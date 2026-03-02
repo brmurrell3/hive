@@ -1,0 +1,40 @@
+# Binaries
+/hived
+/hivectl
+/hive-sidecar
+/hive-agent
+/vm.test
+/bin/
+
+# Build artifacts
+rootfs/rootfs.ext4
+rootfs/hive-sidecar
+
+# State
+state.db
+.state/
+.demo/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.env.*
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+
+# Local validation (not shipped)
+VALIDATE.sh
+
+# Deployment configs (contain user-specific secrets/settings)
+deploy/

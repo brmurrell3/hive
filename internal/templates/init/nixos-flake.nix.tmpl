@@ -1,0 +1,53 @@
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    hive.url = "github:brmurrell3/hive";
+  };
+
+  outputs = { self, nixpkgs, hive, ... }: {
+    nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        hive.nixosModules.default
+        {
+          services.hived = {
+            enable = true;
+            clusterRoot = "{{.AbsDir}}";
+            user = "{{.User}}";
+            group = "users";
+            openFirewall = true;
+            envFile = "{{.AbsDir}}/.secrets/env";
+{{- if eq .TeamTemplate "quant"}}
+            agents.strategist = {
+              manifest = "{{.AbsDir}}/agents/strategist/manifest.yaml";
+{{- if eq .RuntimeType "openclaw"}}
+              runtimeConfig = "{{.AbsDir}}/agents/strategist/openclaw.json";
+{{- end}}
+              joinTokenFile = "{{.AbsDir}}/.secrets/join-token";
+              httpAddr = ":9100";
+            };
+            agents.analyst = {
+              manifest = "{{.AbsDir}}/agents/analyst/manifest.yaml";
+{{- if eq .RuntimeType "openclaw"}}
+              runtimeConfig = "{{.AbsDir}}/agents/analyst/openclaw.json";
+{{- end}}
+              joinTokenFile = "{{.AbsDir}}/.secrets/join-token";
+              httpAddr = ":9101";
+            };
+{{- else}}
+            agents.{{.AgentID}} = {
+              manifest = "{{.AbsDir}}/agents/{{.AgentID}}/manifest.yaml";
+{{- if eq .RuntimeType "openclaw"}}
+              runtimeConfig = "{{.AbsDir}}/agents/{{.AgentID}}/openclaw.json";
+{{- end}}
+              joinTokenFile = "{{.AbsDir}}/.secrets/join-token";
+              httpAddr = ":9100";
+            };
+{{- end}}
+          };
+        }
+      ];
+    };
+  };
+}

@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Unit tests
+        run: go test -tags unit -race -count=1 -coverprofile=unit.cov ./...
+
+      - name: Integration tests
+        run: go test -tags integration -race -count=1 -timeout 5m -coverprofile=integration.cov ./...
+
+      - name: Upload coverage
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: "*.cov"
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: E2E tests
+        run: go test -tags e2e -count=1 -timeout 3m -v ./test/e2e/
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          go build -ldflags "-X main.version=${VERSION}" -o /dev/null ./cmd/hived
+          go build -ldflags "-X main.version=${VERSION}" -o /dev/null ./cmd/hivectl
+          go build -ldflags "-X main.version=${VERSION}" -o /dev/null ./cmd/hive-agent
+
+  audit-lint:
+    name: Audit Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Fuzz ParseMemory
+        run: go test -tags unit -run=^$ -fuzz=^FuzzParseMemory$ -fuzztime=10s ./internal/config/
+
+      - name: Fuzz ParseDiskSize
+        run: go test -tags unit -run=^$ -fuzz=^FuzzParseDiskSize$ -fuzztime=10s ./internal/config/
+
+      - name: Fuzz ValidateSubjectComponent
+        run: go test -tags unit -run=^$ -fuzz=^FuzzValidateSubjectComponent$ -fuzztime=10s ./internal/types/
+
+      - name: Fuzz EnvelopeValidate
+        run: go test -tags unit -run=^$ -fuzz=^FuzzEnvelopeValidate$ -fuzztime=10s ./internal/types/
+
+      - name: Fuzz Authenticate
+        run: go test -tags unit -run=^$ -fuzz=^FuzzAuthenticate$ -fuzztime=10s ./internal/auth/
+
+  race-stress:
+    name: Race Stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Race detector stress test
+        run: go test -tags unit,integration -race -count=5 -timeout 20m ./...

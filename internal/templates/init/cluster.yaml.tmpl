@@ -1,0 +1,23 @@
+apiVersion: hive/v1
+kind: Cluster
+metadata:
+  name: {{.ClusterName}}
+spec:
+  nats:
+    host: "0.0.0.0"
+    port: 4222
+    clusterPort: -1
+    jetstream:
+      enabled: true
+  defaults:
+    resources:
+      memory: "256Mi"
+      vcpus: 1
+    health:
+      interval: "30s"
+      timeout: "5s"
+      maxFailures: 3
+    restart:
+      policy: on-failure
+      maxRestarts: 5
+      backoff: "10s"
