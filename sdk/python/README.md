@@ -1,0 +1,128 @@
+# Hive Python SDK
+
+A zero-dependency Python SDK for building [Hive](https://github.com/brmurrell3/hive) agents. Requires Python 3.8+.
+
+## Installation
+
+```bash
+pip install ./sdk/python
+```
+
+## Quick Start
+
+```python
+from hive_sdk import HiveAgent
+
+agent = HiveAgent()
+
+@agent.capability("greet")
+def greet(name: str, greeting: str = "Hello"):
+    return {"message": f"{greeting}, {name}!"}
+
+agent.run()
+```
+
+Set the required environment variables before running:
+
+```bash
+export HIVE_CALLBACK_PORT=9200
+export HIVE_AGENT_ID=my-agent
+export HIVE_TEAM_ID=my-team
+export HIVE_SIDECAR_URL=http://127.0.0.1:9100
+python my_agent.py
+```
+
+## Environment Variables
+
+| Variable             | Required | Description                                      |
+|----------------------|----------|--------------------------------------------------|
+| `HIVE_CALLBACK_PORT` | Yes      | Port the HTTP server listens on                  |
+| `HIVE_AGENT_ID`      | No       | Agent identifier                                 |
+| `HIVE_TEAM_ID`       | No       | Team identifier                                  |
+| `HIVE_SIDECAR_URL`   | No       | Sidecar API URL (required for `invoke()`)        |
+| `HIVE_WORKSPACE`     | No       | Workspace directory                              |
+
+## Capabilities
+
+Register capabilities using the `@agent.capability("name")` decorator. The decorated function:
+
+- Receives keyword arguments matching the capability's input names
+- Returns a dict that is automatically wrapped as `{"outputs": {...}}`
+- Raised exceptions are caught and returned as structured errors
+
+```python
+@agent.capability("add")
+def add(a: int, b: int):
+    return {"sum": a + b}
+
+@agent.capability("divide")
+def divide(numerator: float, denominator: float):
+    if denominator == 0:
+        raise ValueError("cannot divide by zero")
+    return {"result": numerator / denominator}
+```
+
+## Remote Invocation
+
+Call capabilities on other agents via the sidecar:
+
+```python
+result = agent.invoke(
+    target="other-agent",
+    capability="process-data",
+    inputs={"data": "hello"},
+    timeout="30s",
+)
+print(result)  # {"status": "ok", "outputs": {"processed": "HELLO"}}
+```
+
+## HTTP Protocol
+
+The SDK implements the Hive agent callback protocol:
+
+| Method | Path                        | Description                |
+|--------|-----------------------------|----------------------------|
+| GET    | `/health`                   | Health check               |
+| POST   | `/handle/{capability_name}` | Invoke a capability        |
+
+### Request format (POST /handle/{name})
+
+```json
+{
+  "inputs": {
+    "key": "value"
+  }
+}
+```
+
+### Success response (HTTP 200)
+
+```json
+{
+  "outputs": {
+    "key": "value"
+  }
+}
+```
+
+### Error response (HTTP 500)
+
+```json
+{
+  "error": {
+    "code": "CAPABILITY_FAILED",
+    "message": "description of the error"
+  }
+}
+```
+
+## Testing
+
+```bash
+cd sdk/python
+python -m unittest test_hive_sdk -v
+```
+
+## License
+
+Apache-2.0

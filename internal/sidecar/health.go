@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/brmurrell3/hive/internal/capability"
+	"github.com/brmurrell3/hive/internal/protocol"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // Health status constants used in HTTP /health responses and heartbeats.
@@ -50,6 +52,7 @@ type invokeRemoteRequest struct {
 func setupHTTPRoutes(mux *http.ServeMux, s *Sidecar) {
 	mux.HandleFunc("GET /health", handleHealth(s))
 	mux.HandleFunc("GET /capabilities", handleCapabilities(s))
+	mux.HandleFunc("GET /team/capabilities", handleTeamCapabilities(s))
 	mux.HandleFunc("POST /capabilities/", handleCapabilityRoute(s))
 }
 
@@ -239,6 +242,120 @@ func handleCapabilities(s *Sidecar) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, caps, s.logger)
+	}
+}
+
+// teamCapabilityEntry is the JSON structure returned by GET /team/capabilities
+// for each capability registered across all teams.
+type teamCapabilityEntry struct {
+	Name        string `json:"name"`
+	AgentID     string `json:"agent_id"`
+	TeamID      string `json:"team_id"`
+	Description string `json:"description,omitempty"`
+}
+
+// handleTeamCapabilities returns an http.HandlerFunc that queries the control
+// plane for all registered capabilities across all teams via NATS and returns
+// them as a JSON array. This enables cross-team capability discovery.
+func handleTeamCapabilities(s *Sidecar) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get NATS connection under RLock.
+		s.mu.RLock()
+		nc := s.natsConn
+		s.mu.RUnlock()
+
+		if nc == nil || !nc.IsConnected() {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "NATS connection not available",
+			}, s.logger)
+			return
+		}
+
+		// Build an envelope wrapping a CtlRequest, matching the format
+		// used by hivectl's DaemonClient.request().
+		payloadBytes, err := json.Marshal(&protocol.CtlRequest{})
+		if err != nil {
+			s.logger.Error("failed to marshal capabilities request payload", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "internal server error",
+			}, s.logger)
+			return
+		}
+
+		env := types.Envelope{
+			ID:        types.NewUUID(),
+			From:      s.agentID,
+			To:        "hived",
+			Type:      types.MessageTypeControl,
+			Timestamp: time.Now().UTC(),
+			Payload:   payloadBytes,
+		}
+
+		data, err := json.Marshal(env)
+		if err != nil {
+			s.logger.Error("failed to marshal capabilities request envelope", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "internal server error",
+			}, s.logger)
+			return
+		}
+
+		// Send NATS request with 5s timeout.
+		msg, err := nc.Request(protocol.SubjCapabilityList, data, 5*time.Second)
+		if err != nil {
+			s.logger.Warn("failed to query capabilities from control plane", "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error": "failed to query control plane",
+			}, s.logger)
+			return
+		}
+
+		// Parse the CtlResponse.
+		var resp protocol.CtlResponse
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			s.logger.Warn("failed to parse capabilities response", "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error": "invalid response from control plane",
+			}, s.logger)
+			return
+		}
+		if !resp.Success {
+			s.logger.Warn("control plane returned error for capabilities list", "error", resp.Error)
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error": "control plane error",
+			}, s.logger)
+			return
+		}
+
+		// Parse the Data field which contains the capabilities array.
+		// The server returns []capEntry with fields: name, agent_id, team.
+		// We transform to our response format with team_id and description.
+		var serverCaps []struct {
+			Name        string `json:"name"`
+			AgentID     string `json:"agent_id"`
+			Team        string `json:"team"`
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(resp.Data, &serverCaps); err != nil {
+			s.logger.Warn("failed to parse capabilities data", "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error": "invalid capabilities data from control plane",
+			}, s.logger)
+			return
+		}
+
+		// Transform to the desired response format.
+		result := make([]teamCapabilityEntry, len(serverCaps))
+		for i, cap := range serverCaps {
+			result[i] = teamCapabilityEntry{
+				Name:        cap.Name,
+				AgentID:     cap.AgentID,
+				TeamID:      cap.Team,
+				Description: cap.Description,
+			}
+		}
+
+		writeJSON(w, http.StatusOK, result, s.logger)
 	}
 }
 

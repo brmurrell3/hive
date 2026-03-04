@@ -1,0 +1,15 @@
+apiVersion: hive/v1
+kind: Cluster
+metadata:
+  name: content-pipeline
+spec:
+  nats:
+    port: 4222
+    jetstream:
+      enabled: true
+  defaults:
+    resources:
+      memory: "256Mi"
+    health:
+      interval: "10s"
+      timeout: "5s"

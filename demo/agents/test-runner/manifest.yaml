@@ -1,0 +1,33 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: test-runner
+  team: ci-pipeline
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: run-tests
+      description: "Execute a test suite and return structured results."
+      inputs:
+        - name: repo_path
+          type: string
+          description: "Path to the repository root"
+        - name: test_command
+          type: string
+          description: "Command to run tests (e.g., 'go test ./...' or 'npm test')"
+      outputs:
+        - name: passed
+          type: int
+          description: "Number of tests passed"
+        - name: failed
+          type: int
+          description: "Number of tests failed"
+        - name: output
+          type: string
+          description: "Raw test output (truncated to 64KB)"
+        - name: success
+          type: bool
+          description: "True if all tests passed"

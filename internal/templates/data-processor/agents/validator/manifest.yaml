@@ -1,0 +1,34 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: validator
+  team: data-processor
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: validate-data
+      description: "Validate data against specified rules and report any violations."
+      inputs:
+        - name: data
+          type: string
+          description: "JSON string of data records to validate"
+        - name: rules
+          type: string
+          description: "Comma-separated validation rules (e.g., no_nulls,unique_ids,non_empty)"
+          required: false
+      outputs:
+        - name: valid
+          type: bool
+          description: "True if all records pass validation"
+        - name: records_checked
+          type: int
+          description: "Number of records checked"
+        - name: violations
+          type: string
+          description: "JSON array of validation violations"
+        - name: violations_count
+          type: int
+          description: "Number of violations found"

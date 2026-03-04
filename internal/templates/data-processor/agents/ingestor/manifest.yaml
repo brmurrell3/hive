@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: ingestor
+  team: data-processor
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: ingest-data
+      description: "Ingest data from a source in CSV, JSON, or text format. Orchestrates transformer and validator."
+      inputs:
+        - name: source
+          type: string
+          description: "Data source path or inline data"
+        - name: format
+          type: string
+          description: "Data format: csv, json, or text"
+          required: false
+      outputs:
+        - name: data
+          type: string
+          description: "Parsed data as JSON"
+        - name: records_count
+          type: int
+          description: "Number of records ingested"
+        - name: format
+          type: string
+          description: "The format detected or used"

@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: watcher
+  team: monitor
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: watch-target
+      description: "Monitor a target via HTTP, port, or process check. Orchestrates alerter if issues found."
+      inputs:
+        - name: target
+          type: string
+          description: "Target to monitor (URL, host:port, or process name)"
+        - name: check_type
+          type: string
+          description: "Check type: http, port, or process"
+          required: false
+      outputs:
+        - name: status
+          type: string
+          description: "Check result: up, down, or degraded"
+        - name: response_time_ms
+          type: int
+          description: "Response time in milliseconds"
+        - name: details
+          type: string
+          description: "Detailed check results"
