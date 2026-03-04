@@ -127,10 +127,15 @@ func (s *Sidecar) publishHeartbeat(subject string) {
 	healthy := s.IsHealthy()
 	uptimeSeconds := int(time.Since(s.startTime).Seconds())
 
+	tier := s.config.Tier
+	if tier == "" {
+		tier = "vm"
+	}
+
 	payload := types.HealthPayload{
 		Healthy:       healthy,
 		UptimeSeconds: uptimeSeconds,
-		Tier:          "vm", // Sidecar in standalone mode implies VM tier.
+		Tier:          tier,
 	}
 
 	env := types.Envelope{

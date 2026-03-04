@@ -30,6 +30,17 @@ type Sidecar struct {
 	broadcastSub *nats.Subscription
 }
 
+// SidecarMode indicates how the sidecar is running.
+type SidecarMode string
+
+const (
+	// ModeStandalone indicates the sidecar runs as a standalone binary (e.g., inside a VM).
+	ModeStandalone SidecarMode = "standalone"
+
+	// ModeLibrary indicates the sidecar runs as goroutines within a host process.
+	ModeLibrary SidecarMode = "library"
+)
+
 // Config holds all configuration for a Sidecar instance.
 type Config struct {
 	// AgentID is the unique identifier for the agent this sidecar manages.
@@ -60,6 +71,14 @@ type Config struct {
 	// HealthInterval is the interval between heartbeat publications.
 	// Defaults to 30 seconds if zero.
 	HealthInterval time.Duration
+
+	// Tier is the tier of the agent (vm, native, firmware). Used in heartbeats.
+	// Defaults to "vm" if empty.
+	Tier string
+
+	// Mode is the sidecar operating mode (standalone or library).
+	// Defaults to standalone if empty.
+	Mode SidecarMode
 }
 
 // Capability describes a single capability that an agent exposes to the cluster.

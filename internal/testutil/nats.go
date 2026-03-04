@@ -7,6 +7,7 @@ import (
 
 	hivenats "github.com/hivehq/hive/internal/nats"
 	"github.com/hivehq/hive/internal/types"
+	"github.com/nats-io/nats.go"
 )
 
 // NATSServer starts an embedded NATS server on a random port for testing.
@@ -38,4 +39,21 @@ func NATSServer(t *testing.T) *hivenats.Server {
 	})
 
 	return srv
+}
+
+// NATSConnect creates a NATS client connection to the test server.
+// The connection is automatically closed when the test completes.
+func NATSConnect(t *testing.T, srv *hivenats.Server) *nats.Conn {
+	t.Helper()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("connecting to test NATS: %v", err)
+	}
+
+	t.Cleanup(func() {
+		nc.Close()
+	})
+
+	return nc
 }

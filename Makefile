@@ -3,6 +3,7 @@
 build:
 	go build ./cmd/hived
 	go build ./cmd/hivectl
+	go build ./cmd/hive-agent
 
 test: test-unit test-integration
 
@@ -19,6 +20,6 @@ rootfs:
 	$(MAKE) -C rootfs rootfs
 
 clean:
-	rm -f hived hivectl
+	rm -f hived hivectl hive-agent
 	$(MAKE) -C rootfs rootfs-clean
 	go clean ./...

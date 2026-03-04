@@ -1,6 +1,8 @@
 package state
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -9,6 +11,9 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/hivehq/hive/internal/auth"
+	"github.com/hivehq/hive/internal/types"
 )
 
 // AgentStatus represents the lifecycle status of an agent VM.
@@ -40,6 +45,10 @@ type AgentState struct {
 	ID             string      `json:"id"`
 	Team           string      `json:"team"`
 	Status         AgentStatus `json:"status"`
+	NodeID         string      `json:"node_id,omitempty"`
+	MemoryBytes    int64       `json:"memory_bytes,omitempty"`
+	VCPUs          int         `json:"vcpus,omitempty"`
+	ManifestHash   string      `json:"manifest_hash,omitempty"`
 	VMPID          int         `json:"vm_pid,omitempty"`
 	VMCID          uint32      `json:"vm_cid,omitempty"`
 	VMSocketPath   string      `json:"vm_socket_path,omitempty"`
@@ -52,7 +61,19 @@ type AgentState struct {
 
 // State is the top-level runtime state persisted to state.json.
 type State struct {
-	Agents map[string]*AgentState `json:"agents"`
+	Agents       map[string]*AgentState        `json:"agents"`
+	Nodes        map[string]*types.NodeState   `json:"nodes,omitempty"`
+	Tokens       []*types.Token                `json:"tokens,omitempty"`
+	Capabilities *types.CapabilityRegistry     `json:"capabilities,omitempty"`
+	Users        []*auth.User                  `json:"users,omitempty"`
+}
+
+func newState() *State {
+	return &State{
+		Agents:       make(map[string]*AgentState),
+		Nodes:        make(map[string]*types.NodeState),
+		Capabilities: types.NewCapabilityRegistry(),
+	}
 }
 
 // Store manages the runtime state persistence via state.json.
@@ -69,9 +90,7 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	s := &Store{
 		path:   path,
 		logger: logger,
-		state: &State{
-			Agents: make(map[string]*AgentState),
-		},
+		state:  newState(),
 	}
 
 	if _, err := os.Stat(path); err == nil {
@@ -105,6 +124,12 @@ func (s *Store) Load() error {
 
 	if st.Agents == nil {
 		st.Agents = make(map[string]*AgentState)
+	}
+	if st.Nodes == nil {
+		st.Nodes = make(map[string]*types.NodeState)
+	}
+	if st.Capabilities == nil {
+		st.Capabilities = types.NewCapabilityRegistry()
 	}
 
 	s.state = &st
@@ -228,6 +253,301 @@ func (s *Store) AllAgents() []*AgentState {
 	})
 
 	return agents
+}
+
+// --- Node management ---
+
+// GetNode returns the node state for the given ID, or nil if not found.
+func (s *Store) GetNode(id string) *types.NodeState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.state.Nodes[id]
+	if !ok {
+		return nil
+	}
+	cp := *node
+	return &cp
+}
+
+// SetNode updates or inserts a node state and persists to disk.
+func (s *Store) SetNode(node *types.NodeState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cp := *node
+	s.state.Nodes[cp.ID] = &cp
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after setting node %s: %w", cp.ID, err)
+	}
+	s.logger.Debug("node state updated", "node_id", cp.ID, "status", cp.Status)
+	return nil
+}
+
+// RemoveNode removes a node from state and persists to disk.
+func (s *Store) RemoveNode(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.state.Nodes[id]; !ok {
+		return fmt.Errorf("node %q not found in state", id)
+	}
+	delete(s.state.Nodes, id)
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after removing node %s: %w", id, err)
+	}
+	s.logger.Debug("node removed from state", "node_id", id)
+	return nil
+}
+
+// AllNodes returns all node states sorted alphabetically by ID.
+func (s *Store) AllNodes() []*types.NodeState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nodes := make([]*types.NodeState, 0, len(s.state.Nodes))
+	for _, n := range s.state.Nodes {
+		cp := *n
+		nodes = append(nodes, &cp)
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
+	return nodes
+}
+
+// --- Token management ---
+
+// AddToken stores a hashed token and persists to disk.
+func (s *Store) AddToken(token *types.Token) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.state.Tokens = append(s.state.Tokens, token)
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after adding token: %w", err)
+	}
+	s.logger.Debug("token added", "prefix", token.Prefix)
+	return nil
+}
+
+// ValidateToken checks a raw token against stored hashes.
+// Returns the matching token if valid, nil otherwise.
+func (s *Store) ValidateToken(rawToken string) *types.Token {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	hash := hashToken(rawToken)
+	for _, t := range s.state.Tokens {
+		if t.Hash == hash && t.IsValid() {
+			t.LastUsed = time.Now()
+			return t
+		}
+	}
+	return nil
+}
+
+// AllTokens returns all tokens (for listing).
+func (s *Store) AllTokens() []*types.Token {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tokens := make([]*types.Token, 0, len(s.state.Tokens))
+	for _, t := range s.state.Tokens {
+		cp := *t
+		tokens = append(tokens, &cp)
+	}
+	return tokens
+}
+
+// RevokeToken revokes a token matching the given prefix.
+func (s *Store) RevokeToken(prefix string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	for _, t := range s.state.Tokens {
+		if t.Prefix == prefix {
+			t.Revoked = true
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("no token found with prefix %q", prefix)
+	}
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after revoking token: %w", err)
+	}
+	s.logger.Debug("token revoked", "prefix", prefix)
+	return nil
+}
+
+// hashToken returns the SHA-256 hex digest of a raw token string.
+func hashToken(raw string) string {
+	h := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(h[:])
+}
+
+// HashToken is the exported version for use by token generation code.
+func HashToken(raw string) string {
+	return hashToken(raw)
+}
+
+// --- Capability Registry ---
+
+// GetCapabilityRegistry returns a copy of the capability registry.
+func (s *Store) GetCapabilityRegistry() *types.CapabilityRegistry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	reg := types.NewCapabilityRegistry()
+	for k, v := range s.state.Capabilities.Agents {
+		cp := *v
+		reg.Agents[k] = &cp
+	}
+	return reg
+}
+
+// RegisterCapabilities registers an agent's capabilities and persists.
+func (s *Store) RegisterCapabilities(agentID, teamID, tier, nodeID string, caps []types.AgentCapability) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.state.Capabilities.Register(agentID, teamID, tier, nodeID, caps)
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after registering capabilities for %s: %w", agentID, err)
+	}
+	s.logger.Debug("capabilities registered", "agent_id", agentID, "count", len(caps))
+	return nil
+}
+
+// DeregisterCapabilities removes an agent's capabilities and persists.
+func (s *Store) DeregisterCapabilities(agentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.state.Capabilities.Deregister(agentID)
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after deregistering capabilities for %s: %w", agentID, err)
+	}
+	s.logger.Debug("capabilities deregistered", "agent_id", agentID)
+	return nil
+}
+
+// --- User management ---
+
+// AddUser adds a user to state and persists to disk.
+func (s *Store) AddUser(user *auth.User) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check for duplicate IDs.
+	for _, u := range s.state.Users {
+		if u.ID == user.ID {
+			return fmt.Errorf("user %q already exists", user.ID)
+		}
+	}
+
+	cp := *user
+	s.state.Users = append(s.state.Users, &cp)
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after adding user %s: %w", user.ID, err)
+	}
+	s.logger.Debug("user added", "user_id", user.ID, "role", user.Role)
+	return nil
+}
+
+// RemoveUser removes a user from state and persists to disk.
+func (s *Store) RemoveUser(userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	users := make([]*auth.User, 0, len(s.state.Users))
+	for _, u := range s.state.Users {
+		if u.ID == userID {
+			found = true
+			continue
+		}
+		users = append(users, u)
+	}
+
+	if !found {
+		return fmt.Errorf("user %q not found", userID)
+	}
+
+	s.state.Users = users
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after removing user %s: %w", userID, err)
+	}
+	s.logger.Debug("user removed", "user_id", userID)
+	return nil
+}
+
+// GetUser returns a copy of the user with the given ID, or nil if not found.
+func (s *Store) GetUser(userID string) *auth.User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, u := range s.state.Users {
+		if u.ID == userID {
+			cp := *u
+			return &cp
+		}
+	}
+	return nil
+}
+
+// AllUsers returns all users sorted alphabetically by ID.
+func (s *Store) AllUsers() []*auth.User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	users := make([]*auth.User, 0, len(s.state.Users))
+	for _, u := range s.state.Users {
+		cp := *u
+		users = append(users, &cp)
+	}
+
+	sort.Slice(users, func(i, j int) bool {
+		return users[i].ID < users[j].ID
+	})
+
+	return users
+}
+
+// UpdateUser updates an existing user in state and persists to disk.
+func (s *Store) UpdateUser(user *auth.User) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	for i, u := range s.state.Users {
+		if u.ID == user.ID {
+			cp := *user
+			s.state.Users[i] = &cp
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("user %q not found", user.ID)
+	}
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after updating user %s: %w", user.ID, err)
+	}
+	s.logger.Debug("user updated", "user_id", user.ID, "role", user.Role)
+	return nil
 }
 
 // ValidateTransition checks whether a transition from one status to another

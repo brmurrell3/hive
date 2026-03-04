@@ -20,9 +20,12 @@ type ClusterSpec struct {
 }
 
 type NATSConfig struct {
-	Port        int             `yaml:"port" json:"port"`
-	ClusterPort int             `yaml:"clusterPort" json:"clusterPort"`
-	JetStream   JetStreamConfig `yaml:"jetstream" json:"jetstream"`
+	Port         int             `yaml:"port" json:"port"`
+	ClusterPort  int             `yaml:"clusterPort" json:"clusterPort"`
+	JetStream    JetStreamConfig `yaml:"jetstream" json:"jetstream"`
+	Mode         string          `yaml:"mode,omitempty" json:"mode,omitempty"`                 // "embedded" or "external"
+	URLs         []string        `yaml:"urls,omitempty" json:"urls,omitempty"`                  // external NATS URLs
+	ClusterPeers []string        `yaml:"clusterPeers,omitempty" json:"clusterPeers,omitempty"` // for NATS clustering
 }
 
 type JetStreamConfig struct {
