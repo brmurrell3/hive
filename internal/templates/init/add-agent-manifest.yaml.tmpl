@@ -1,0 +1,26 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: {{.AgentID}}
+  team: {{.TeamID}}
+spec:
+  tier: native
+  runtime:
+    type: {{.RuntimeType}}
+{{- if .RuntimeCommand}}
+    command: "{{.RuntimeCommand}}"
+{{- end}}
+  capabilities:
+    - name: chat
+      description: General conversation and task execution
+      inputs:
+        - name: message
+          type: string
+          description: User message
+      outputs:
+        - name: response
+          type: string
+          description: Agent response
+  resources:
+    memory: "256Mi"
+    vcpus: 1

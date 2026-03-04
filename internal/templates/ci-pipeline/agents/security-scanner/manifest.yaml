@@ -1,0 +1,27 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: security-scanner
+  team: ci-pipeline
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: scan-security
+      description: "Scan source code for security vulnerabilities including injection, hardcoded secrets, and auth issues."
+      inputs:
+        - name: file_path
+          type: string
+          description: "Path to file or directory to scan"
+      outputs:
+        - name: vulnerabilities
+          type: string
+          description: "JSON array of findings with type, severity, file, line, description"
+        - name: risk_level
+          type: string
+          description: "Overall risk: low, medium, high, critical"
+        - name: findings_count
+          type: int
+          description: "Number of vulnerabilities found"

@@ -1,0 +1,106 @@
+linters:
+  enable:
+    - gofmt
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    # Security
+    - gosec
+    # Bug detection
+    - gocritic
+    - bodyclose
+    - nilerr
+    - durationcheck
+    - errorlint
+    - makezero
+    - unconvert
+    - wastedassign
+    - prealloc
+    - copyloopvar
+    # Repeated string constants
+    - goconst
+    # Typo detection
+    - misspell
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    exclude-functions:
+      # Deferred close/cleanup — errors are unactionable at defer time
+      - (io.Closer).Close
+      - (*os.File).Close
+      - (net.Conn).Close
+      - (*database/sql.DB).Close
+      - (*database/sql.Rows).Close
+      - (*database/sql.Stmt).Close
+      - (*database/sql.Tx).Rollback
+      - (*github.com/nats-io/nats.go.Conn).Drain
+      - (*github.com/nats-io/nats.go.Conn).Flush
+      - (*github.com/nats-io/nats.go.Subscription).Unsubscribe
+      - (*github.com/nats-io/nats.go.Msg).Respond
+      # CLI output — write errors to stdout/stderr are unrecoverable
+      - fmt.Fprintf
+      - fmt.Fprintln
+      - (*text/tabwriter.Writer).Flush
+      # Best-effort cleanup
+      - os.Remove
+      - os.RemoveAll
+      - (*os.File).Chmod
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+      - shadow  # too noisy — most Go code idiomatically re-uses err
+  gocritic:
+    # All desired checks (appendAssign, dupBranchBody, dupSubExpr,
+    # exitAfterDefer, nilValReturn, weakCond) are enabled by default.
+  gosec:
+    excludes:
+      - G104  # unhandled errors - covered by errcheck
+      - G204  # subprocess with variable - intentional for VM/firmware/backend
+      - G301  # directory permissions 0750 - we use 0755 for agent dirs intentionally
+      - G302  # file permissions 0600 - 0640 for log files is intentional
+      - G304  # file inclusion via variable - inherent to config/manifest loading
+      - G306  # file permissions 0600 - 0644 is appropriate for non-secret config
+      - G404  # weak random - math/rand for jitter/backoff is fine
+      - G115  # integer overflow conversion - checked at call sites
+  goconst:
+    min-occurrences: 4
+  errorlint:
+    errorf: true
+    asserts: true
+    comparison: true
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Don't enforce in test files
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+        - prealloc
+        - errorlint
+        - bodyclose
+        - unconvert
+        - wastedassign
+        - goconst
+    # Don't enforce in test helpers
+    - path: internal/testing/
+      linters:
+        - errcheck
+    - path: internal/testutil/
+      linters:
+        - errcheck
+        - gosec
+
+run:
+  timeout: 5m
+  build-tags:
+    - unit
+    - integration

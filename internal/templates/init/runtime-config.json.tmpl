@@ -1,0 +1,23 @@
+{
+  "env": {
+    "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
+  },
+  "gateway": {
+    "mode": "local"
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "{{.Model}}"
+      }
+    }
+  }{{if .TelegramToken}},
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "{{.TelegramToken}}",
+      "dmPolicy": "allowlist",
+      "allowFrom": ["tg:{{.TelegramUserID}}"]
+    }
+  }{{end}}
+}
