@@ -1,0 +1,23 @@
+apiVersion: hive/v1
+kind: Cluster
+metadata:
+  name: test-cluster
+spec:
+  nats:
+    port: 4222
+    jetstream:
+      enabled: true
+      maxMemory: "1GB"
+      maxStorage: "10GB"
+  defaults:
+    resources:
+      memory: "512Mi"
+      vcpus: 2
+    health:
+      interval: "30s"
+      timeout: "5s"
+      maxFailures: 3
+    restart:
+      policy: on-failure
+      maxRestarts: 5
+      backoff: "10s"
