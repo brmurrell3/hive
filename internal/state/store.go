@@ -33,7 +33,7 @@ const (
 var validTransitions = map[AgentStatus][]AgentStatus{
 	AgentStatusPending:  {AgentStatusCreating},
 	AgentStatusCreating: {AgentStatusStarting, AgentStatusFailed},
-	AgentStatusStarting: {AgentStatusRunning, AgentStatusFailed},
+	AgentStatusStarting: {AgentStatusRunning, AgentStatusFailed, AgentStatusStopping},
 	AgentStatusRunning:  {AgentStatusStopping, AgentStatusFailed},
 	AgentStatusStopping: {AgentStatusStopped, AgentStatusFailed},
 	AgentStatusStopped:  {AgentStatusCreating},
@@ -72,7 +72,9 @@ func newState() *State {
 	return &State{
 		Agents:       make(map[string]*AgentState),
 		Nodes:        make(map[string]*types.NodeState),
+		Tokens:       []*types.Token{},       // T3-11: initialize
 		Capabilities: types.NewCapabilityRegistry(),
+		Users:        []*auth.User{},          // T3-11: initialize
 	}
 }
 
@@ -130,6 +132,12 @@ func (s *Store) Load() error {
 	}
 	if st.Capabilities == nil {
 		st.Capabilities = types.NewCapabilityRegistry()
+	}
+	if st.Tokens == nil {
+		st.Tokens = []*types.Token{}
+	}
+	if st.Users == nil {
+		st.Users = []*auth.User{}
 	}
 
 	s.state = &st
@@ -218,6 +226,30 @@ func (s *Store) SetAgent(agent *AgentState) error {
 	return nil
 }
 
+// ModifyAgent performs an atomic read-modify-write on agent state.
+// T2-02: The callback receives the current state, mutates it, and the store
+// persists atomically while holding the lock.
+func (s *Store) ModifyAgent(id string, fn func(*AgentState) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	agent, ok := s.state.Agents[id]
+	if !ok {
+		return fmt.Errorf("agent %q not found in state", id)
+	}
+
+	if err := fn(agent); err != nil {
+		return err
+	}
+
+	if err := s.saveLocked(); err != nil {
+		return fmt.Errorf("saving state after modifying agent %s: %w", id, err)
+	}
+
+	s.logger.Debug("agent state modified atomically", "agent_id", id, "status", agent.Status)
+	return nil
+}
+
 // RemoveAgent removes the agent from state and persists to disk.
 func (s *Store) RemoveAgent(id string) error {
 	s.mu.Lock()
@@ -258,6 +290,7 @@ func (s *Store) AllAgents() []*AgentState {
 // --- Node management ---
 
 // GetNode returns the node state for the given ID, or nil if not found.
+// T2-05: Deep-copies Labels map and Agents slice.
 func (s *Store) GetNode(id string) *types.NodeState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -267,15 +300,36 @@ func (s *Store) GetNode(id string) *types.NodeState {
 		return nil
 	}
 	cp := *node
+	if node.Labels != nil {
+		cp.Labels = make(map[string]string, len(node.Labels))
+		for k, v := range node.Labels {
+			cp.Labels[k] = v
+		}
+	}
+	if node.Agents != nil {
+		cp.Agents = make([]string, len(node.Agents))
+		copy(cp.Agents, node.Agents)
+	}
 	return &cp
 }
 
 // SetNode updates or inserts a node state and persists to disk.
+// T2-05: Deep-copies Labels map and Agents slice.
 func (s *Store) SetNode(node *types.NodeState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	cp := *node
+	if node.Labels != nil {
+		cp.Labels = make(map[string]string, len(node.Labels))
+		for k, v := range node.Labels {
+			cp.Labels[k] = v
+		}
+	}
+	if node.Agents != nil {
+		cp.Agents = make([]string, len(node.Agents))
+		copy(cp.Agents, node.Agents)
+	}
 	s.state.Nodes[cp.ID] = &cp
 
 	if err := s.saveLocked(); err != nil {
@@ -321,11 +375,13 @@ func (s *Store) AllNodes() []*types.NodeState {
 // --- Token management ---
 
 // AddToken stores a hashed token and persists to disk.
+// T2-04: Makes a defensive copy before storing.
 func (s *Store) AddToken(token *types.Token) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.state.Tokens = append(s.state.Tokens, token)
+	cp := *token
+	s.state.Tokens = append(s.state.Tokens, &cp)
 
 	if err := s.saveLocked(); err != nil {
 		return fmt.Errorf("saving state after adding token: %w", err)
@@ -335,7 +391,8 @@ func (s *Store) AddToken(token *types.Token) error {
 }
 
 // ValidateToken checks a raw token against stored hashes.
-// Returns the matching token if valid, nil otherwise.
+// Returns a copy of the matching token if valid, nil otherwise.
+// T2-03: Persists LastUsed and returns a copy (not a pointer into internal state).
 func (s *Store) ValidateToken(rawToken string) *types.Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -344,7 +401,11 @@ func (s *Store) ValidateToken(rawToken string) *types.Token {
 	for _, t := range s.state.Tokens {
 		if t.Hash == hash && t.IsValid() {
 			t.LastUsed = time.Now()
-			return t
+			if err := s.saveLocked(); err != nil {
+				s.logger.Error("failed to persist token LastUsed", "error", err)
+			}
+			cp := *t
+			return &cp
 		}
 	}
 	return nil
@@ -399,7 +460,8 @@ func HashToken(raw string) string {
 
 // --- Capability Registry ---
 
-// GetCapabilityRegistry returns a copy of the capability registry.
+// GetCapabilityRegistry returns a deep copy of the capability registry.
+// T2-05: Deep-copies Capabilities slice and nested Inputs/Outputs.
 func (s *Store) GetCapabilityRegistry() *types.CapabilityRegistry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -407,6 +469,21 @@ func (s *Store) GetCapabilityRegistry() *types.CapabilityRegistry {
 	reg := types.NewCapabilityRegistry()
 	for k, v := range s.state.Capabilities.Agents {
 		cp := *v
+		if v.Capabilities != nil {
+			cp.Capabilities = make([]types.AgentCapability, len(v.Capabilities))
+			for i, c := range v.Capabilities {
+				cc := c
+				if c.Inputs != nil {
+					cc.Inputs = make([]types.CapabilityParam, len(c.Inputs))
+					copy(cc.Inputs, c.Inputs)
+				}
+				if c.Outputs != nil {
+					cc.Outputs = make([]types.CapabilityParam, len(c.Outputs))
+					copy(cc.Outputs, c.Outputs)
+				}
+				cp.Capabilities[i] = cc
+			}
+		}
 		reg.Agents[k] = &cp
 	}
 	return reg
@@ -492,29 +569,43 @@ func (s *Store) RemoveUser(userID string) error {
 	return nil
 }
 
+// deepCopyUser returns a deep copy of a User, including slices.
+func deepCopyUser(u *auth.User) *auth.User {
+	cp := *u
+	if u.Teams != nil {
+		cp.Teams = make([]string, len(u.Teams))
+		copy(cp.Teams, u.Teams)
+	}
+	if u.Agents != nil {
+		cp.Agents = make([]string, len(u.Agents))
+		copy(cp.Agents, u.Agents)
+	}
+	return &cp
+}
+
 // GetUser returns a copy of the user with the given ID, or nil if not found.
+// T2-05: Deep-copies Teams and Agents slices.
 func (s *Store) GetUser(userID string) *auth.User {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, u := range s.state.Users {
 		if u.ID == userID {
-			cp := *u
-			return &cp
+			return deepCopyUser(u)
 		}
 	}
 	return nil
 }
 
 // AllUsers returns all users sorted alphabetically by ID.
+// T2-05: Deep-copies Teams and Agents slices.
 func (s *Store) AllUsers() []*auth.User {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	users := make([]*auth.User, 0, len(s.state.Users))
 	for _, u := range s.state.Users {
-		cp := *u
-		users = append(users, &cp)
+		users = append(users, deepCopyUser(u))
 	}
 
 	sort.Slice(users, func(i, j int) bool {

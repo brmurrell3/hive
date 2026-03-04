@@ -69,6 +69,9 @@ func joinCmd() *cobra.Command {
 			if controlPlane == "" {
 				return fmt.Errorf("--control-plane is required")
 			}
+			if agentID == "" {
+				return fmt.Errorf("--agent-id is required")
+			}
 
 			return runJoin(logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr)
 		},

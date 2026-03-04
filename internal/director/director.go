@@ -1,7 +1,6 @@
 package director
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -29,6 +28,11 @@ type ToolParam struct {
 	Required    bool   `json:"required"`
 }
 
+// AuthFunc validates that a given sender (from the envelope's From field)
+// is authorized to invoke director tools. Return nil to allow, or an error
+// to deny the request.
+type AuthFunc func(senderID string) error
+
 // Director manages the org-level director agent. The director has visibility
 // into all teams and agents, and can send messages, invoke capabilities,
 // and query cluster status.
@@ -37,18 +41,22 @@ type Director struct {
 	natsConn *nats.Conn
 	store    *state.Store
 	logger   *slog.Logger
+	authFunc AuthFunc
 
 	mu   sync.Mutex
 	subs []*nats.Subscription
 }
 
-// NewDirector creates a new Director instance.
-func NewDirector(agentID string, nc *nats.Conn, store *state.Store, logger *slog.Logger) *Director {
+// NewDirector creates a new Director instance. The optional authFn callback
+// validates incoming requests by sender ID. If authFn is nil, all requests
+// are allowed (no authentication).
+func NewDirector(agentID string, nc *nats.Conn, store *state.Store, logger *slog.Logger, authFn AuthFunc) *Director {
 	return &Director{
 		agentID:  agentID,
 		natsConn: nc,
 		store:    store,
 		logger:   logger,
+		authFunc: authFn,
 	}
 }
 
@@ -74,7 +82,7 @@ func (d *Director) Start() error {
 		subject := fmt.Sprintf("hive.director.%s.request", name)
 		h := handler // capture for closure
 
-		sub, err := d.natsConn.Subscribe(subject, h)
+		sub, err := d.natsConn.Subscribe(subject, d.withAuth(h))
 		if err != nil {
 			d.cleanup()
 			return fmt.Errorf("subscribing to director tool %s: %w", subject, err)
@@ -276,7 +284,7 @@ func (d *Director) handleMessageLead(msg *nats.Msg) {
 	subject := fmt.Sprintf("hive.team.%s.lead", req.TeamID)
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		To:        req.TeamID,
 		Type:      types.MessageTypeTask,
@@ -318,7 +326,7 @@ func (d *Director) handleMessageAgent(msg *nats.Msg) {
 	subject := fmt.Sprintf("hive.agent.%s.inbox", req.AgentID)
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		To:        req.AgentID,
 		Type:      types.MessageTypeTask,
@@ -359,7 +367,7 @@ func (d *Director) handleBroadcastLeads(msg *nats.Msg) {
 	subject := "hive.broadcast.leads"
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		Type:      types.MessageTypeBroadcast,
 		Timestamp: time.Now().UTC(),
@@ -399,7 +407,7 @@ func (d *Director) handleBroadcastAll(msg *nats.Msg) {
 	subject := "hive.broadcast.all"
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		Type:      types.MessageTypeBroadcast,
 		Timestamp: time.Now().UTC(),
@@ -447,7 +455,7 @@ func (d *Director) handleInvokeCapability(msg *nats.Msg) {
 	}
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		To:        req.AgentID,
 		Type:      types.MessageTypeCapabilityRequest,
@@ -560,6 +568,38 @@ func (d *Director) handleClusterStatus(msg *nats.Msg) {
 	})
 }
 
+// --- Auth ---
+
+// withAuth wraps a NATS message handler with authentication. If authFunc is
+// configured, it extracts the From field from the envelope and validates it.
+// Unauthorized requests receive an error response.
+func (d *Director) withAuth(handler func(*nats.Msg)) func(*nats.Msg) {
+	if d.authFunc == nil {
+		return handler
+	}
+	return func(msg *nats.Msg) {
+		var env types.Envelope
+		if err := json.Unmarshal(msg.Data, &env); err != nil {
+			d.respondError(msg, "INVALID_REQUEST", "failed to parse envelope")
+			return
+		}
+		if env.From == "" {
+			d.respondError(msg, "UNAUTHORIZED", "missing sender identity (From field)")
+			return
+		}
+		if err := d.authFunc(env.From); err != nil {
+			d.logger.Warn("unauthorized director tool invocation",
+				"from", env.From,
+				"subject", msg.Subject,
+				"error", err,
+			)
+			d.respondError(msg, "UNAUTHORIZED", fmt.Sprintf("not authorized: %s", err))
+			return
+		}
+		handler(msg)
+	}
+}
+
 // --- Helper methods ---
 
 // parseRequest extracts the payload from a NATS message envelope into the target struct.
@@ -588,7 +628,7 @@ func (d *Director) respondJSON(msg *nats.Msg, payload interface{}) {
 	}
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		Type:      types.MessageTypeResult,
 		Timestamp: time.Now().UTC(),
@@ -613,7 +653,7 @@ func (d *Director) respondError(msg *nats.Msg, code, message string) {
 	}
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      d.agentID,
 		Type:      types.MessageTypeError,
 		Timestamp: time.Now().UTC(),
@@ -634,21 +674,3 @@ func (d *Director) respondError(msg *nats.Msg, code, message string) {
 	}
 }
 
-// newUUID generates a UUID v4 string using crypto/rand.
-func newUUID() string {
-	var uuid [16]byte
-	if _, err := rand.Read(uuid[:]); err != nil {
-		return "00000000-0000-0000-0000-000000000000"
-	}
-
-	uuid[6] = (uuid[6] & 0x0f) | 0x40
-	uuid[8] = (uuid[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		uuid[0:4],
-		uuid[4:6],
-		uuid[6:8],
-		uuid[8:10],
-		uuid[10:16],
-	)
-}

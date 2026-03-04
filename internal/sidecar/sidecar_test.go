@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"testing"
 	"time"
+
+	"github.com/hivehq/hive/internal/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ func TestHeartbeatMessageSchema(t *testing.T) {
 	// We verify the structure by calling newUUID and assembling the same
 	// fields the sidecar would use.
 
-	uuid := newUUID()
+	uuid := types.NewUUID()
 
 	// UUID v4 format: 8-4-4-4-12 hex characters.
 	uuidRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -70,7 +72,7 @@ func TestHeartbeatMessageSchema(t *testing.T) {
 func TestNewUUID_Uniqueness(t *testing.T) {
 	seen := make(map[string]bool)
 	for i := 0; i < 100; i++ {
-		id := newUUID()
+		id := types.NewUUID()
 		if seen[id] {
 			t.Fatalf("duplicate UUID generated: %s", id)
 		}
@@ -80,7 +82,7 @@ func TestNewUUID_Uniqueness(t *testing.T) {
 
 func TestNewUUID_Version4Bits(t *testing.T) {
 	for i := 0; i < 50; i++ {
-		uuid := newUUID()
+		uuid := types.NewUUID()
 		// Version nibble (position 14) must be '4'.
 		if uuid[14] != '4' {
 			t.Errorf("UUID version nibble = %c, want '4' in %s", uuid[14], uuid)

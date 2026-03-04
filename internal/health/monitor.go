@@ -14,16 +14,19 @@ import (
 
 // Monitor watches for agent heartbeats on NATS and updates health state.
 type Monitor struct {
-	store       *state.Store
-	nc          *nats.Conn
-	logger      *slog.Logger
-	interval    time.Duration
-	maxFailures int
+	store          *state.Store
+	nc             *nats.Conn
+	logger         *slog.Logger
+	interval       time.Duration
+	maxFailures    int
+	restartManager *RestartManager // T2-01: integration with RestartManager
 
 	mu          sync.Mutex
 	lastSeen    map[string]time.Time // agentID → last heartbeat time
 	sub         *nats.Subscription
 	stopCh      chan struct{}
+	stopOnce    sync.Once // T3-01: prevent double-close panic
+	started     bool      // T3-02: prevent double-start
 }
 
 // NewMonitor creates a new health monitor.
@@ -45,8 +48,23 @@ func NewMonitor(store *state.Store, nc *nats.Conn, interval time.Duration, maxFa
 	}
 }
 
+// SetRestartManager configures the restart manager invoked when an agent becomes unhealthy.
+// T2-01: The monitor delegates to the RestartManager for policy-based restarts.
+func (m *Monitor) SetRestartManager(rm *RestartManager) {
+	m.restartManager = rm
+}
+
 // Start begins monitoring heartbeats.
+// T3-02: Returns error if already started.
 func (m *Monitor) Start() error {
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return fmt.Errorf("health monitor already started")
+	}
+	m.started = true
+	m.mu.Unlock()
+
 	sub, err := m.nc.Subscribe("hive.health.*", m.handleHeartbeat)
 	if err != nil {
 		return fmt.Errorf("subscribing to health subjects: %w", err)
@@ -59,12 +77,14 @@ func (m *Monitor) Start() error {
 	return nil
 }
 
-// Stop stops the health monitor.
+// Stop stops the health monitor. Safe to call multiple times (T3-01).
 func (m *Monitor) Stop() {
-	close(m.stopCh)
-	if m.sub != nil {
-		m.sub.Unsubscribe()
-	}
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+		if m.sub != nil {
+			m.sub.Unsubscribe()
+		}
+	})
 }
 
 // RecordHeartbeat records a heartbeat for an agent (used when heartbeat arrives outside NATS).
@@ -162,10 +182,16 @@ func (m *Monitor) markUnhealthy(agentID string) {
 	if agent == nil {
 		return
 	}
-	// In M4, we just mark as unhealthy (update error field).
-	// Auto-restart is M5.
+
 	agent.Error = "heartbeat timeout: agent marked unhealthy"
 	if err := m.store.SetAgent(agent); err != nil {
 		m.logger.Error("failed to update agent state", "agent_id", agentID, "error", err)
+	}
+
+	// T2-01: Invoke the restart manager if configured.
+	if m.restartManager != nil {
+		if err := m.restartManager.HandleUnhealthy(agentID); err != nil {
+			m.logger.Error("restart manager error", "agent_id", agentID, "error", err)
+		}
 	}
 }

@@ -1,7 +1,6 @@
 package sidecar
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -11,7 +10,8 @@ import (
 )
 
 // connectNATS establishes a connection to the NATS server at the configured URL.
-// It sets up reconnection handlers for resilient communication.
+// It retries with exponential backoff to handle boot race conditions where
+// the sidecar starts before hived's NATS server is ready (T1-06).
 func (s *Sidecar) connectNATS() error {
 	opts := []nats.Option{
 		nats.Name(fmt.Sprintf("sidecar-%s", s.agentID)),
@@ -28,14 +28,41 @@ func (s *Sidecar) connectNATS() error {
 		}),
 	}
 
-	nc, err := nats.Connect(s.config.NATSUrl, opts...)
-	if err != nil {
-		return fmt.Errorf("connecting to NATS at %s: %w", s.config.NATSUrl, err)
+	// T1-06: Retry with exponential backoff for up to 60s.
+	maxRetryDuration := 60 * time.Second
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+	deadline := time.Now().Add(maxRetryDuration)
+
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		nc, err := nats.Connect(s.config.NATSUrl, opts...)
+		if err == nil {
+			s.natsConn = nc
+			s.logger.Info("connected to NATS", "url", s.config.NATSUrl, "attempt", attempt)
+			return nil
+		}
+		lastErr = err
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		s.logger.Warn("NATS connection failed, retrying",
+			"url", s.config.NATSUrl,
+			"attempt", attempt,
+			"backoff", backoff,
+			"error", err,
+		)
+
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
 
-	s.natsConn = nc
-	s.logger.Info("connected to NATS", "url", s.config.NATSUrl)
-	return nil
+	return fmt.Errorf("connecting to NATS at %s after retries: %w", s.config.NATSUrl, lastErr)
 }
 
 // subscribeControl subscribes to the agent's control subject for receiving
@@ -139,7 +166,7 @@ func (s *Sidecar) publishHeartbeat(subject string) {
 	}
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      s.agentID,
 		To:        "hived",
 		Type:      types.MessageTypeHealth,
@@ -182,25 +209,3 @@ func (s *Sidecar) closeNATS() {
 	s.logger.Info("NATS connection closed")
 }
 
-// newUUID generates a UUID v4 string using crypto/rand.
-func newUUID() string {
-	var uuid [16]byte
-	if _, err := rand.Read(uuid[:]); err != nil {
-		// crypto/rand should never fail on supported platforms.
-		// Fall back to a zero UUID rather than panicking.
-		return "00000000-0000-0000-0000-000000000000"
-	}
-
-	// Set version 4 (bits 12-15 of time_hi_and_version).
-	uuid[6] = (uuid[6] & 0x0f) | 0x40
-	// Set variant to RFC 4122 (bits 6-7 of clock_seq_hi_and_reserved).
-	uuid[8] = (uuid[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		uuid[0:4],
-		uuid[4:6],
-		uuid[6:8],
-		uuid[8:10],
-		uuid[10:16],
-	)
-}

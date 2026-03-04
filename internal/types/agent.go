@@ -109,9 +109,16 @@ type AgentPlacement struct {
 	Arch       string            `yaml:"arch,omitempty" json:"arch,omitempty"`
 }
 
+// AgentFirmware defines firmware-specific build and flash configuration.
+// T4-05: All fields from 02-SCHEMAS.md lines 163-168.
 type AgentFirmware struct {
-	Platform string `yaml:"platform,omitempty" json:"platform,omitempty"`
-	Board    string `yaml:"board,omitempty" json:"board,omitempty"`
+	Platform       string   `yaml:"platform,omitempty" json:"platform,omitempty"`
+	Board          string   `yaml:"board,omitempty" json:"board,omitempty"`
+	PartitionTable string   `yaml:"partitionTable,omitempty" json:"partitionTable,omitempty"`
+	ExtraLibs      []string `yaml:"extraLibs,omitempty" json:"extraLibs,omitempty"`
+	BuildFlags     []string `yaml:"buildFlags,omitempty" json:"buildFlags,omitempty"`
+	FlashMethod    string   `yaml:"flashMethod,omitempty" json:"flashMethod,omitempty"`
+	FlashBaud      int      `yaml:"flashBaud,omitempty" json:"flashBaud,omitempty"`
 }
 
 type AgentHardware struct {

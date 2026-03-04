@@ -1,7 +1,6 @@
 package crossteam
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -72,7 +71,7 @@ func NewRouter(nc *nats.Conn, store *state.Store, logger *slog.Logger) *Router {
 //
 // For each exposed capability, it subscribes to:
 //
-//	org.capabilities.{AGENT_ID}.{CAPABILITY}.request
+//	hive.org.capabilities.{AGENT_ID}.{CAPABILITY}.request
 //
 // The router forwards requests to the agent's internal capability subject:
 //
@@ -108,7 +107,7 @@ func (r *Router) Start(teams map[string]*types.TeamManifest) error {
 					capability: agentCap.Name,
 				}
 
-				subject := fmt.Sprintf("org.capabilities.%s.%s.request", agentID, agentCap.Name)
+				subject := fmt.Sprintf("hive.org.capabilities.%s.%s.request", agentID, agentCap.Name)
 				capName := agentCap.Name
 				aID := agentID
 
@@ -206,7 +205,9 @@ func (r *Router) handleCrossTeamRequest(msg *nats.Msg, agentID, capName string) 
 		return
 	}
 
-	// Forward the response back to the original caller.
+	// Forward the raw response bytes back to the original caller.
+	// The agent's response is already a marshaled types.Envelope, so we
+	// publish it as-is. Error responses use the same format (see publishErrorResponse).
 	if msg.Reply != "" {
 		if err := r.natsConn.Publish(msg.Reply, resp.Data); err != nil {
 			r.logger.Error("failed to publish cross-team response",
@@ -225,28 +226,28 @@ func (r *Router) handleCrossTeamRequest(msg *nats.Msg, agentID, capName string) 
 }
 
 // publishErrorResponse sends an error response to the reply subject.
+// The response is marshaled as a types.Envelope (raw bytes), matching the
+// format used by the success path which forwards the agent's raw envelope bytes.
 func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message string, start time.Time) {
 	if msg.Reply == "" {
 		return
 	}
 
-	resp := InvocationResponse{
-		Capability: capName,
-		Status:     "error",
-		Error: &InvocationError{
-			Code:      code,
-			Message:   message,
-			Retryable: code == "TIMEOUT",
-		},
-		DurationMs: time.Since(start).Milliseconds(),
-	}
-
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      "crossteam-router",
 		Type:      types.MessageTypeCapabilityResponse,
 		Timestamp: time.Now().UTC(),
-		Payload:   resp,
+		Payload: InvocationResponse{
+			Capability: capName,
+			Status:     "error",
+			Error: &InvocationError{
+				Code:      code,
+				Message:   message,
+				Retryable: code == "TIMEOUT",
+			},
+			DurationMs: time.Since(start).Milliseconds(),
+		},
 	}
 
 	data, err := json.Marshal(env)
@@ -309,21 +310,3 @@ func ToolName(capability, teamID string) string {
 	return fmt.Sprintf("%s-%s", capability, teamID)
 }
 
-// newUUID generates a UUID v4 string using crypto/rand.
-func newUUID() string {
-	var uuid [16]byte
-	if _, err := rand.Read(uuid[:]); err != nil {
-		return "00000000-0000-0000-0000-000000000000"
-	}
-
-	uuid[6] = (uuid[6] & 0x0f) | 0x40
-	uuid[8] = (uuid[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		uuid[0:4],
-		uuid[4:6],
-		uuid[6:8],
-		uuid[8:10],
-		uuid[10:16],
-	)
-}

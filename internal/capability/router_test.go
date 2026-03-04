@@ -181,7 +181,7 @@ func TestRouter_EnvelopeFields(t *testing.T) {
 
 		// Build a proper response envelope.
 		respEnv := types.Envelope{
-			ID:            newUUID(),
+			ID:            types.NewUUID(),
 			From:          "agent-b",
 			To:            reqEnv.From,
 			Type:          types.MessageTypeCapabilityResponse,

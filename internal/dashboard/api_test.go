@@ -543,9 +543,9 @@ func TestServer_CORSHeaders(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// Verify CORS headers.
-	if origin := resp.Header.Get("Access-Control-Allow-Origin"); origin != "*" {
-		t.Errorf("expected Access-Control-Allow-Origin: *, got %q", origin)
+	// Verify CORS headers (default is localhost).
+	if origin := resp.Header.Get("Access-Control-Allow-Origin"); origin != "http://localhost:8080" {
+		t.Errorf("expected Access-Control-Allow-Origin: http://localhost:8080, got %q", origin)
 	}
 	if methods := resp.Header.Get("Access-Control-Allow-Methods"); methods == "" {
 		t.Error("expected Access-Control-Allow-Methods header to be present")
@@ -572,8 +572,8 @@ func TestServer_CORSPreflight(t *testing.T) {
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("expected status 204, got %d", resp.StatusCode)
 	}
-	if origin := resp.Header.Get("Access-Control-Allow-Origin"); origin != "*" {
-		t.Errorf("expected Access-Control-Allow-Origin: *, got %q", origin)
+	if origin := resp.Header.Get("Access-Control-Allow-Origin"); origin != "http://localhost:8080" {
+		t.Errorf("expected Access-Control-Allow-Origin: http://localhost:8080, got %q", origin)
 	}
 }
 

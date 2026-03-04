@@ -88,6 +88,10 @@ func TestStartAgent_Success(t *testing.T) {
 	if agentState.VMCID == 0 {
 		t.Error("VMCID should be non-zero")
 	}
+	// T1-01: Verify VMPID is set after start.
+	if agentState.VMPID == 0 {
+		t.Error("VMPID should be non-zero after start")
+	}
 
 	// Mock hypervisor should show 1 running VM.
 	if mock.RunningCount() != 1 {

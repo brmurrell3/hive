@@ -116,7 +116,7 @@ func TestExposedCapabilityIsInvocableCrossTeam(t *testing.T) {
 		t.Fatalf("marshaling request: %v", err)
 	}
 
-	subject := "org.capabilities.agent-1.code-review.request"
+	subject := "hive.org.capabilities.agent-1.code-review.request"
 	msg, err := nc.Request(subject, data, 5*time.Second)
 	if err != nil {
 		t.Fatalf("cross-team request failed: %v", err)
@@ -177,7 +177,7 @@ func TestUnexposedCapabilityReturnsPermissionError(t *testing.T) {
 
 	// Try to invoke the unexposed "deploy" capability.
 	// This subject should have no subscriber, so we expect a timeout/no-responder.
-	subject := "org.capabilities.agent-1.deploy.request"
+	subject := "hive.org.capabilities.agent-1.deploy.request"
 	req := types.Envelope{
 		ID:        "cross-team-req-2",
 		From:      "agent-2",
@@ -259,7 +259,7 @@ func TestAllExposureMode(t *testing.T) {
 
 	// Verify we can actually invoke them.
 	for _, capName := range []string{"code-review", "deploy", "test"} {
-		subject := "org.capabilities.agent-1." + capName + ".request"
+		subject := "hive.org.capabilities.agent-1." + capName + ".request"
 		req := types.Envelope{
 			ID:        "req-" + capName,
 			From:      "agent-2",

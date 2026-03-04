@@ -45,6 +45,7 @@ type Client struct {
 	agentID  string
 	verified bool
 	topics   []string
+	subs     []*nats.Subscription // T1-10: track NATS subscriptions for cleanup
 	mu       sync.Mutex
 	bridge   *Bridge
 }
@@ -142,6 +143,7 @@ func (b *Bridge) acceptLoop() {
 
 // handleConnection manages a single MQTT client connection.
 // This implements a minimal subset of MQTT v3.1.1 needed for firmware agents.
+// T1-08: Uses proper MQTT packet framing instead of one-packet-per-read assumption.
 func (b *Bridge) handleConnection(conn net.Conn) {
 	client := &Client{
 		conn:   conn,
@@ -149,6 +151,14 @@ func (b *Bridge) handleConnection(conn net.Conn) {
 	}
 
 	defer func() {
+		// T1-10: Unsubscribe all NATS subscriptions for this client.
+		client.mu.Lock()
+		for _, sub := range client.subs {
+			sub.Unsubscribe()
+		}
+		client.subs = nil
+		client.mu.Unlock()
+
 		b.mu.Lock()
 		delete(b.clients, client.agentID)
 		b.mu.Unlock()
@@ -158,7 +168,8 @@ func (b *Bridge) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, 0, 8192)
+	readBuf := make([]byte, 4096)
 	for {
 		select {
 		case <-b.stopCh:
@@ -167,7 +178,7 @@ func (b *Bridge) handleConnection(conn net.Conn) {
 		}
 
 		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		n, err := conn.Read(buf)
+		n, err := conn.Read(readBuf)
 		if err != nil {
 			return
 		}
@@ -175,10 +186,34 @@ func (b *Bridge) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		data := buf[:n]
-		if err := client.handlePacket(data); err != nil {
-			b.logger.Warn("packet handling error", "error", err, "agent_id", client.agentID)
-			return
+		buf = append(buf, readBuf[:n]...)
+
+		// T1-08: Process all complete packets in the buffer.
+		for len(buf) >= 2 {
+			// Read fixed header to determine remaining length.
+			remainLen, bytesUsed := decodeRemainingLength(buf[1:])
+			if bytesUsed == 0 {
+				break // need more data for remaining length
+			}
+			// Check if the last byte of remaining length still has continuation bit.
+			if buf[1+bytesUsed-1]&0x80 != 0 && bytesUsed < 4 {
+				break // incomplete remaining length encoding
+			}
+
+			totalLen := 1 + bytesUsed + remainLen
+			if len(buf) < totalLen {
+				break // incomplete packet, wait for more data
+			}
+
+			// Extract one complete packet.
+			packet := make([]byte, totalLen)
+			copy(packet, buf[:totalLen])
+			buf = buf[totalLen:]
+
+			if err := client.handlePacket(packet); err != nil {
+				b.logger.Warn("packet handling error", "error", err, "agent_id", client.agentID)
+				return
+			}
 		}
 	}
 }
@@ -271,9 +306,12 @@ func (c *Client) handleConnect(data []byte) error {
 		agentID = clientID
 	}
 
-	// Validate the token
+	// T3-03: Require authentication — empty password connections are rejected.
 	returnCode := byte(0) // success
-	if password != "" {
+	if password == "" {
+		returnCode = 5 // not authorized
+		c.bridge.logger.Warn("MQTT auth rejected: no password", "agent_id", agentID)
+	} else {
 		t := c.bridge.store.ValidateToken(password)
 		if t == nil {
 			returnCode = 5 // not authorized
@@ -324,8 +362,15 @@ func (c *Client) handlePublish(data []byte) error {
 
 	// QoS from fixed header
 	qos := (data[0] >> 1) & 0x03
+
+	// T1-09: Capture packet ID immediately before advancing offset.
+	var packetIDBytes [2]byte
 	if qos > 0 {
-		// Skip packet identifier for QoS 1/2
+		if offset+2 > len(data) {
+			return fmt.Errorf("PUBLISH packet too short for packet ID")
+		}
+		packetIDBytes[0] = data[offset]
+		packetIDBytes[1] = data[offset+1]
 		offset += 2
 	}
 
@@ -350,10 +395,9 @@ func (c *Client) handlePublish(data []byte) error {
 		"size", len(payload),
 	)
 
-	// Send PUBACK for QoS 1
-	if qos == 1 && len(data) >= offset {
-		packetID := data[offset-2-len(payload) : offset-len(payload)]
-		puback := []byte{0x40, 0x02, packetID[0], packetID[1]}
+	// T1-09: Send PUBACK for QoS 1 using the captured packet ID.
+	if qos == 1 {
+		puback := []byte{0x40, 0x02, packetIDBytes[0], packetIDBytes[1]}
 		c.conn.Write(puback)
 	}
 
@@ -430,10 +474,18 @@ func (c *Client) handlePing() error {
 }
 
 // subscribeForClient creates a NATS subscription that forwards messages to an MQTT client.
+// T1-10: The subscription is stored on the client for cleanup on disconnect.
 func (b *Bridge) subscribeForClient(c *Client, natsSubject, mqttTopic string) {
-	b.natsConn.Subscribe(natsSubject, func(msg *nats.Msg) {
+	sub, err := b.natsConn.Subscribe(natsSubject, func(msg *nats.Msg) {
 		c.publishToMQTT(mqttTopic, msg.Data)
 	})
+	if err != nil {
+		b.logger.Warn("failed to subscribe for client", "agent_id", c.agentID, "subject", natsSubject, "error", err)
+		return
+	}
+	c.mu.Lock()
+	c.subs = append(c.subs, sub)
+	c.mu.Unlock()
 }
 
 // publishToMQTT sends an MQTT PUBLISH packet to the client.

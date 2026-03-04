@@ -39,6 +39,7 @@ type Action struct {
 // triggered by fsnotify events.
 type Reconciler struct {
 	mu            sync.Mutex
+	runMu         sync.Mutex // T2-07: serializes runOnce calls
 	store         *state.Store
 	clusterRoot   string
 	logger        *slog.Logger
@@ -46,6 +47,9 @@ type Reconciler struct {
 	interval      time.Duration
 	stopCh        chan struct{}
 	stopped       chan struct{}
+	stopOnce      sync.Once // T3-01: prevent double-close panic
+	started       bool      // T3-02: prevent double-start
+	triggerCh     chan struct{}
 }
 
 // NewReconciler creates a new Reconciler.
@@ -57,6 +61,7 @@ func NewReconciler(store *state.Store, clusterRoot string, logger *slog.Logger) 
 		interval:    5 * time.Second,
 		stopCh:      make(chan struct{}),
 		stopped:     make(chan struct{}),
+		triggerCh:   make(chan struct{}, 1), // T2-07: buffered for coalesced triggers
 	}
 }
 
@@ -77,7 +82,16 @@ func (r *Reconciler) SetActionHandler(handler func(Action) error) {
 
 // Start begins the periodic reconciliation loop. It runs in a goroutine
 // and returns immediately. Call Stop to halt it.
+// T3-02: Returns error if already started.
 func (r *Reconciler) Start() error {
+	r.mu.Lock()
+	if r.started {
+		r.mu.Unlock()
+		return fmt.Errorf("reconciler already started")
+	}
+	r.started = true
+	r.mu.Unlock()
+
 	r.logger.Info("reconciler starting", "interval", r.interval)
 
 	go func() {
@@ -93,6 +107,8 @@ func (r *Reconciler) Start() error {
 			select {
 			case <-ticker.C:
 				r.runOnce()
+			case <-r.triggerCh:
+				r.runOnce()
 			case <-r.stopCh:
 				r.logger.Info("reconciler stopped")
 				return
@@ -104,20 +120,30 @@ func (r *Reconciler) Start() error {
 }
 
 // Stop halts the reconciliation loop and waits for it to finish.
+// T3-01: Safe to call multiple times.
 func (r *Reconciler) Stop() {
-	close(r.stopCh)
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+	})
 	<-r.stopped
 }
 
 // Trigger forces an immediate reconciliation pass outside the timer.
-// This is intended to be called from fsnotify event handlers.
+// T2-07: Sends to a buffered channel, coalescing multiple triggers.
 func (r *Reconciler) Trigger() {
-	r.runOnce()
+	select {
+	case r.triggerCh <- struct{}{}:
+	default:
+		// Already a pending trigger, no need to queue another.
+	}
 }
 
 // runOnce performs a single reconciliation pass: compute actions and
-// dispatch them to the handler.
+// dispatch them to the handler. T2-07: Protected by runMu to prevent concurrent runs.
 func (r *Reconciler) runOnce() {
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+
 	actions := r.Reconcile()
 	if len(actions) == 0 {
 		return
@@ -199,7 +225,7 @@ func (r *Reconciler) Reconcile() []Action {
 		if !exists {
 			continue
 		}
-		newHash := manifestHash(manifest)
+		newHash, _ := manifestHash(manifest)
 		if agentState.ManifestHash != "" && agentState.ManifestHash != newHash {
 			restartActions = append(restartActions, Action{
 				Type:     ActionRestart,
@@ -231,19 +257,70 @@ func sortActions(actions []Action) {
 	})
 }
 
-// manifestHash computes a SHA-256 hash of the manifest's JSON representation
-// to detect changes.
-func manifestHash(manifest *types.AgentManifest) string {
-	data, err := json.Marshal(manifest)
+// manifestHash computes a stable SHA-256 hash of the manifest.
+// T2-08: Uses sorted map keys for deterministic output regardless of iteration order.
+func manifestHash(manifest *types.AgentManifest) (string, error) {
+	// Create a stable representation by sorting map keys.
+	// We hash a canonical form: sort the struct's map fields.
+	type stableManifest struct {
+		APIVersion string
+		Kind       string
+		ID         string
+		Team       string
+		Labels     [][2]string // sorted key-value pairs
+		Tier       string
+		Mode       string
+		Memory     string
+		VCPUs      int
+		Runtime    types.AgentRuntime
+		Caps       []types.AgentCapability
+		Env        [][2]string
+		NodeLabels [][2]string
+	}
+
+	sortMap := func(m map[string]string) [][2]string {
+		if len(m) == 0 {
+			return nil
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		pairs := make([][2]string, len(keys))
+		for i, k := range keys {
+			pairs[i] = [2]string{k, m[k]}
+		}
+		return pairs
+	}
+
+	sm := stableManifest{
+		APIVersion: manifest.APIVersion,
+		Kind:       manifest.Kind,
+		ID:         manifest.Metadata.ID,
+		Team:       manifest.Metadata.Team,
+		Labels:     sortMap(manifest.Metadata.Labels),
+		Tier:       manifest.Spec.Tier,
+		Mode:       manifest.Spec.Mode,
+		Memory:     manifest.Spec.Resources.Memory,
+		VCPUs:      manifest.Spec.Resources.VCPUs,
+		Runtime:    manifest.Spec.Runtime,
+		Caps:       manifest.Spec.Capabilities,
+		Env:        sortMap(manifest.Spec.Runtime.Model.Env),
+		NodeLabels: sortMap(manifest.Spec.Placement.NodeLabels),
+	}
+
+	data, err := json.Marshal(sm)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("marshaling manifest for hash: %w", err)
 	}
 	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h)
+	return fmt.Sprintf("%x", h), nil
 }
 
 // ManifestHash is exported for use by other packages that need to compute
 // the hash of a manifest (e.g., when setting ManifestHash on AgentState).
 func ManifestHash(manifest *types.AgentManifest) string {
-	return manifestHash(manifest)
+	h, _ := manifestHash(manifest)
+	return h
 }

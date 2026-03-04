@@ -65,6 +65,10 @@ type Aggregator struct {
 	followers map[string][]chan LogEntry
 	stopOnce  sync.Once
 	done      chan struct{}
+
+	// fileMu protects the openFiles map.
+	fileMu    sync.Mutex
+	openFiles map[string]*os.File // keyed by file path
 }
 
 // NewAggregator creates a new log aggregator. It does not start subscribing
@@ -93,6 +97,7 @@ func NewAggregator(cfg AggregatorConfig) *Aggregator {
 		logger:        logger,
 		followers:     make(map[string][]chan LogEntry),
 		done:          make(chan struct{}),
+		openFiles:     make(map[string]*os.File),
 	}
 }
 
@@ -123,7 +128,7 @@ func (a *Aggregator) Start() error {
 	return nil
 }
 
-// Stop unsubscribes from NATS and closes all follower channels.
+// Stop unsubscribes from NATS, closes all open log files, and closes all follower channels.
 func (a *Aggregator) Stop() {
 	a.stopOnce.Do(func() {
 		close(a.done)
@@ -133,6 +138,16 @@ func (a *Aggregator) Stop() {
 				a.logger.Warn("error unsubscribing from logs", "error", err)
 			}
 		}
+
+		// Close all open file handles.
+		a.fileMu.Lock()
+		for path, f := range a.openFiles {
+			if err := f.Close(); err != nil {
+				a.logger.Warn("error closing log file", "path", path, "error", err)
+			}
+			delete(a.openFiles, path)
+		}
+		a.fileMu.Unlock()
 
 		// Close all follower channels.
 		a.mu.Lock()
@@ -202,6 +217,7 @@ func (a *Aggregator) extractLogEntry(env types.Envelope) (LogEntry, error) {
 }
 
 // writeEntry appends a log entry to the appropriate agent log file.
+// File handles are kept open and reused across calls for performance.
 func (a *Aggregator) writeEntry(entry LogEntry) error {
 	agentDir := filepath.Join(a.logDir, entry.AgentID)
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
@@ -211,9 +227,13 @@ func (a *Aggregator) writeEntry(entry LogEntry) error {
 	date := entry.Timestamp.Format("2006-01-02")
 	logFile := filepath.Join(agentDir, date+".jsonl")
 
-	// Check if rotation is needed.
-	if err := a.rotateIfNeeded(logFile); err != nil {
+	// Check if rotation is needed. If rotation happens, close the cached handle.
+	rotated, err := a.rotateIfNeeded(logFile)
+	if err != nil {
 		a.logger.Warn("error during log rotation", "file", logFile, "error", err)
+	}
+	if rotated {
+		a.closeFile(logFile)
 	}
 
 	data, err := json.Marshal(entry)
@@ -221,31 +241,61 @@ func (a *Aggregator) writeEntry(entry LogEntry) error {
 		return fmt.Errorf("marshaling log entry: %w", err)
 	}
 
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := a.getOrOpenFile(logFile)
 	if err != nil {
 		return fmt.Errorf("opening log file %s: %w", logFile, err)
 	}
-	defer f.Close()
 
 	if _, err := f.Write(append(data, '\n')); err != nil {
+		// On write error, close and remove the cached handle.
+		a.closeFile(logFile)
 		return fmt.Errorf("writing to log file %s: %w", logFile, err)
 	}
 
 	return nil
 }
 
+// getOrOpenFile returns a cached file handle or opens a new one.
+func (a *Aggregator) getOrOpenFile(path string) (*os.File, error) {
+	a.fileMu.Lock()
+	defer a.fileMu.Unlock()
+
+	if f, ok := a.openFiles[path]; ok {
+		return f, nil
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	a.openFiles[path] = f
+	return f, nil
+}
+
+// closeFile closes and removes a cached file handle.
+func (a *Aggregator) closeFile(path string) {
+	a.fileMu.Lock()
+	defer a.fileMu.Unlock()
+
+	if f, ok := a.openFiles[path]; ok {
+		f.Close()
+		delete(a.openFiles, path)
+	}
+}
+
 // rotateIfNeeded renames the log file if it exceeds the maximum file size.
-func (a *Aggregator) rotateIfNeeded(logFile string) error {
+// Returns true if rotation occurred.
+func (a *Aggregator) rotateIfNeeded(logFile string) (bool, error) {
 	info, err := os.Stat(logFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("stat %s: %w", logFile, err)
+		return false, fmt.Errorf("stat %s: %w", logFile, err)
 	}
 
 	if info.Size() < a.maxFileSize {
-		return nil
+		return false, nil
 	}
 
 	// Find the next rotation number.
@@ -256,10 +306,10 @@ func (a *Aggregator) rotateIfNeeded(logFile string) error {
 		rotated := fmt.Sprintf("%s.%d%s", base, i, ext)
 		if _, err := os.Stat(rotated); os.IsNotExist(err) {
 			if err := os.Rename(logFile, rotated); err != nil {
-				return fmt.Errorf("rotating %s to %s: %w", logFile, rotated, err)
+				return false, fmt.Errorf("rotating %s to %s: %w", logFile, rotated, err)
 			}
 			a.logger.Info("rotated log file", "from", logFile, "to", rotated)
-			return nil
+			return true, nil
 		}
 	}
 }
@@ -435,7 +485,7 @@ func (a *Aggregator) matchesQuery(entry LogEntry, opts QueryOpts) bool {
 
 // Follow returns a channel that receives new log entries for the given agent
 // in real time, and a cancel function that stops the follow and closes the
-// channel.
+// channel. The cancel function is safe to call multiple times.
 func (a *Aggregator) Follow(agentID string) (<-chan LogEntry, func()) {
 	ch := make(chan LogEntry, 64)
 
@@ -443,18 +493,21 @@ func (a *Aggregator) Follow(agentID string) (<-chan LogEntry, func()) {
 	a.followers[agentID] = append(a.followers[agentID], ch)
 	a.mu.Unlock()
 
+	var once sync.Once
 	cancel := func() {
-		a.mu.Lock()
-		defer a.mu.Unlock()
+		once.Do(func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
 
-		channels := a.followers[agentID]
-		for i, c := range channels {
-			if c == ch {
-				a.followers[agentID] = append(channels[:i], channels[i+1:]...)
-				break
+			channels := a.followers[agentID]
+			for i, c := range channels {
+				if c == ch {
+					a.followers[agentID] = append(channels[:i], channels[i+1:]...)
+					break
+				}
 			}
-		}
-		close(ch)
+			close(ch)
+		})
 	}
 
 	return ch, cancel

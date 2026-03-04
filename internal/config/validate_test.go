@@ -152,7 +152,7 @@ func TestValidateDesiredState_AllFieldsPopulated(t *testing.T) {
 
 	team := validTeam("ops", "worker1")
 	team.Spec.SharedVolumes = []types.SharedVolume{
-		{Name: "data", HostPath: "/mnt/data", Access: "rw"},
+		{Name: "data", HostPath: "/mnt/data", Access: "read-write"},
 	}
 
 	ds := mustDS(t, nil,
@@ -290,12 +290,13 @@ spec:
 		}
 	}
 
+	// T2-12: Duplicate agent IDs should now return an error.
 	agents, err := LoadAgents(dir)
-	requireNoError(t, err)
-
-	// Map-based loading means only one survives.
-	if len(agents) != 1 {
-		t.Errorf("expected 1 agent in map (last-writer-wins), got %d", len(agents))
+	if err == nil {
+		t.Fatalf("expected error for duplicate agent IDs, got %d agents", len(agents))
+	}
+	if !strings.Contains(err.Error(), "duplicate agent ID") {
+		t.Errorf("expected 'duplicate agent ID' in error, got: %v", err)
 	}
 }
 

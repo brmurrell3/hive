@@ -27,6 +27,7 @@ type Sidecar struct {
 	mu           sync.RWMutex
 	healthy      bool
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 	broadcastSub *nats.Subscription
 }
 
@@ -194,11 +195,14 @@ func (s *Sidecar) monitorRuntime() {
 
 // Stop performs a graceful shutdown of all sidecar subsystems in reverse
 // start order: heartbeat, HTTP server, runtime, NATS.
+// T3-01: Safe to call multiple times.
 func (s *Sidecar) Stop() error {
 	s.logger.Info("stopping sidecar")
 
-	// Signal the heartbeat goroutine to stop.
-	close(s.stopCh)
+	// T3-01: Use sync.Once to prevent double-close panic.
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 
 	// Shut down the HTTP server with a timeout.
 	if s.httpServer != nil {

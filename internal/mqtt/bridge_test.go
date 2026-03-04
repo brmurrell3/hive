@@ -292,12 +292,12 @@ func TestBridge_ConnectWithNoPassword(t *testing.T) {
 
 	bridge := startBridge(t, nc, store)
 
-	// CONNECT with no password should succeed (password validation skipped when empty).
+	// T3-03: CONNECT with no password should be rejected (auth required).
 	conn, returnCode := connectAndAuth(t, bridge, "anon-client", "", "")
 	defer conn.Close()
 
-	if returnCode != 0 {
-		t.Errorf("CONNACK return code = %d, want 0 (success with no password)", returnCode)
+	if returnCode != 5 {
+		t.Errorf("CONNACK return code = %d, want 5 (not authorized with no password)", returnCode)
 	}
 }
 

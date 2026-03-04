@@ -1,7 +1,9 @@
 # Binaries
-hived
-hivectl
-hive-sidecar
+/hived
+/hivectl
+/hive-sidecar
+/hive-agent
+/bin/
 
 # Build artifacts
 rootfs/rootfs.ext4

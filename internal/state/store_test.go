@@ -4,9 +4,11 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1286,6 +1288,139 @@ func TestHashToken_Consistent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Mixed state: agents, nodes, tokens, and capabilities coexist
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Concurrent state store access (test coverage gap)
+// ---------------------------------------------------------------------------
+
+func TestConcurrentSetAgent_NoRace(t *testing.T) {
+	store, _ := testStore(t)
+
+	// Seed initial agents.
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("agent-%d", i)
+		if err := store.SetAgent(testAgentState(id, "team", AgentStatusPending)); err != nil {
+			t.Fatalf("seeding agent %s: %v", id, err)
+		}
+	}
+
+	// Concurrently update agents from multiple goroutines.
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			id := fmt.Sprintf("agent-%d", idx)
+			for j := 0; j < 50; j++ {
+				a := store.GetAgent(id)
+				if a == nil {
+					t.Errorf("GetAgent(%s) returned nil", id)
+					return
+				}
+				a.RestartCount = j
+				if err := store.SetAgent(a); err != nil {
+					t.Errorf("SetAgent(%s): %v", id, err)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify all agents exist and have reasonable state.
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("agent-%d", i)
+		a := store.GetAgent(id)
+		if a == nil {
+			t.Errorf("agent %s missing after concurrent updates", id)
+		}
+	}
+}
+
+func TestConcurrentModifyAgent_NoLostUpdates(t *testing.T) {
+	store, _ := testStore(t)
+
+	if err := store.SetAgent(testAgentState("counter", "team", AgentStatusRunning)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use ModifyAgent to atomically increment RestartCount from 50 goroutines.
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := store.ModifyAgent("counter", func(a *AgentState) error {
+				a.RestartCount++
+				return nil
+			})
+			if err != nil {
+				t.Errorf("ModifyAgent: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	a := store.GetAgent("counter")
+	if a == nil {
+		t.Fatal("agent not found")
+	}
+	if a.RestartCount != 50 {
+		t.Errorf("RestartCount = %d, want 50 (lost updates detected)", a.RestartCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Empty/zero-byte state file recovery (test coverage gap)
+// ---------------------------------------------------------------------------
+
+func TestNewStore_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	// Create an empty file.
+	if err := os.WriteFile(path, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	_, err := NewStore(path, logger)
+	if err == nil {
+		t.Fatal("expected error for empty state file, got nil")
+	}
+}
+
+func TestNewStore_ZeroBytesButValidJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	// Write minimal valid JSON.
+	if err := os.WriteFile(path, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	// Should initialize properly with empty maps/slices.
+	agents := store.AllAgents()
+	if len(agents) != 0 {
+		t.Errorf("expected 0 agents, got %d", len(agents))
+	}
+
+	nodes := store.AllNodes()
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+
+	tokens := store.AllTokens()
+	if tokens == nil {
+		t.Error("expected non-nil tokens slice")
+	}
+}
 
 func TestMixedState_Coexistence(t *testing.T) {
 	store, path := testStore(t)

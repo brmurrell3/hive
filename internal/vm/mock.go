@@ -28,22 +28,26 @@ func NewMockHypervisor() *MockHypervisor {
 }
 
 // CreateVM simulates VM creation by recording the socket path.
-func (m *MockHypervisor) CreateVM(cfg VMConfig) error {
+// Returns a synthetic PID for the created VM process.
+func (m *MockHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.CreateErr != nil {
-		return m.CreateErr
+		return 0, m.CreateErr
 	}
 
 	if _, exists := m.running[cfg.SocketPath]; exists {
-		return fmt.Errorf("mock: VM already exists at socket %s", cfg.SocketPath)
+		return 0, fmt.Errorf("mock: VM already exists at socket %s", cfg.SocketPath)
 	}
 
-	// Assign a fake PID but don't mark as running yet (StartVM does that).
-	// Store with PID 0 to indicate created but not started.
+	// Assign a fake PID immediately so the manager can store it.
+	pid := m.nextPID
+	m.nextPID++
+	// Store with PID 0 to indicate created but not started; the real PID
+	// is returned to the caller (Manager stores it in state).
 	m.running[cfg.SocketPath] = 0
-	return nil
+	return pid, nil
 }
 
 // StartVM simulates VM boot by assigning a fake PID.

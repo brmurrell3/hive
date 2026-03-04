@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -70,9 +71,16 @@ type firecrackerAction struct {
 	ActionType string `json:"action_type"`
 }
 
+// killAndReap kills a process and calls Wait to prevent zombies (T1-03).
+func killAndReap(cmd *exec.Cmd) {
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+}
+
 // CreateVM spawns the Firecracker process and configures the VM via the API
 // socket. The VM is configured but not started (use StartVM for that).
-func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) error {
+// Returns the process PID on success.
+func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	f.logger.Info("creating Firecracker VM",
 		"agent_id", cfg.AgentID,
 		"socket", cfg.SocketPath,
@@ -90,19 +98,19 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) error {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting firecracker process: %w", err)
+		return 0, fmt.Errorf("starting firecracker process: %w", err)
 	}
 
+	pid := cmd.Process.Pid
 	f.logger.Info("firecracker process started",
 		"agent_id", cfg.AgentID,
-		"pid", cmd.Process.Pid,
+		"pid", pid,
 	)
 
 	// Wait for the API socket to appear.
 	if err := waitForSocket(cfg.SocketPath, 5*time.Second); err != nil {
-		// Kill the process if the socket never appeared.
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("waiting for API socket: %w", err)
+		killAndReap(cmd) // T1-03: reap to prevent zombie
+		return 0, fmt.Errorf("waiting for API socket: %w", err)
 	}
 
 	client := socketHTTPClient(cfg.SocketPath)
@@ -113,8 +121,8 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) error {
 		BootArgs:        "console=ttyS0 reboot=k panic=1 pci=off",
 	}
 	if err := apiPut(client, cfg.SocketPath, "/boot-source", bootSource); err != nil {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("configuring boot source: %w", err)
+		killAndReap(cmd)
+		return 0, fmt.Errorf("configuring boot source: %w", err)
 	}
 
 	// Configure the rootfs drive.
@@ -125,22 +133,23 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) error {
 		IsReadOnly:   false,
 	}
 	if err := apiPut(client, cfg.SocketPath, "/drives/rootfs", rootfsDrive); err != nil {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("configuring rootfs drive: %w", err)
+		killAndReap(cmd)
+		return 0, fmt.Errorf("configuring rootfs drive: %w", err)
 	}
 
-	// If an agent directory is provided, attach it as a secondary drive.
-	if cfg.AgentDir != "" {
-		if _, err := os.Stat(cfg.AgentDir); err == nil {
+	// If an agent drive image is provided, attach it as a secondary drive.
+	// T1-02: This must be a block device image (.img), not a directory.
+	if cfg.AgentDrivePath != "" {
+		if _, err := os.Stat(cfg.AgentDrivePath); err == nil {
 			agentDrive := firecrackerDrive{
 				DriveID:      "agent",
-				PathOnHost:   cfg.AgentDir,
+				PathOnHost:   cfg.AgentDrivePath,
 				IsRootDevice: false,
 				IsReadOnly:   true,
 			}
 			if err := apiPut(client, cfg.SocketPath, "/drives/agent", agentDrive); err != nil {
-				_ = cmd.Process.Kill()
-				return fmt.Errorf("configuring agent drive: %w", err)
+				killAndReap(cmd)
+				return 0, fmt.Errorf("configuring agent drive: %w", err)
 			}
 		}
 	}
@@ -152,8 +161,8 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) error {
 		Smt:        false,
 	}
 	if err := apiPut(client, cfg.SocketPath, "/machine-config", machineCfg); err != nil {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("configuring machine: %w", err)
+		killAndReap(cmd)
+		return 0, fmt.Errorf("configuring machine: %w", err)
 	}
 
 	// Configure vsock for host-guest communication.
@@ -163,16 +172,16 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) error {
 		UDSPath:  vsockPath,
 	}
 	if err := apiPut(client, cfg.SocketPath, "/vsock", vsock); err != nil {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("configuring vsock: %w", err)
+		killAndReap(cmd)
+		return 0, fmt.Errorf("configuring vsock: %w", err)
 	}
 
 	f.logger.Info("Firecracker VM configured",
 		"agent_id", cfg.AgentID,
-		"pid", cmd.Process.Pid,
+		"pid", pid,
 	)
 
-	return nil
+	return pid, nil
 }
 
 // StartVM boots a previously created VM by sending the InstanceStart action
@@ -257,6 +266,8 @@ func (f *FirecrackerHypervisor) DestroyVM(socketPath string, pid int) error {
 
 // IsRunning checks whether a process with the given PID exists by sending
 // signal 0 (which checks for process existence without actually sending a signal).
+// Returns true if the process exists, including when we get EPERM (process
+// exists but belongs to another user).
 func (f *FirecrackerHypervisor) IsRunning(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -267,7 +278,14 @@ func (f *FirecrackerHypervisor) IsRunning(pid int) bool {
 	}
 	// Signal 0 tests for process existence.
 	err = proc.Signal(syscall.Signal(0))
-	return err == nil
+	if err == nil {
+		return true // process exists and we can signal it
+	}
+	// EPERM means the process exists but we can't signal it (different user).
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	return false // ESRCH or other error means process is gone
 }
 
 // socketHTTPClient creates an HTTP client that communicates over a Unix socket.

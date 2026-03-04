@@ -22,9 +22,14 @@ type StateReader interface {
 	AllNodes() []*types.NodeState
 }
 
+const maxLatencyObservations = 10000
+
 // latencyBucket holds observed latency values for computing quantiles.
+// It uses a fixed-size ring buffer to bound memory usage.
 type latencyBucket struct {
 	values []float64
+	pos    int  // next write position in the ring
+	full   bool // true once the ring has wrapped around
 }
 
 // Collector tracks Hive metrics in memory. All methods are thread-safe.
@@ -75,16 +80,29 @@ func (c *Collector) IncMessageCount(subject string) {
 }
 
 // ObserveInvocationLatency records a capability invocation latency observation.
+// Observations are stored in a fixed-size ring buffer (maxLatencyObservations)
+// to prevent unbounded memory growth.
 func (c *Collector) ObserveInvocationLatency(capability string, durationMs float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	bucket, ok := c.latencies[capability]
 	if !ok {
-		bucket = &latencyBucket{}
+		bucket = &latencyBucket{
+			values: make([]float64, 0, maxLatencyObservations),
+		}
 		c.latencies[capability] = bucket
 	}
-	bucket.values = append(bucket.values, durationMs)
+
+	if len(bucket.values) < maxLatencyObservations {
+		// Still filling up the ring buffer.
+		bucket.values = append(bucket.values, durationMs)
+	} else {
+		// Ring buffer is full; overwrite the oldest entry.
+		bucket.values[bucket.pos] = durationMs
+		bucket.full = true
+	}
+	bucket.pos = (bucket.pos + 1) % maxLatencyObservations
 }
 
 // SetHeartbeatStatus records whether an agent is healthy.

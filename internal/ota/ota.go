@@ -1,6 +1,7 @@
 package ota
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -85,7 +86,8 @@ func NewUpdater(nc *nats.Conn, logger *slog.Logger) *Updater {
 	}
 }
 
-// Push initiates an OTA firmware update for the specified agent.
+// Push initiates an OTA firmware update for the specified agent. The provided
+// context can be used to cancel the operation before it completes.
 //
 // OTA protocol:
 //  1. Read binary from disk and compute SHA-256.
@@ -94,7 +96,7 @@ func NewUpdater(nc *nats.Conn, logger *slog.Logger) *Updater {
 //  4. Wait for chunk requests on hive.ota.{AGENT_ID}.request.
 //  5. Publish chunks to hive.ota.{AGENT_ID}.chunk.{INDEX}.
 //  6. Wait for completion or failure on hive.ota.{AGENT_ID}.complete.
-func (u *Updater) Push(update Update) (*UpdateStatus, error) {
+func (u *Updater) Push(ctx context.Context, update Update) (*UpdateStatus, error) {
 	if update.AgentID == "" {
 		return nil, fmt.Errorf("agent ID is required")
 	}
@@ -152,9 +154,19 @@ func (u *Updater) Push(update Update) (*UpdateStatus, error) {
 		"subject", manifestSubject,
 	)
 
-	// Subscribe to chunk requests.
+	// Check context before proceeding.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("OTA push cancelled: %w", err)
+	}
+
+	// Subscribe to chunk requests with context awareness.
 	requestSubject := fmt.Sprintf("hive.ota.%s.request", update.AgentID)
 	requestSub, err := u.nc.Subscribe(requestSubject, func(msg *nats.Msg) {
+		// Check context before processing each chunk request.
+		if ctx.Err() != nil {
+			return
+		}
+
 		var req ChunkRequest
 		if err := json.Unmarshal(msg.Data, &req); err != nil {
 			u.logger.Error("failed to unmarshal chunk request",
@@ -211,7 +223,7 @@ func (u *Updater) Push(update Update) (*UpdateStatus, error) {
 		_ = requestSub.Unsubscribe()
 	}()
 
-	// Wait for completion message.
+	// Wait for completion message with context cancellation support.
 	completeSubject := fmt.Sprintf("hive.ota.%s.complete", update.AgentID)
 	completeSub, err := u.nc.SubscribeSync(completeSubject)
 	if err != nil {
@@ -221,10 +233,25 @@ func (u *Updater) Push(update Update) (*UpdateStatus, error) {
 		_ = completeSub.Unsubscribe()
 	}()
 
-	// Wait up to 5 minutes for the OTA to complete.
-	msg, err := completeSub.NextMsg(5 * time.Minute)
-	if err != nil {
-		if err == nats.ErrTimeout {
+	// Poll for completion in short intervals, checking context between polls.
+	// This allows the caller to cancel the operation via the context instead
+	// of blocking for the full 5-minute timeout.
+	var msg *nats.Msg
+	pollInterval := 500 * time.Millisecond
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		select {
+		case <-ctx.Done():
+			return &UpdateStatus{
+				AgentID:  update.AgentID,
+				Progress: 0,
+				Status:   StatusFailed,
+				Error:    fmt.Sprintf("OTA push cancelled: %s", ctx.Err()),
+			}, nil
+		default:
+		}
+
+		if time.Now().After(deadline) {
 			return &UpdateStatus{
 				AgentID:  update.AgentID,
 				Progress: 0,
@@ -232,7 +259,15 @@ func (u *Updater) Push(update Update) (*UpdateStatus, error) {
 				Error:    "OTA update timed out waiting for completion",
 			}, nil
 		}
-		return nil, fmt.Errorf("waiting for OTA completion: %w", err)
+
+		msg, err = completeSub.NextMsg(pollInterval)
+		if err != nil {
+			if err == nats.ErrTimeout {
+				continue // keep polling
+			}
+			return nil, fmt.Errorf("waiting for OTA completion: %w", err)
+		}
+		break // got a completion message
 	}
 
 	var completion CompletionMessage

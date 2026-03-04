@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
@@ -19,7 +20,8 @@ import (
 type Hypervisor interface {
 	// CreateVM creates a new VM from the given configuration. The VM is not
 	// started yet; the Firecracker process is spawned and configured.
-	CreateVM(cfg VMConfig) error
+	// Returns the process PID and any error.
+	CreateVM(cfg VMConfig) (int, error)
 
 	// StartVM boots a previously created VM via its API socket.
 	StartVM(socketPath string) error
@@ -37,14 +39,14 @@ type Hypervisor interface {
 
 // VMConfig holds the configuration for creating a new Firecracker VM.
 type VMConfig struct {
-	AgentID    string
-	SocketPath string
-	RootfsPath string
-	KernelPath string
-	MemoryMB   int
-	VCPUs      int
-	CID        uint32
-	AgentDir   string // path to agent directory for file mounting
+	AgentID        string
+	SocketPath     string
+	RootfsPath     string
+	KernelPath     string
+	MemoryMB       int
+	VCPUs          int
+	CID            uint32
+	AgentDrivePath string // path to ext4 disk image for agent files (T1-02)
 }
 
 // Manager handles Firecracker VM lifecycle. It coordinates between the
@@ -135,39 +137,54 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 	kernelPath := filepath.Join(m.clusterRoot, "rootfs", "vmlinux")
 	baseRootfs := filepath.Join(m.clusterRoot, "rootfs", "rootfs.ext4")
 	agentDir := filepath.Join(m.clusterRoot, "agents", agentID)
+	agentDriveImg := filepath.Join(stateDir, "agent-drive.img")
 
 	// Copy rootfs for this VM (Firecracker requires a dedicated rootfs per VM).
 	if err := copyFile(baseRootfs, rootfsCopy); err != nil {
 		return m.failAgent(agentState, fmt.Errorf("copying rootfs for agent %s: %w", agentID, err))
 	}
 
+	// T1-02: Create ext4 disk image from agent directory for Firecracker drive API.
+	var agentDrivePath string
+	if _, err := os.Stat(agentDir); err == nil {
+		if err := createAgentDriveImage(agentDir, agentDriveImg); err != nil {
+			os.Remove(rootfsCopy)
+			return m.failAgent(agentState, fmt.Errorf("creating agent drive image for %s: %w", agentID, err))
+		}
+		agentDrivePath = agentDriveImg
+	}
+
 	// Allocate a unique CID for virtio-vsock.
 	cid := m.allocateCID()
 
 	vmCfg := VMConfig{
-		AgentID:    agentID,
-		SocketPath: socketPath,
-		RootfsPath: rootfsCopy,
-		KernelPath: kernelPath,
-		MemoryMB:   memoryMB,
-		VCPUs:      vcpus,
-		CID:        cid,
-		AgentDir:   agentDir,
+		AgentID:        agentID,
+		SocketPath:     socketPath,
+		RootfsPath:     rootfsCopy,
+		KernelPath:     kernelPath,
+		MemoryMB:       memoryMB,
+		VCPUs:          vcpus,
+		CID:            cid,
+		AgentDrivePath: agentDrivePath,
 	}
 
 	// Create the VM via the hypervisor.
-	if err := m.hypervisor.CreateVM(vmCfg); err != nil {
+	vmPID, err := m.hypervisor.CreateVM(vmCfg)
+	if err != nil {
+		os.Remove(rootfsCopy) // T1-05: clean up rootfs copy on failure
 		return m.failAgent(agentState, fmt.Errorf("creating VM for agent %s: %w", agentID, err))
 	}
 
 	// Transition to STARTING.
 	if err := state.ValidateTransition(agentState.Status, state.AgentStatusStarting); err != nil {
+		os.Remove(rootfsCopy)
 		return m.failAgent(agentState, err)
 	}
 	agentState.Status = state.AgentStatusStarting
 	agentState.VMSocketPath = socketPath
 	agentState.RootfsCopyPath = rootfsCopy
 	agentState.VMCID = cid
+	agentState.VMPID = vmPID
 	agentState.LastTransition = time.Now()
 	if err := m.store.SetAgent(agentState); err != nil {
 		return fmt.Errorf("setting agent state to STARTING: %w", err)
@@ -175,6 +192,7 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 
 	// Start (boot) the VM.
 	if err := m.hypervisor.StartVM(socketPath); err != nil {
+		os.Remove(rootfsCopy) // T1-05: clean up rootfs copy on failure
 		return m.failAgent(agentState, fmt.Errorf("starting VM for agent %s: %w", agentID, err))
 	}
 
@@ -341,11 +359,22 @@ func (m *Manager) RestartAgent(agentID string, agent *types.AgentManifest) error
 
 // ReconcileOnStartup checks all known agents in state against their actual
 // process status. VMs whose processes are no longer running are marked FAILED.
+// It also restores nextCID to avoid CID collisions with existing VMs.
 // This should be called once at hived startup to recover from crashes.
 func (m *Manager) ReconcileOnStartup() error {
 	m.logger.Info("reconciling VM state on startup")
 
 	agents := m.store.AllAgents()
+
+	// T1-04: Restore nextCID from existing agent CIDs to prevent reuse.
+	m.mu.Lock()
+	for _, agent := range agents {
+		if agent.VMCID >= m.nextCID {
+			m.nextCID = agent.VMCID + 1
+		}
+	}
+	m.mu.Unlock()
+
 	for _, agent := range agents {
 		switch agent.Status {
 		case state.AgentStatusRunning, state.AgentStatusStarting, state.AgentStatusStopping:
@@ -444,6 +473,81 @@ func (m *Manager) failAgent(agentState *state.AgentState, cause error) error {
 		)
 	}
 	return cause
+}
+
+// createAgentDriveImage creates an ext4 disk image from an agent's directory
+// contents. The image can be attached as a secondary Firecracker drive.
+// T1-02: Firecracker requires block device images, not directories.
+func createAgentDriveImage(agentDir, imgPath string) error {
+	// Calculate the size needed (minimum 4MB to fit ext4 metadata).
+	var totalSize int64
+	err := filepath.Walk(agentDir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("calculating agent directory size: %w", err)
+	}
+
+	// Add padding for ext4 metadata and overhead (at least 4MB).
+	imgSizeMB := (totalSize/(1024*1024) + 4)
+	if imgSizeMB < 4 {
+		imgSizeMB = 4
+	}
+
+	// Create a sparse file of the right size.
+	f, err := os.Create(imgPath)
+	if err != nil {
+		return fmt.Errorf("creating image file: %w", err)
+	}
+	if err := f.Truncate(imgSizeMB * 1024 * 1024); err != nil {
+		f.Close()
+		os.Remove(imgPath)
+		return fmt.Errorf("sizing image file: %w", err)
+	}
+	f.Close()
+
+	// Format as ext4.
+	mkfs := exec.Command("mkfs.ext4", "-q", "-F", imgPath)
+	if out, err := mkfs.CombinedOutput(); err != nil {
+		os.Remove(imgPath)
+		return fmt.Errorf("mkfs.ext4: %s: %w", string(out), err)
+	}
+
+	// Mount, copy files, unmount.
+	mountPoint, err := os.MkdirTemp("", "hive-agent-mount-*")
+	if err != nil {
+		os.Remove(imgPath)
+		return fmt.Errorf("creating mount point: %w", err)
+	}
+	defer os.RemoveAll(mountPoint)
+
+	mount := exec.Command("mount", "-o", "loop", imgPath, mountPoint)
+	if out, err := mount.CombinedOutput(); err != nil {
+		os.Remove(imgPath)
+		return fmt.Errorf("mounting image: %s: %w", string(out), err)
+	}
+
+	// Copy agent files into the mounted image.
+	cp := exec.Command("cp", "-a", agentDir+"/.", mountPoint+"/")
+	if out, err := cp.CombinedOutput(); err != nil {
+		exec.Command("umount", mountPoint).Run()
+		os.Remove(imgPath)
+		return fmt.Errorf("copying agent files: %s: %w", string(out), err)
+	}
+
+	umount := exec.Command("umount", mountPoint)
+	if out, err := umount.CombinedOutput(); err != nil {
+		os.Remove(imgPath)
+		return fmt.Errorf("unmounting image: %s: %w", string(out), err)
+	}
+
+	return nil
 }
 
 // copyFile copies a regular file from src to dst. It creates dst if it does

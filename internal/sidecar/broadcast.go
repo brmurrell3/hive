@@ -19,7 +19,7 @@ func (s *Sidecar) SubscribeTeamBroadcast(handler BroadcastHandler) error {
 		return fmt.Errorf("no team ID configured")
 	}
 
-	subject := fmt.Sprintf("team.%s.broadcast", s.teamID)
+	subject := fmt.Sprintf("hive.team.%s.broadcast", s.teamID)
 	sub, err := s.natsConn.Subscribe(subject, func(msg *nats.Msg) {
 		var env types.Envelope
 		if err := json.Unmarshal(msg.Data, &env); err != nil {
@@ -48,10 +48,10 @@ func (s *Sidecar) PublishTeamBroadcast(payload interface{}) error {
 		return fmt.Errorf("no team ID configured")
 	}
 
-	subject := fmt.Sprintf("team.%s.broadcast", s.teamID)
+	subject := fmt.Sprintf("hive.team.%s.broadcast", s.teamID)
 
 	env := types.Envelope{
-		ID:        newUUID(),
+		ID:        types.NewUUID(),
 		From:      s.agentID,
 		To:        subject,
 		Type:      types.MessageTypeBroadcast,

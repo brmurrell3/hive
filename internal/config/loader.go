@@ -157,13 +157,23 @@ func LoadAgents(clusterRoot string) (map[string]*types.AgentManifest, error) {
 		if !entry.IsDir() {
 			continue
 		}
+		// T4-01: Support both .yaml and .yml extensions for agent manifests.
 		manifestPath := filepath.Join(agentsDir, entry.Name(), "manifest.yaml")
 		data, err := os.ReadFile(manifestPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				continue
+				// Try .yml extension as fallback.
+				manifestPath = filepath.Join(agentsDir, entry.Name(), "manifest.yml")
+				data, err = os.ReadFile(manifestPath)
+				if err != nil {
+					if os.IsNotExist(err) {
+						continue
+					}
+					return nil, fmt.Errorf("reading agent manifest %s: %w", entry.Name(), err)
+				}
+			} else {
+				return nil, fmt.Errorf("reading agent manifest %s: %w", entry.Name(), err)
 			}
-			return nil, fmt.Errorf("reading agent manifest %s: %w", entry.Name(), err)
 		}
 
 		agent, err := ParseAgent(data)
@@ -171,6 +181,11 @@ func LoadAgents(clusterRoot string) (map[string]*types.AgentManifest, error) {
 			return nil, fmt.Errorf("parsing agent manifest %s: %w", entry.Name(), err)
 		}
 
+		// T2-12: Detect duplicate agent IDs.
+		if existing, dup := agents[agent.Metadata.ID]; dup {
+			_ = existing
+			return nil, fmt.Errorf("duplicate agent ID %q: found in %s and another directory", agent.Metadata.ID, entry.Name())
+		}
 		agents[agent.Metadata.ID] = agent
 	}
 
@@ -285,7 +300,8 @@ func LoadTeams(clusterRoot string) (map[string]*types.TeamManifest, error) {
 		if entry.IsDir() {
 			continue
 		}
-		if filepath.Ext(entry.Name()) != ".yaml" {
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yaml" && ext != ".yml" {
 			continue
 		}
 
@@ -300,6 +316,10 @@ func LoadTeams(clusterRoot string) (map[string]*types.TeamManifest, error) {
 			return nil, fmt.Errorf("parsing team manifest %s: %w", entry.Name(), err)
 		}
 
+		// T2-12: Detect duplicate team IDs.
+		if _, dup := teams[team.Metadata.ID]; dup {
+			return nil, fmt.Errorf("duplicate team ID %q: found in %s and another file", team.Metadata.ID, entry.Name())
+		}
 		teams[team.Metadata.ID] = team
 	}
 
@@ -317,6 +337,7 @@ func ParseTeam(data []byte) (*types.TeamManifest, error) {
 
 // LoadDesiredState loads the complete desired state from a cluster root directory.
 // It reads cluster.yaml, all agent manifests, and all team manifests.
+// T2-11: Merges cluster defaults into agents that omit health/restart fields.
 func LoadDesiredState(clusterRoot string) (*types.DesiredState, error) {
 	cluster, err := LoadCluster(clusterRoot)
 	if err != nil {
@@ -333,11 +354,45 @@ func LoadDesiredState(clusterRoot string) (*types.DesiredState, error) {
 		return nil, fmt.Errorf("loading team manifests: %w", err)
 	}
 
+	// T2-11: Merge cluster-level defaults into agents that don't set these fields.
+	for _, agent := range agents {
+		mergeAgentDefaults(agent, cluster)
+	}
+
 	return &types.DesiredState{
 		Cluster: cluster,
 		Agents:  agents,
 		Teams:   teams,
 	}, nil
+}
+
+// mergeAgentDefaults populates agent-level health/restart fields from cluster
+// defaults when the agent manifest does not explicitly set them.
+// T2-11: Agents that omit health/restart sections inherit cluster defaults.
+func mergeAgentDefaults(agent *types.AgentManifest, cluster *types.ClusterConfig) {
+	defaults := cluster.Spec.Defaults
+
+	// Health defaults
+	if agent.Spec.Health.Interval == 0 {
+		agent.Spec.Health.Interval = defaults.Health.Interval
+	}
+	if agent.Spec.Health.Timeout == 0 {
+		agent.Spec.Health.Timeout = defaults.Health.Timeout
+	}
+	if agent.Spec.Health.MaxFailures == 0 {
+		agent.Spec.Health.MaxFailures = defaults.Health.MaxFailures
+	}
+
+	// Restart defaults
+	if agent.Spec.Restart.Policy == "" {
+		agent.Spec.Restart.Policy = defaults.Restart.Policy
+	}
+	if agent.Spec.Restart.Backoff == 0 {
+		agent.Spec.Restart.Backoff = defaults.Restart.Backoff
+	}
+	if agent.Spec.Restart.MaxRestarts == 0 {
+		agent.Spec.Restart.MaxRestarts = defaults.Restart.MaxRestarts
+	}
 }
 
 func applyDefaults(cfg *types.ClusterConfig) {

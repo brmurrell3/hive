@@ -163,6 +163,7 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 	}
 
 	// Validate capabilities (rule 7: unique names within agent)
+	validParamTypes := map[string]bool{"string": true, "int": true, "float": true, "bool": true, "bytes": true}
 	capNames := make(map[string]bool)
 	for _, cap := range agent.Spec.Capabilities {
 		if cap.Name == "" {
@@ -176,6 +177,16 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			ve.addf("%s: duplicate capability name %q", prefix, cap.Name)
 		}
 		capNames[cap.Name] = true
+		for _, param := range cap.Inputs {
+			if param.Type != "" && !validParamTypes[param.Type] {
+				ve.addf("%s: capability %q input %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
+			}
+		}
+		for _, param := range cap.Outputs {
+			if param.Type != "" && !validParamTypes[param.Type] {
+				ve.addf("%s: capability %q output %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
+			}
+		}
 	}
 
 	// Validate volumes reference team shared_volumes (rule 2, 9)
@@ -189,9 +200,13 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 				for _, sv := range team.Spec.SharedVolumes {
 					svNames[sv.Name] = true
 				}
+				validVolumeAccess := map[string]bool{"read-only": true, "read-write": true}
 				for _, vol := range agent.Spec.Volumes {
 					if !svNames[vol.Name] {
 						ve.addf("%s: volume %q references nonexistent shared_volume in team %q", prefix, vol.Name, agent.Metadata.Team)
+					}
+					if vol.Access != "" && !validVolumeAccess[vol.Access] {
+						ve.addf("%s: volume %q access must be one of [read-only, read-write], got %q", prefix, vol.Name, vol.Access)
 					}
 				}
 			}
@@ -201,6 +216,12 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 	// Validate network egress only for vm tier (rule 10)
 	if agent.Spec.Network.Egress != "" && agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
 		ve.addf("%s: network egress is only valid for vm tier", prefix)
+	}
+	if agent.Spec.Network.Egress != "" {
+		validEgress := map[string]bool{"none": true, "restricted": true, "full": true}
+		if !validEgress[agent.Spec.Network.Egress] {
+			ve.addf("%s: spec.network.egress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Egress)
+		}
 	}
 
 	// Validate mode only for firmware tier (rule 15)
@@ -250,6 +271,14 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 			ve.addf("%s: lead %q references nonexistent agent", prefix, team.Spec.Lead)
 		} else if leadAgent.Metadata.Team != id {
 			ve.addf("%s: lead %q has metadata.team %q, expected %q", prefix, team.Spec.Lead, leadAgent.Metadata.Team, id)
+		}
+	}
+
+	// Validate shared_volumes access values
+	validSharedVolumeAccess := map[string]bool{"read-only": true, "read-write": true}
+	for _, sv := range team.Spec.SharedVolumes {
+		if sv.Access != "" && !validSharedVolumeAccess[sv.Access] {
+			ve.addf("%s: shared_volume %q access must be one of [read-only, read-write], got %q", prefix, sv.Name, sv.Access)
 		}
 	}
 }

@@ -40,10 +40,12 @@ type NATSConn interface {
 
 // Config holds the configuration for the dashboard API server.
 type Config struct {
-	Store    StoreReader
-	NATSConn NATSConn
-	Logger   *slog.Logger
-	Addr     string // e.g. ":8080"
+	Store      StoreReader
+	NATSConn   NATSConn
+	Logger     *slog.Logger
+	Addr       string // e.g. ":8080"
+	CORSOrigin string // Allowed CORS origin; defaults to "http://localhost:8080"
+	AuthToken  string // If set, WebSocket connections must provide this token via ?token= query param
 }
 
 // Server is the dashboard API server.
@@ -55,6 +57,8 @@ type Server struct {
 	hub        *wsHub
 	startTime  time.Time
 	subs       []*nats.Subscription
+	corsOrigin string // Allowed CORS origin
+	authToken  string // Required token for WebSocket authentication
 }
 
 // NewServer creates a new dashboard API server.
@@ -65,13 +69,18 @@ func NewServer(cfg Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"
 	}
+	if cfg.CORSOrigin == "" {
+		cfg.CORSOrigin = "http://localhost:8080"
+	}
 
 	s := &Server{
-		store:     cfg.Store,
-		natsConn:  cfg.NATSConn,
-		logger:    cfg.Logger,
-		hub:       newWSHub(cfg.Logger),
-		startTime: time.Now(),
+		store:      cfg.Store,
+		natsConn:   cfg.NATSConn,
+		logger:     cfg.Logger,
+		hub:        newWSHub(cfg.Logger),
+		startTime:  time.Now(),
+		corsOrigin: cfg.CORSOrigin,
+		authToken:  cfg.AuthToken,
 	}
 
 	mux := http.NewServeMux()
@@ -145,7 +154,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 // corsMiddleware adds CORS headers to all responses.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", s.corsOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
@@ -331,11 +340,11 @@ func (s *Server) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 
 	// Build and publish the request envelope.
 	envelope := types.Envelope{
-		ID:        fmt.Sprintf("dashboard-%d", time.Now().UnixNano()),
+		ID:        types.NewUUID(),
 		From:      "dashboard",
 		To:        id,
 		Type:      types.MessageTypeCapabilityRequest,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		Payload:   map[string]string{"message": req.Message},
 		ReplyTo:   replySubject,
 	}
@@ -499,6 +508,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
+	}
+
+	// Verify auth token if configured.
+	if s.authToken != "" {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			s.writeError(w, http.StatusUnauthorized, "authentication required: provide ?token= query parameter")
+			return
+		}
+		if token != s.authToken {
+			s.writeError(w, http.StatusUnauthorized, "invalid authentication token")
+			return
+		}
 	}
 
 	// Verify upgrade headers.
