@@ -1317,7 +1317,7 @@ func TestValidateDesiredState_MountDangerousGuestPath(t *testing.T) {
 			t.Parallel()
 			agent := validAgent("mount-agent", "")
 			agent.Spec.Mounts = []types.AgentMount{
-				{Name: "danger", Host: "/tmp/host", Guest: path, Mode: "ro"},
+				{Name: "danger", Host: "/opt/host", Guest: path, Mode: "ro"},
 			}
 
 			ds := mustDS(t, nil,
@@ -1335,7 +1335,7 @@ func TestValidateDesiredState_MountGuestPathTraversal(t *testing.T) {
 	t.Parallel()
 	agent := validAgent("mount-agent", "")
 	agent.Spec.Mounts = []types.AgentMount{
-		{Name: "traversal", Host: "/tmp/host", Guest: "/data/../etc/passwd", Mode: "ro"},
+		{Name: "traversal", Host: "/opt/host", Guest: "/data/../etc/passwd", Mode: "ro"},
 	}
 
 	ds := mustDS(t, nil,
@@ -1351,7 +1351,7 @@ func TestValidateDesiredState_MountValidGuestPath(t *testing.T) {
 	t.Parallel()
 	agent := validAgent("mount-agent", "")
 	agent.Spec.Mounts = []types.AgentMount{
-		{Name: "valid", Host: "/tmp/host", Guest: "/data/workdir", Mode: "ro"},
+		{Name: "valid", Host: "/opt/host", Guest: "/data/workdir", Mode: "ro"},
 	}
 
 	ds := mustDS(t, nil,

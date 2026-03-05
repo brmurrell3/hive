@@ -4,6 +4,7 @@
 package vm
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -33,7 +34,7 @@ func NewMockHypervisor() *MockHypervisor {
 // CreateVM simulates VM creation by recording the socket path.
 // Returns a synthetic PID for the created VM process. The same PID will be
 // used by StartVM so that callers see consistent PID values.
-func (m *MockHypervisor) CreateVM(cfg VMConfig) (int, error) {
+func (m *MockHypervisor) CreateVM(_ context.Context, cfg VMConfig) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -55,7 +56,8 @@ func (m *MockHypervisor) CreateVM(cfg VMConfig) (int, error) {
 }
 
 // StartVM simulates VM boot by marking the stored PID as running.
-func (m *MockHypervisor) StartVM(socketPath string) error {
+// FC-C2: Accepts context.Context to match the updated Hypervisor interface.
+func (m *MockHypervisor) StartVM(_ context.Context, socketPath string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -85,8 +87,14 @@ func (m *MockHypervisor) StopVM(socketPath string, pid int) error {
 		return m.StopErr
 	}
 
-	if _, exists := m.running[socketPath]; !exists {
+	storedPID, exists := m.running[socketPath]
+	if !exists {
 		return fmt.Errorf("mock: no VM at socket %s", socketPath)
+	}
+
+	// FC-C3: Verify PID matches to prevent stopping the wrong process.
+	if storedPID != pid && storedPID != -pid {
+		return fmt.Errorf("mock: PID mismatch for socket %s: stored %d, provided %d", socketPath, storedPID, pid)
 	}
 
 	delete(m.running, socketPath)
@@ -100,6 +108,16 @@ func (m *MockHypervisor) DestroyVM(socketPath string, pid int) error {
 
 	if m.DestroyErr != nil {
 		return m.DestroyErr
+	}
+
+	// FC-C3: Check existence and verify PID matches before destroying.
+	storedPID, exists := m.running[socketPath]
+	if !exists {
+		return fmt.Errorf("mock: no VM at socket %s", socketPath)
+	}
+
+	if storedPID != pid && storedPID != -pid {
+		return fmt.Errorf("mock: PID mismatch for socket %s: stored %d, provided %d", socketPath, storedPID, pid)
 	}
 
 	delete(m.running, socketPath)

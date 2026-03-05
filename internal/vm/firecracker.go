@@ -6,6 +6,7 @@ package vm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -93,6 +96,13 @@ type firecrackerMachineConfig struct {
 	Smt        bool `json:"smt"`
 }
 
+// firecrackerNetworkInterface is the network interface configuration.
+type firecrackerNetworkInterface struct {
+	IfaceID     string `json:"iface_id"`
+	GuestMAC    string `json:"guest_mac"`
+	HostDevName string `json:"host_dev_name"`
+}
+
 // firecrackerVsock is the vsock device configuration.
 type firecrackerVsock struct {
 	GuestCID int    `json:"guest_cid"`
@@ -131,10 +141,14 @@ func (f *FirecrackerHypervisor) startReaper(socketPath string, cmd *exec.Cmd, lo
 		if current, ok := f.processes[socketPath]; ok && current == fp {
 			delete(f.processes, socketPath)
 		}
+		// FC-H2: Read logFile under lock to avoid race with claimProcess
+		// which sets fp.logFile = nil when it claims ownership.
+		lf := fp.logFile
+		fp.logFile = nil
 		f.mu.Unlock()
 		// Close the per-VM log file now that the process has exited.
-		if fp.logFile != nil {
-			fp.logFile.Close()
+		if lf != nil {
+			lf.Close()
 		}
 		close(fp.done)
 	}()
@@ -152,21 +166,118 @@ func waitForReap(fp *firecrackerProcess, timeout time.Duration) {
 }
 
 // claimProcess removes and returns the tracked process for the given socket
-// path under the lock. Returns nil if no process is tracked.
-func (f *FirecrackerHypervisor) claimProcess(socketPath string) *firecrackerProcess {
+// path under the lock. Returns nil for both values if no process is tracked.
+// FC-C1: Returns the log file pointer along with the process. The caller is
+// responsible for closing the log file after waitForReap completes, which
+// prevents the log FD leak that occurred when claimProcess set logFile=nil
+// and the reaper subsequently found logFile already nil.
+func (f *FirecrackerHypervisor) claimProcess(socketPath string) (*firecrackerProcess, *os.File) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fp := f.processes[socketPath]
 	if fp != nil {
 		delete(f.processes, socketPath)
+		// FC-C1: Take ownership of the log file. Setting fp.logFile = nil
+		// under the lock prevents the reaper from also closing it.
+		lf := fp.logFile
+		fp.logFile = nil
+		return fp, lf
 	}
-	return fp
+	return nil, nil
+}
+
+// isFirecrackerProcess checks whether the process with the given PID is
+// actually a Firecracker process by reading /proc/<pid>/cmdline on Linux.
+// On non-Linux platforms or if /proc is unavailable, returns false and logs
+// a warning. This prevents sending signals to a recycled PID that now
+// belongs to an unrelated process.
+func isFirecrackerProcess(pid int, logger *slog.Logger) bool {
+	if runtime.GOOS != "linux" {
+		logger.Warn("cannot verify process identity on non-Linux platform, skipping signal",
+			"pid", pid,
+			"goos", runtime.GOOS,
+		)
+		return false
+	}
+	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
+	data, err := os.ReadFile(cmdlinePath)
+	if err != nil {
+		logger.Warn("cannot read /proc cmdline to verify process identity, skipping signal",
+			"pid", pid,
+			"error", err,
+		)
+		return false
+	}
+	// /proc/<pid>/cmdline uses NUL bytes as separators.
+	cmdline := string(data)
+	if strings.Contains(cmdline, "firecracker") {
+		return true
+	}
+	logger.Warn("PID is not a firecracker process, skipping signal to avoid PID reuse hazard",
+		"pid", pid,
+		"cmdline", strings.ReplaceAll(cmdline, "\x00", " "),
+	)
+	return false
 }
 
 // CreateVM spawns the Firecracker process and configures the VM via the API
 // socket. The VM is configured but not started (use StartVM for that).
 // Returns the process PID on success.
-func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
+func (f *FirecrackerHypervisor) CreateVM(ctx context.Context, cfg VMConfig) (int, error) {
+	// FC-H1: Validate VMConfig inputs.
+	if cfg.SocketPath == "" {
+		return 0, fmt.Errorf("VMConfig.SocketPath must not be empty")
+	}
+	if cfg.KernelPath == "" {
+		return 0, fmt.Errorf("VMConfig.KernelPath must not be empty")
+	}
+	if cfg.RootfsPath == "" {
+		return 0, fmt.Errorf("VMConfig.RootfsPath must not be empty")
+	}
+	if cfg.MemoryMB <= 0 {
+		return 0, fmt.Errorf("VMConfig.MemoryMB must be positive, got %d", cfg.MemoryMB)
+	}
+	if cfg.VCPUs <= 0 {
+		return 0, fmt.Errorf("VMConfig.VCPUs must be positive, got %d", cfg.VCPUs)
+	}
+	if cfg.CID < 3 {
+		return 0, fmt.Errorf("VMConfig.CID must be >= 3, got %d", cfg.CID)
+	}
+
+	// FC-H2b: Validate VMConfig path fields to prevent path traversal and
+	// glob injection. All paths must be absolute and contain no ".." components.
+	// SocketPath must also not contain glob metacharacters since it is used
+	// in filepath.Glob in cleanupSocket.
+	for _, pv := range []struct {
+		name, path string
+	}{
+		{"SocketPath", cfg.SocketPath},
+		{"KernelPath", cfg.KernelPath},
+		{"RootfsPath", cfg.RootfsPath},
+	} {
+		if !filepath.IsAbs(pv.path) {
+			return 0, fmt.Errorf("VMConfig.%s must be an absolute path, got %q", pv.name, pv.path)
+		}
+		if cleaned := filepath.Clean(pv.path); cleaned != pv.path && cleaned+"/" != pv.path {
+			// Allow the path only if Clean produces the same result (no ".." resolution needed).
+			if strings.Contains(pv.path, "..") {
+				return 0, fmt.Errorf("VMConfig.%s must not contain '..' components, got %q", pv.name, pv.path)
+			}
+		}
+	}
+	if cfg.AgentDrivePath != "" {
+		if !filepath.IsAbs(cfg.AgentDrivePath) {
+			return 0, fmt.Errorf("VMConfig.AgentDrivePath must be an absolute path, got %q", cfg.AgentDrivePath)
+		}
+		if strings.Contains(cfg.AgentDrivePath, "..") {
+			return 0, fmt.Errorf("VMConfig.AgentDrivePath must not contain '..' components, got %q", cfg.AgentDrivePath)
+		}
+	}
+	// SocketPath is used in filepath.Glob (cleanupSocket), so reject glob metacharacters.
+	if strings.ContainsAny(cfg.SocketPath, "*?[]") {
+		return 0, fmt.Errorf("VMConfig.SocketPath must not contain glob metacharacters (*?[]), got %q", cfg.SocketPath)
+	}
+
 	f.logger.Info("creating Firecracker VM",
 		"agent_id", cfg.AgentID,
 		"socket", cfg.SocketPath,
@@ -210,10 +321,18 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	fp := f.startReaper(cfg.SocketPath, cmd, logFile)
 	f.mu.Unlock()
 
-	// Wait for the API socket to appear.
-	if err := waitForSocket(cfg.SocketPath, 5*time.Second); err != nil {
-		// Remove from map so the reaper goroutine knows we're abandoning it,
-		// then kill and wait for the goroutine to finish.
+	// FC-H2: Deferred cleanup of the socket on error paths. Set to true now
+	// that the process has started; cleared to false on success.
+	cleanupNeeded := true
+	defer func() {
+		if cleanupNeeded {
+			f.cleanupSocket(cfg.SocketPath)
+		}
+	}()
+
+	// killAndReap is a helper to kill the process and wait for the reaper
+	// on any configuration error path.
+	killAndReap := func() {
 		f.mu.Lock()
 		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
 			delete(f.processes, cfg.SocketPath)
@@ -223,6 +342,11 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		// waitForReap waits for the reaper goroutine which closes fp.logFile,
 		// so we must not close logFile again here (double-close).
 		waitForReap(fp, 5*time.Second)
+	}
+
+	// Wait for the API socket to appear.
+	if err := waitForSocket(ctx, cfg.SocketPath, 5*time.Second); err != nil {
+		killAndReap()
 		return 0, fmt.Errorf("waiting for API socket: %w", err)
 	}
 
@@ -234,14 +358,8 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		KernelImagePath: cfg.KernelPath,
 		BootArgs:        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init",
 	}
-	if err := apiPut(client, cfg.SocketPath, "/boot-source", bootSource); err != nil {
-		f.mu.Lock()
-		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
-			delete(f.processes, cfg.SocketPath)
-		}
-		f.mu.Unlock()
-		_ = cmd.Process.Kill()
-		waitForReap(fp, 5*time.Second)
+	if err := apiPut(ctx, client, cfg.SocketPath, "/boot-source", bootSource); err != nil {
+		killAndReap()
 		return 0, fmt.Errorf("configuring boot source: %w", err)
 	}
 
@@ -252,14 +370,8 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		IsRootDevice: true,
 		IsReadOnly:   false,
 	}
-	if err := apiPut(client, cfg.SocketPath, "/drives/rootfs", rootfsDrive); err != nil {
-		f.mu.Lock()
-		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
-			delete(f.processes, cfg.SocketPath)
-		}
-		f.mu.Unlock()
-		_ = cmd.Process.Kill()
-		waitForReap(fp, 5*time.Second)
+	if err := apiPut(ctx, client, cfg.SocketPath, "/drives/rootfs", rootfsDrive); err != nil {
+		killAndReap()
 		return 0, fmt.Errorf("configuring rootfs drive: %w", err)
 	}
 
@@ -273,16 +385,27 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 				IsRootDevice: false,
 				IsReadOnly:   false,
 			}
-			if err := apiPut(client, cfg.SocketPath, "/drives/agent", agentDrive); err != nil {
-				f.mu.Lock()
-				if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
-					delete(f.processes, cfg.SocketPath)
-				}
-				f.mu.Unlock()
-				_ = cmd.Process.Kill()
-				waitForReap(fp, 5*time.Second)
+			if err := apiPut(ctx, client, cfg.SocketPath, "/drives/agent", agentDrive); err != nil {
+				killAndReap()
 				return 0, fmt.Errorf("configuring agent drive: %w", err)
 			}
+		}
+	}
+
+	// Configure shared volume drives. Each volume is an ext4 image created
+	// from the team's shared directory. They appear as /dev/vdc, /dev/vdd, etc.
+	// inside the guest (after rootfs on /dev/vda and agent drive on /dev/vdb).
+	for i, vol := range cfg.Volumes {
+		driveID := fmt.Sprintf("shared-%d", i)
+		drive := firecrackerDrive{
+			DriveID:      driveID,
+			PathOnHost:   vol.HostPath,
+			IsRootDevice: false,
+			IsReadOnly:   vol.ReadOnly,
+		}
+		if err := apiPut(ctx, client, cfg.SocketPath, fmt.Sprintf("/drives/%s", driveID), drive); err != nil {
+			killAndReap()
+			return 0, fmt.Errorf("configuring shared volume drive %q: %w", vol.Name, err)
 		}
 	}
 
@@ -292,15 +415,24 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		MemSizeMiB: cfg.MemoryMB,
 		Smt:        false,
 	}
-	if err := apiPut(client, cfg.SocketPath, "/machine-config", machineCfg); err != nil {
-		f.mu.Lock()
-		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
-			delete(f.processes, cfg.SocketPath)
-		}
-		f.mu.Unlock()
-		_ = cmd.Process.Kill()
-		waitForReap(fp, 5*time.Second)
+	if err := apiPut(ctx, client, cfg.SocketPath, "/machine-config", machineCfg); err != nil {
+		killAndReap()
 		return 0, fmt.Errorf("configuring machine: %w", err)
+	}
+
+	// Configure the network interface if a network policy with a TAP device
+	// is provided. This attaches the host TAP device to the guest as eth0 with
+	// a deterministic MAC address derived from the agent ID.
+	if cfg.NetworkPolicy != nil && cfg.NetworkPolicy.TapDevice != "" {
+		netIface := firecrackerNetworkInterface{
+			IfaceID:     "eth0",
+			GuestMAC:    deterministicMAC(cfg.AgentID),
+			HostDevName: cfg.NetworkPolicy.TapDevice,
+		}
+		if err := apiPut(ctx, client, cfg.SocketPath, "/network-interfaces/eth0", netIface); err != nil {
+			killAndReap()
+			return 0, fmt.Errorf("configuring network interface: %w", err)
+		}
 	}
 
 	// Configure vsock for host-guest communication.
@@ -309,16 +441,13 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		GuestCID: int(cfg.CID),
 		UDSPath:  vsockPath,
 	}
-	if err := apiPut(client, cfg.SocketPath, "/vsock", vsock); err != nil {
-		f.mu.Lock()
-		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
-			delete(f.processes, cfg.SocketPath)
-		}
-		f.mu.Unlock()
-		_ = cmd.Process.Kill()
-		waitForReap(fp, 5*time.Second)
+	if err := apiPut(ctx, client, cfg.SocketPath, "/vsock", vsock); err != nil {
+		killAndReap()
 		return 0, fmt.Errorf("configuring vsock: %w", err)
 	}
+
+	// FC-H2: All configuration succeeded; clear the cleanup flag.
+	cleanupNeeded = false
 
 	f.logger.Info("Firecracker VM configured",
 		"agent_id", cfg.AgentID,
@@ -330,13 +459,16 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 
 // StartVM boots a previously created VM by sending the InstanceStart action
 // via the Firecracker API socket.
-func (f *FirecrackerHypervisor) StartVM(socketPath string) error {
+// FC-C2: Accepts context.Context so the caller can propagate cancellation/timeouts
+// instead of using an uncancellable context.Background().
+func (f *FirecrackerHypervisor) StartVM(ctx context.Context, socketPath string) error {
 	f.logger.Info("starting Firecracker VM", "socket", socketPath)
 
 	client := socketHTTPClient(socketPath)
+	defer client.CloseIdleConnections()
 	action := firecrackerAction{ActionType: "InstanceStart"}
 
-	if err := apiPut(client, socketPath, "/actions", action); err != nil {
+	if err := apiPut(ctx, client, socketPath, "/actions", action); err != nil {
 		return fmt.Errorf("sending InstanceStart action: %w", err)
 	}
 
@@ -358,7 +490,37 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 	// Claim the tracked process. After this point the reaper goroutine will
 	// not remove the map entry, but it will still call cmd.Wait() and close
 	// fp.done when the process exits.
-	fp := f.claimProcess(socketPath)
+	// FC-C1: claimProcess now returns the log file; caller closes it after reap.
+	fp, logFile := f.claimProcess(socketPath)
+	defer func() {
+		if logFile != nil {
+			logFile.Close()
+		}
+	}()
+
+	// FC-C1: When we have no tracked process handle, verify that the PID
+	// still belongs to a firecracker process before sending any signal.
+	// This prevents signaling an unrelated process after PID reuse.
+	if fp == nil && !isFirecrackerProcess(pid, f.logger) {
+		f.logger.Warn("skipping signal: cannot confirm PID is a firecracker process",
+			"pid", pid,
+			"socket", socketPath,
+		)
+		f.cleanupSocket(socketPath)
+		return nil
+	}
+
+	// FC-H1: If the process has already exited (done channel closed), skip
+	// sending SIGTERM to avoid signaling a potentially recycled PID.
+	if fp != nil {
+		select {
+		case <-fp.done:
+			f.logger.Info("VM process already exited before SIGTERM", "pid", pid)
+			f.cleanupSocket(socketPath)
+			return nil
+		default:
+		}
+	}
 
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -373,7 +535,7 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 			if fp != nil {
 				waitForReap(fp, 5*time.Second)
 			}
-			cleanupSocket(socketPath)
+			f.cleanupSocket(socketPath)
 			return nil
 		}
 		return fmt.Errorf("sending SIGTERM to PID %d: %w", pid, err)
@@ -398,7 +560,10 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 	} else {
 		// No tracked process (e.g. hived restarted and lost the cmd handle).
 		// Fall back to polling-based wait, accepting that we cannot call Wait().
-		exited := waitForProcessExit(pid, 5*time.Second)
+		// Use context.Background() for the cleanup path because the caller's
+		// context may already be cancelled during shutdown, and we still need
+		// to wait for the process to exit before cleaning up.
+		exited := waitForProcessExit(context.Background(), pid, 5*time.Second)
 		if !exited {
 			f.logger.Warn("VM process did not exit after SIGTERM, sending SIGKILL",
 				"pid", pid,
@@ -406,11 +571,11 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 			if err := proc.Signal(syscall.SIGKILL); err != nil && !isProcessGone(err) {
 				return fmt.Errorf("sending SIGKILL to PID %d: %w", pid, err)
 			}
-			waitForProcessExit(pid, 2*time.Second)
+			waitForProcessExit(context.Background(), pid, 2*time.Second)
 		}
 	}
 
-	cleanupSocket(socketPath)
+	f.cleanupSocket(socketPath)
 	f.logger.Info("Firecracker VM stopped", "socket", socketPath, "pid", pid)
 	return nil
 }
@@ -423,27 +588,48 @@ func (f *FirecrackerHypervisor) DestroyVM(socketPath string, pid int) error {
 
 	// Claim the tracked process before sending any signal so the reaper
 	// goroutine does not race with our map removal.
-	fp := f.claimProcess(socketPath)
+	// FC-C1: claimProcess now returns the log file; caller closes it after reap.
+	fp, logFile := f.claimProcess(socketPath)
+	defer func() {
+		if logFile != nil {
+			logFile.Close()
+		}
+	}()
 
 	if pid > 0 {
-		proc, err := os.FindProcess(pid)
-		if err == nil {
-			if killErr := proc.Signal(syscall.SIGKILL); killErr != nil && !isProcessGone(killErr) {
-				f.logger.Warn("error sending SIGKILL during destroy",
-					"pid", pid,
-					"error", killErr,
-				)
+		// FC-C1: When we have no tracked process handle, verify that the
+		// PID still belongs to a firecracker process before sending SIGKILL.
+		if fp == nil && !isFirecrackerProcess(pid, f.logger) {
+			f.logger.Warn("skipping SIGKILL: cannot confirm PID is a firecracker process",
+				"pid", pid,
+				"socket", socketPath,
+			)
+		} else {
+			proc, err := os.FindProcess(pid)
+			if err == nil {
+				if killErr := proc.Signal(syscall.SIGKILL); killErr != nil && !isProcessGone(killErr) {
+					f.logger.Warn("error sending SIGKILL during destroy",
+						"pid", pid,
+						"error", killErr,
+					)
+				}
 			}
-		}
 
-		// Wait for the reaper goroutine to confirm the process has been
-		// reaped, preventing zombie accumulation.
-		if fp != nil {
-			waitForReap(fp, 5*time.Second)
+			// Wait for the reaper goroutine to confirm the process has been
+			// reaped, preventing zombie accumulation.
+			if fp != nil {
+				waitForReap(fp, 5*time.Second)
+			} else {
+				// FC-H4: When fp is nil, wait for process exit after SIGKILL
+				// to avoid leaving zombies or proceeding before cleanup.
+				// Use context.Background() because destroy is a force-kill
+				// cleanup path and the caller's context may be cancelled.
+				waitForProcessExit(context.Background(), pid, 5*time.Second)
+			}
 		}
 	}
 
-	cleanupSocket(socketPath)
+	f.cleanupSocket(socketPath)
 	return nil
 }
 
@@ -462,16 +648,29 @@ func (f *FirecrackerHypervisor) IsRunning(pid int) bool {
 	// Signal 0 tests for process existence.
 	err = proc.Signal(syscall.Signal(0))
 	if err == nil {
-		return true // process exists and we can signal it
+		// FC-C3: Process exists, but verify it's actually a Firecracker
+		// process to guard against PID reuse by an unrelated process.
+		if !isFirecrackerProcess(pid, f.logger) {
+			return false
+		}
+		return true
 	}
 	// EPERM means the process exists but we can't signal it (different user).
 	if errors.Is(err, syscall.EPERM) {
+		// FC-C3: Cannot verify identity via /proc when EPERM, but the
+		// process exists. Attempt identity check; if it fails, treat as
+		// not running to be safe against PID reuse.
+		if !isFirecrackerProcess(pid, f.logger) {
+			return false
+		}
 		return true
 	}
 	return false // ESRCH or other error means process is gone
 }
 
 // socketHTTPClient creates an HTTP client that communicates over a Unix socket.
+// FC-H2: MaxIdleConnsPerHost and MaxConnsPerHost are set to bound the transport
+// pool, preventing unbounded connection accumulation to the local socket.
 func socketHTTPClient(socketPath string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
@@ -479,19 +678,22 @@ func socketHTTPClient(socketPath string) *http.Client {
 				var d net.Dialer
 				return d.DialContext(ctx, "unix", socketPath)
 			},
+			MaxIdleConnsPerHost: 1,
+			MaxConnsPerHost:     2,
 		},
 		Timeout: 10 * time.Second,
 	}
 }
 
 // apiPut sends a PUT request to the Firecracker API over the Unix socket.
-func apiPut(client *http.Client, socketPath string, path string, body interface{}) error {
+// FC-H7: Accepts context.Context to propagate cancellation/timeouts.
+func apiPut(ctx context.Context, client *http.Client, socketPath string, path string, body interface{}) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshaling request body: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPut, "http://localhost"+path, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost"+path, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
@@ -501,7 +703,12 @@ func apiPut(client *http.Client, socketPath string, path string, body interface{
 	if err != nil {
 		return fmt.Errorf("sending request to %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// FC-S8: Drain the response body remainder before closing so the
+		// underlying connection can be reused by the transport pool.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var respBody bytes.Buffer
@@ -515,21 +722,30 @@ func apiPut(client *http.Client, socketPath string, path string, body interface{
 }
 
 // waitForSocket polls for the existence of a Unix socket file up to the
-// given timeout.
-func waitForSocket(socketPath string, timeout time.Duration) error {
+// given timeout. The context is checked before each sleep so that callers
+// can cancel the wait early.
+func waitForSocket(ctx context.Context, socketPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(socketPath); err == nil {
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while waiting for socket %s: %w", socketPath, ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("socket %s did not appear within %s", socketPath, timeout)
 }
 
 // waitForProcessExit polls for process exit up to the given timeout.
-// Returns true if the process exited, false if the timeout was reached.
-func waitForProcessExit(pid int, timeout time.Duration) bool {
+// Returns true if the process exited, false if the timeout was reached or the
+// context was cancelled. The context is checked before each sleep so that
+// callers can cancel the wait early.
+// FC-C2: EPERM is treated as "still alive" (consistent with IsRunning),
+// since it means the process exists but belongs to another user.
+func waitForProcessExit(ctx context.Context, pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		proc, err := os.FindProcess(pid)
@@ -537,9 +753,23 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 			return true
 		}
 		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			// FC-C2: EPERM means the process exists but we can't signal it.
+			// Continue polling instead of treating it as exited.
+			if errors.Is(err, syscall.EPERM) {
+				select {
+				case <-ctx.Done():
+					return false
+				case <-time.After(100 * time.Millisecond):
+				}
+				continue
+			}
 			return true
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	return false
 }
@@ -555,20 +785,41 @@ func isProcessGone(err error) bool {
 	if errors.Is(err, syscall.ESRCH) {
 		return true
 	}
-	return err.Error() == "os: process already finished"
+	return false
 }
 
-// cleanupSocket removes the API socket and vsock files.
-func cleanupSocket(socketPath string) {
+// deterministicMAC generates a deterministic locally-administered MAC address
+// from an identifier string. The MAC uses the 06:XX:XX:XX:XX:XX pattern where
+// 06 sets the locally-administered + unicast bits, and the remaining 5 bytes
+// are derived from a SHA-256 hash of the identifier.
+func deterministicMAC(identifier string) string {
+	h := sha256.Sum256([]byte(identifier))
+	return fmt.Sprintf("06:%02x:%02x:%02x:%02x:%02x", h[0], h[1], h[2], h[3], h[4])
+}
+
+// cleanupSocket removes the API socket and vsock files. It acquires f.mu to
+// synchronize with concurrent operations that may be modifying the process map
+// or accessing the socket path.
+func (f *FirecrackerHypervisor) cleanupSocket(socketPath string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	os.Remove(socketPath)
 	os.Remove(socketPath + ".vsock")
 	// Clean up port-specific vsock UDS files (e.g., firecracker.sock.vsock_4222)
 	// that Firecracker creates when guests connect via AF_VSOCK.
+	expectedPrefix := socketPath + ".vsock_"
 	matches, globErr := filepath.Glob(socketPath + ".vsock_*")
 	if globErr != nil {
-		slog.Warn("filepath.Glob failed during socket cleanup", "pattern", socketPath+".vsock_*", "error", globErr)
+		f.logger.Warn("filepath.Glob failed during socket cleanup", "pattern", socketPath+".vsock_*", "error", globErr)
 	}
 	for _, m := range matches {
+		// FC-H5: Verify each match starts with the expected prefix to
+		// prevent removing unintended files if the glob pattern is abused.
+		if !strings.HasPrefix(m, expectedPrefix) {
+			f.logger.Warn("skipping unexpected glob match during socket cleanup", "match", m, "expected_prefix", expectedPrefix)
+			continue
+		}
 		os.Remove(m)
 	}
 }

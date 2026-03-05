@@ -7,8 +7,10 @@
 package process
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,15 +38,78 @@ type Backend struct {
 	instances   map[string]*processInstance
 }
 
+// maxBufSize is the maximum number of bytes retained per output buffer (10 MB).
+// Once the limit is reached, additional writes are silently dropped.
+const maxBufSize = 10 * 1024 * 1024
+
+// safeBuf is a thread-safe bytes.Buffer with a maximum size limit.
+// It implements io.Writer so it can be used directly as cmd.Stdout/Stderr.
+type safeBuf struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool // set when data is dropped due to maxBufSize
+}
+
+// truncationMsg is appended to output when truncation has occurred.
+const truncationMsg = "\n... output truncated (10MB limit) ...\n"
+
+// Write implements io.Writer. This intentionally violates the io.Writer
+// contract by always returning len(p), nil even when data is truncated.
+// This is necessary because safeBuf is used as cmd.Stdout/Stderr —
+// returning n < len(p) or a non-nil error would cause exec.Command to
+// abort the child process prematurely. Truncation beyond maxBufSize is
+// an acceptable trade-off for keeping the process alive.
+func (s *safeBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(p) // always report full write to caller
+	remaining := maxBufSize - s.buf.Len()
+	if remaining <= 0 {
+		// Buffer full — record truncation and discard.
+		s.truncated = true
+		return n, nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+		s.truncated = true
+	}
+	// Ignore the bytes-written count from the underlying buffer; we
+	// always report n (original len) to avoid aborting the child process.
+	_, _ = s.buf.Write(p)
+	return n, nil
+}
+
+// Bytes returns a copy of the buffered data, safe for concurrent use.
+// If truncation occurred, a truncation indicator is appended to the output.
+func (s *safeBuf) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.truncated {
+		cp := make([]byte, s.buf.Len()+len(truncationMsg))
+		copy(cp, s.buf.Bytes())
+		copy(cp[s.buf.Len():], truncationMsg)
+		return cp
+	}
+	cp := make([]byte, s.buf.Len())
+	copy(cp, s.buf.Bytes())
+	return cp
+}
+
 type processInstance struct {
-	id      string
-	agentID string
-	cmd     *exec.Cmd
-	stdout  *bytes.Buffer
-	stderr  *bytes.Buffer
-	cancel  context.CancelFunc
-	done    chan struct{}
-	err     error
+	id            string
+	agentID       string
+	cmd           *exec.Cmd
+	stdout        *safeBuf
+	stderr        *safeBuf
+	cancel        context.CancelFunc
+	done          chan struct{}
+	closeOnce     sync.Once // BE-H2: prevents double-close of done channel
+	mu            sync.Mutex // guards started and stopped flags
+	started       bool       // BE-H8: prevents double-Start
+	stopped       bool       // BE-H7: prevents Start after Stop
+	err           error
+	workspacePath string // set for OpenClaw agents; cleaned up in Destroy
+	gatewayPort   int    // BE-C1: OpenClaw gateway port; released in Destroy
 }
 
 func (i *processInstance) ID() string      { return i.id }
@@ -87,6 +153,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	var cmdName string
 	var cmdArgs []string
 	var openclawPort int
+	var wsPath string // workspace directory to clean up on Destroy (OpenClaw only)
 
 	if isOpenClawRuntime(spec) {
 		// OpenClaw runtime path: use the openclaw binary instead of
@@ -109,13 +176,29 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 		cmdName = binaryPath
 		cmdArgs = []string{"--config", configPath}
 		openclawPort = port
+		wsPath = workspacePath
 
 		b.logger.Info("openclaw workspace prepared",
 			"agent_id", agentID,
 			"workspace", workspacePath,
 			"gateway_port", port,
 		)
-	} else {
+	}
+
+	// BE-C2: Deferred cleanup of port and workspace if Create fails after
+	// prepareOpenClawWorkspace has succeeded. The success flag is set just
+	// before the successful return so that early returns trigger cleanup.
+	success := false
+	defer func() {
+		if !success && openclawPort > 0 {
+			releaseGatewayPort(openclawPort)
+			if wsPath != "" {
+				os.RemoveAll(wsPath) //nolint:errcheck // best-effort cleanup on failure path
+			}
+		}
+	}()
+
+	if !isOpenClawRuntime(spec) {
 		// Standard process runtime path.
 		runtimeCmd := spec.Spec.Runtime.Command
 		if runtimeCmd == "" {
@@ -132,9 +215,36 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, cmdName, cmdArgs...)
 
-	// Build environment.
-	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env,
+	// Build environment from a minimal allow-list of parent variables
+	// instead of inheriting the full parent environment, which could
+	// leak secrets (BE-H2).
+	var env []string
+	for _, key := range []string{"PATH", "HOME", "USER", "TMPDIR", "LANG", "TERM"} {
+		if v := os.Getenv(key); v != "" {
+			env = append(env, fmt.Sprintf("%s=%s", key, v))
+		}
+	}
+
+	// Add model env vars BEFORE HIVE_* assignments so that a malicious
+	// model config cannot override framework-critical variables (BE-H1).
+	// A denylist prevents injection of HIVE_*, LD_*, DYLD_*, PATH,
+	// HOME, and SHELL keys.
+	for k, v := range spec.Spec.Runtime.Model.Env {
+		upper := strings.ToUpper(k)
+		if strings.HasPrefix(upper, "HIVE_") ||
+			strings.HasPrefix(upper, "LD_") ||
+			strings.HasPrefix(upper, "DYLD_") ||
+			upper == "PATH" || upper == "HOME" || upper == "SHELL" {
+			b.logger.Warn("model env var denied by denylist",
+				"agent_id", agentID, "key", k)
+			continue
+		}
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// HIVE_* assignments come after model env vars so they cannot be
+	// overridden.
+	env = append(env,
 		fmt.Sprintf("HIVE_AGENT_ID=%s", agentID),
 		fmt.Sprintf("HIVE_TEAM=%s", spec.Metadata.Team),
 		fmt.Sprintf("HIVE_TEAM_ID=%s", spec.Metadata.Team),
@@ -142,16 +252,16 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 
 	// Add sidecar and callback env vars if available.
 	if v := os.Getenv("HIVE_NATS_URL"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_NATS_URL=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_NATS_URL=%s", v))
 	}
 	if v := os.Getenv("HIVE_NATS_TOKEN"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_NATS_TOKEN=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_NATS_TOKEN=%s", v))
 	}
 	if v := os.Getenv("HIVE_SIDECAR_URL"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_SIDECAR_URL=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_SIDECAR_URL=%s", v))
 	}
 	if v := os.Getenv("HIVE_CALLBACK_PORT"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_CALLBACK_PORT=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_CALLBACK_PORT=%s", v))
 	}
 
 	// Add OpenClaw-specific env vars.
@@ -159,17 +269,15 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	// gateway via HTTP at this port. That integration is handled separately
 	// in the sidecar package.
 	if openclawPort > 0 {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_OPENCLAW_PORT=%d", openclawPort))
+		env = append(env, fmt.Sprintf("HIVE_OPENCLAW_PORT=%d", openclawPort))
 	}
 
-	// Add model env vars.
-	for k, v := range spec.Spec.Runtime.Model.Env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = env
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &safeBuf{}
+	stderr := &safeBuf{}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	// Set PENDING state before creating the instance.
 	if b.store != nil {
@@ -183,13 +291,15 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	}
 
 	inst := &processInstance{
-		id:      agentID,
-		agentID: agentID,
-		cmd:     cmd,
-		stdout:  &stdout,
-		stderr:  &stderr,
-		cancel:  cancel,
-		done:    make(chan struct{}),
+		id:            agentID,
+		agentID:       agentID,
+		cmd:           cmd,
+		stdout:        stdout,
+		stderr:        stderr,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		workspacePath: wsPath,
+		gatewayPort:   openclawPort, // BE-C1: store port for release in Destroy
 	}
 
 	// Transition to CREATING state.
@@ -204,10 +314,16 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	}
 
 	b.mu.Lock()
+	if _, exists := b.instances[agentID]; exists {
+		b.mu.Unlock()
+		cancel()
+		return nil, fmt.Errorf("agent %q already exists; concurrent Create() detected", agentID)
+	}
 	b.instances[agentID] = inst
 	b.mu.Unlock()
 
 	b.logger.Info("process instance created", "agent_id", agentID, "cmd", cmdName)
+	success = true // BE-C2: disarm deferred cleanup
 	return inst, nil
 }
 
@@ -219,6 +335,19 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 	if !ok {
 		return fmt.Errorf("instance %q not found", id)
 	}
+
+	// BE-H7/BE-H8: Prevent double-start and start-after-stop races.
+	inst.mu.Lock()
+	if inst.stopped {
+		inst.mu.Unlock()
+		return fmt.Errorf("instance %q has been stopped; cannot start", id)
+	}
+	if inst.started {
+		inst.mu.Unlock()
+		return fmt.Errorf("instance %q already started; cannot start twice", id)
+	}
+	inst.started = true
+	inst.mu.Unlock()
 
 	// Transition to STARTING state.
 	if b.store != nil {
@@ -247,6 +376,15 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 			ID:     id,
 			Status: state.AgentStatusRunning,
 		}); err != nil {
+			// Process is running but we failed to record that fact.
+			// Kill the process to avoid a zombie that the caller
+			// doesn't know about.
+			b.logger.Error("store write failed after process started; killing process to avoid zombie",
+				"agent_id", id, "error", err)
+			inst.cancel()
+			// Wait for the process to exit so we don't leak it.
+			_ = inst.cmd.Wait()
+			inst.closeOnce.Do(func() { close(inst.done) })
 			return fmt.Errorf("setting agent %q to RUNNING: %w", id, err)
 		}
 	}
@@ -254,7 +392,7 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 	// Wait in background.
 	go func() {
 		inst.err = inst.cmd.Wait()
-		close(inst.done)
+		inst.closeOnce.Do(func() { close(inst.done) })
 		b.logger.Info("process exited", "agent_id", id, "error", inst.err)
 	}()
 
@@ -271,6 +409,12 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 		return fmt.Errorf("instance %q not found", id)
 	}
 
+	// BE-H7: Mark the instance as stopped so that a concurrent or
+	// subsequent Start call is rejected.
+	inst.mu.Lock()
+	inst.stopped = true
+	inst.mu.Unlock()
+
 	// Transition to STOPPING state.
 	if b.store != nil {
 		if err := b.store.SetAgent(&state.AgentState{
@@ -281,18 +425,28 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 		}
 	}
 
-	// Send SIGTERM first for graceful shutdown.
-	if inst.cmd.Process != nil {
+	// If the process was never started (cmd.Process is nil), the Wait
+	// goroutine was never launched and inst.done will never close. In that
+	// case, cancel the context and close done so callers don't block.
+	// BE-H2: Use closeOnce to prevent double-close.
+	if inst.cmd.Process == nil {
+		inst.cancel()
+		inst.closeOnce.Do(func() { close(inst.done) })
+	} else {
+		// Send SIGTERM first for graceful shutdown.
 		inst.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck // best-effort graceful shutdown signal
-	}
 
-	// Wait with timeout, then force kill.
-	select {
-	case <-inst.done:
-		// Process exited gracefully.
-	case <-time.After(10 * time.Second):
-		inst.cancel() // Force kill via context cancellation.
-		<-inst.done
+		// Wait with timeout, then force kill. Also respect the caller's context.
+		select {
+		case <-inst.done:
+			// Process exited gracefully.
+		case <-ctx.Done():
+			inst.cancel() // Context cancelled — force kill immediately.
+			<-inst.done
+		case <-time.After(10 * time.Second):
+			inst.cancel() // Force kill via context cancellation.
+			<-inst.done
+		}
 	}
 
 	if b.store != nil {
@@ -314,8 +468,26 @@ func (b *Backend) Destroy(ctx context.Context, id string) error {
 	}
 
 	b.mu.Lock()
+	inst, exists := b.instances[id]
+	if !exists {
+		b.mu.Unlock()
+		return fmt.Errorf("instance %q not found; nothing to destroy", id)
+	}
 	delete(b.instances, id)
 	b.mu.Unlock()
+
+	// BE-C1: Release the OpenClaw gateway port back to the pool.
+	if inst.gatewayPort > 0 {
+		releaseGatewayPort(inst.gatewayPort)
+	}
+
+	// Clean up the OpenClaw workspace directory if one was created (BE-H5).
+	if inst.workspacePath != "" {
+		if err := os.RemoveAll(inst.workspacePath); err != nil {
+			b.logger.Warn("failed to remove workspace directory",
+				"agent_id", id, "path", inst.workspacePath, "error", err)
+		}
+	}
 
 	if b.store != nil {
 		if err := b.store.RemoveAgent(id); err != nil {
@@ -363,21 +535,85 @@ func (b *Backend) Logs(ctx context.Context, id string, opts backend.LogOpts) (io
 		return nil, fmt.Errorf("instance %q not found", id)
 	}
 
-	combined := append(inst.stdout.Bytes(), inst.stderr.Bytes()...)
-	return io.NopCloser(bytes.NewReader(combined)), nil
+	// Use io.MultiReader to avoid allocating a single combined buffer
+	// that could reach 2 * maxBufSize (up to 20 MB) (BE-H6).
+	combined := io.MultiReader(
+		bytes.NewReader(inst.stdout.Bytes()),
+		bytes.NewReader(inst.stderr.Bytes()),
+	)
+	return io.NopCloser(combined), nil
+}
+
+// systemMemoryMB returns the total physical system RAM in megabytes.
+// It uses platform-specific methods:
+//   - Linux:  parses /proc/meminfo for MemTotal
+//   - macOS:  reads hw.memsize via syscall.Sysctl
+//
+// Returns 0 if detection fails so the caller can apply a fallback.
+func systemMemoryMB() int64 {
+	switch goruntime.GOOS {
+	case "linux":
+		return linuxMemoryMB()
+	case "darwin":
+		return darwinMemoryMB()
+	default:
+		return 0
+	}
+}
+
+// linuxMemoryMB parses /proc/meminfo to extract MemTotal in MB.
+func linuxMemoryMB() int64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		// Format: "MemTotal:       16384000 kB"
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kB, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kB / 1024 // kB -> MB
+	}
+	return 0
+}
+
+// darwinMemoryMB reads hw.memsize via syscall.Sysctl to get total RAM in MB.
+func darwinMemoryMB() int64 {
+	val, err := syscall.Sysctl("hw.memsize")
+	if err != nil || len(val) == 0 {
+		return 0
+	}
+	// syscall.Sysctl returns a raw byte string; hw.memsize is a uint64 in
+	// host byte order (little-endian on all supported Apple hardware).
+	b := []byte(val)
+	// The kernel may or may not include a trailing NUL byte.
+	// Ensure we have at least 8 bytes for the uint64.
+	if len(b) < 8 {
+		return 0
+	}
+	memBytes := binary.LittleEndian.Uint64(b[:8])
+	return int64(memBytes / (1024 * 1024))
 }
 
 func (b *Backend) Available() backend.Resources {
-	// Use runtime to get actual system info.
-	// Try to read actual CPU count
 	cpuCount := goruntime.NumCPU()
 
-	// For memory, use a simple cross-platform approach
-	var m goruntime.MemStats
-	goruntime.ReadMemStats(&m)
-	memTotal := int64(m.Sys / (1024 * 1024))
+	// Detect actual system RAM using platform-specific methods.
+	memTotal := systemMemoryMB()
 	if memTotal < 256 {
-		memTotal = 8192 // fallback if reading fails
+		memTotal = 8192 // fallback if detection fails or returns unreasonably low value
 	}
 
 	return backend.Resources{

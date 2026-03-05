@@ -614,7 +614,7 @@ func TestAgentManager_Status_Running(t *testing.T) {
 		t.Fatalf("StartAgent: %v", err)
 	}
 
-	status, err := mgr.Status("status-agent")
+	status, err := mgr.Status(context.Background(), "status-agent")
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
@@ -628,7 +628,7 @@ func TestAgentManager_Status_UnknownAgent(t *testing.T) {
 	r := NewRegistry()
 	mgr := NewAgentManager(r, "firecracker", testLogger())
 
-	status, err := mgr.Status("ghost")
+	status, err := mgr.Status(context.Background(), "ghost")
 	if err == nil {
 		t.Fatal("Status: expected error for unknown agent, got nil")
 	}
@@ -653,7 +653,7 @@ func TestAgentManager_Status_BackendError(t *testing.T) {
 	}
 
 	b.StatusErr = errors.New("cgroups unavailable")
-	_, err := mgr.Status("status-err")
+	_, err := mgr.Status(context.Background(), "status-err")
 	if err == nil {
 		t.Fatal("Status: expected error from backend, got nil")
 	}
@@ -679,7 +679,7 @@ func TestAgentManager_Logs_Success(t *testing.T) {
 		t.Fatalf("StartAgent: %v", err)
 	}
 
-	rc, err := mgr.Logs("log-agent", LogOpts{Tail: 10})
+	rc, err := mgr.Logs(context.Background(), "log-agent", LogOpts{Tail: 10})
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
@@ -699,7 +699,7 @@ func TestAgentManager_Logs_UnknownAgent(t *testing.T) {
 	r := NewRegistry()
 	mgr := NewAgentManager(r, "firecracker", testLogger())
 
-	_, err := mgr.Logs("ghost", LogOpts{})
+	_, err := mgr.Logs(context.Background(), "ghost", LogOpts{})
 	if err == nil {
 		t.Fatal("Logs: expected error for unknown agent, got nil")
 	}
@@ -721,7 +721,7 @@ func TestAgentManager_Logs_BackendError(t *testing.T) {
 	}
 
 	b.LogsErr = errors.New("log file missing")
-	_, err := mgr.Logs("log-err", LogOpts{})
+	_, err := mgr.Logs(context.Background(), "log-err", LogOpts{})
 	if err == nil {
 		t.Fatal("Logs: expected error from backend, got nil")
 	}
@@ -746,17 +746,20 @@ func TestAgentManager_RestartAgent_TrackedAgent(t *testing.T) {
 		t.Fatalf("StartAgent: %v", err)
 	}
 
-	if err := mgr.RestartAgent(context.Background(), "restart-me", spec); err != nil {
+	if err := mgr.RestartAgent(context.Background(), spec); err != nil {
 		t.Fatalf("RestartAgent: %v", err)
 	}
 
-	// Expect: 2x Create, 2x Start, 1x Destroy (from the teardown before restart).
-	created, started, _, destroyed := b.callCounts()
+	// Expect: 2x Create, 2x Start, 1x Stop + 1x Destroy (from the teardown before restart).
+	created, started, stopped, destroyed := b.callCounts()
 	if created != 2 {
 		t.Errorf("Create called %d times, want 2", created)
 	}
 	if started != 2 {
 		t.Errorf("Start called %d times, want 2", started)
+	}
+	if stopped != 1 {
+		t.Errorf("Stop called %d times, want 1", stopped)
 	}
 	if destroyed != 1 {
 		t.Errorf("Destroy called %d times, want 1", destroyed)
@@ -775,7 +778,7 @@ func TestAgentManager_RestartAgent_UntrackedAgent(t *testing.T) {
 	spec := testManifest("fresh-restart", "firecracker")
 
 	// RestartAgent on an agent that was never started should just start it.
-	if err := mgr.RestartAgent(context.Background(), "fresh-restart", spec); err != nil {
+	if err := mgr.RestartAgent(context.Background(), spec); err != nil {
 		t.Fatalf("RestartAgent on untracked agent: %v", err)
 	}
 

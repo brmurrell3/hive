@@ -50,9 +50,8 @@ let
     else toString (../../bin/linux-amd64/hive-sidecar);
 
   # Wrap the binary in a derivation so Nix can track it as a store path.
-  # If the file does not exist yet the derivation is a stub that installs a
-  # placeholder script that prints a clear error — this prevents a hard build
-  # failure during early development when the binary hasn't been compiled yet.
+  # If the file does not exist the build aborts immediately — a silently
+  # broken image without the sidecar is worse than a clear build failure.
   sidecarBin =
     if builtins.pathExists resolvedSidecarPath
     then
@@ -60,11 +59,11 @@ let
         install -Dm755 ${resolvedSidecarPath} $out/bin/hive-sidecar
       ''
     else
-      pkgs.writeShellScriptBin "hive-sidecar" ''
-        echo "ERROR: hive-sidecar binary was not found at build time." >&2
-        echo "       Compile it first:" >&2
-        echo "         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar" >&2
-        exit 1
+      builtins.abort ''
+        hive-sidecar binary not found at '${resolvedSidecarPath}'.
+        Compile it first:
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
+        Or set HIVE_SIDECAR_BIN to point to an existing binary.
       '';
 in
 {
@@ -131,7 +130,7 @@ in
   # ---------------------------------------------------------------------------
   networking = {
     hostName = "hive-vm";
-    firewall.enable = false;
+    firewall.enable = true;
     useDHCP = true;
   };
 
@@ -157,6 +156,10 @@ in
     # Read sidecar.conf from the agent drive to get per-agent configuration.
     # The conf file contains KEY=VALUE pairs (AGENT_ID, TEAM_ID, NATS_URL,
     # NATS_TOKEN, VSOCK_PORT).
+    #
+    # SEC-P3-004: The sidecar.conf file is written by the host via
+    # os.WriteFile which is not atomic. A retry loop ensures the file is
+    # fully written (non-empty and ends with a newline) before sourcing.
     script = ''
       AGENT_ID="unknown"
       TEAM_ID=""
@@ -164,36 +167,49 @@ in
       NATS_TOKEN=""
       VSOCK_PORT="4222"
 
-      if [ -f /agent/sidecar.conf ]; then
-        . /agent/sidecar.conf
+      # Wait for sidecar.conf to be fully written (retry up to 30 times, 1s apart).
+      _conf="/agent/sidecar.conf"
+      _retries=0
+      while [ "$_retries" -lt 30 ]; do
+        if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+          # Check that the file ends with a newline (complete write).
+          if tail -c 1 "$_conf" | od -An -tx1 | grep -q '0a'; then
+            break
+          fi
+        fi
+        _retries=$((_retries + 1))
+        echo "Waiting for $_conf to be fully written (attempt $_retries/30)..." >&2
+        sleep 1
+      done
+
+      if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+        . "$_conf"
+      else
+        echo "WARNING: $_conf not found or empty after 30s, using defaults" >&2
       fi
 
-      EXTRA_ARGS=""
+      # Build arguments safely using positional parameters to avoid eval injection.
+      set -- --agent-id "$AGENT_ID" --team-id "$TEAM_ID" \
+             --nats-url "$NATS_URL" \
+             --workspace /agent --vsock --vsock-port "$VSOCK_PORT"
 
       if [ -n "''${RUNTIME_CMD:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --runtime-cmd ''${RUNTIME_CMD}"
+          set -- "$@" --runtime-cmd "''${RUNTIME_CMD}"
       fi
 
       if [ -n "''${RUNTIME_ARGS:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --runtime-args ''${RUNTIME_ARGS}"
+          set -- "$@" --runtime-args "''${RUNTIME_ARGS}"
       fi
 
       if [ -n "''${CAPABILITIES:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --capabilities '''''${CAPABILITIES}'"
+          set -- "$@" --capabilities "''${CAPABILITIES}"
       fi
 
       if [ -n "''${NATS_TOKEN:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --nats-token ''${NATS_TOKEN}"
+          set -- "$@" --nats-token "''${NATS_TOKEN}"
       fi
 
-      eval exec /opt/hive/sidecar \
-        --agent-id "$AGENT_ID" \
-        --team-id "$TEAM_ID" \
-        --nats-url "$NATS_URL" \
-        --workspace /agent \
-        --vsock \
-        --vsock-port "$VSOCK_PORT" \
-        $EXTRA_ARGS
+      exec /opt/hive/sidecar "$@"
     '';
 
     serviceConfig = {
@@ -202,12 +218,214 @@ in
       RestartSec = "5s";
       WorkingDirectory = "/opt/hive";
 
+      # Systemd hardening directives
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      PrivateTmp = true;
+      NoNewPrivileges = true;
+      ReadWritePaths = [ "/workspace" "/volumes" ];
+
       # Sidecar environment — values here are defaults; the control plane
       # can override them via the agent drive or environment file.
       Environment = [
         "HIVE_SIDECAR_MODE=standalone"
         "HIVE_SIDECAR_PORT=9100"
       ];
+    };
+  };
+
+  # ---------------------------------------------------------------------------
+  # Egress policy enforcement (iptables rules based on HIVE_EGRESS_MODE)
+  # ---------------------------------------------------------------------------
+  systemd.services.hive-egress-policy = {
+    description = "Hive Egress Network Policy";
+    after = [ "network.target" "agent.mount" ];
+    wants = [ "agent.mount" ];
+    wantedBy = [ "multi-user.target" ];
+    before = [ "hive-sidecar.service" ];
+
+    path = [ pkgs.iptables pkgs.iproute2 pkgs.dnsutils ];
+
+    # SEC-P3-004: Wait for sidecar.conf to be fully written before sourcing.
+    script = ''
+      set -e
+      HIVE_EGRESS_MODE=""
+      HIVE_EGRESS_ALLOWLIST=""
+      HIVE_DNS_SERVER=""
+
+      _conf="/agent/sidecar.conf"
+      _retries=0
+      while [ "$_retries" -lt 30 ]; do
+        if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+          if tail -c 1 "$_conf" | od -An -tx1 | grep -q '0a'; then
+            break
+          fi
+        fi
+        _retries=$((_retries + 1))
+        echo "Waiting for $_conf to be fully written (attempt $_retries/30)..." >&2
+        sleep 1
+      done
+
+      if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+        . "$_conf"
+      else
+        echo "WARNING: $_conf not found or empty after 30s, using defaults" >&2
+      fi
+
+      # Configure DNS resolver
+      if [ -n "''${HIVE_DNS_SERVER:-}" ]; then
+          if echo "$HIVE_DNS_SERVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "nameserver $HIVE_DNS_SERVER" > /etc/resolv.conf
+          else
+              echo "ERROR: invalid DNS server IP: $HIVE_DNS_SERVER" >&2
+          fi
+      fi
+
+      [ -z "''${HIVE_EGRESS_MODE:-}" ] && exit 0
+
+      case "$HIVE_EGRESS_MODE" in
+          none)
+              # No network device attached, vsock only - restrict INPUT and OUTPUT
+              echo "Network policy: egress=none (vsock only)"
+              # Add ALLOW rules before setting policies to DROP
+              iptables -A INPUT -i lo -j ACCEPT
+              iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+              iptables -A OUTPUT -o lo -j ACCEPT
+              iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+              # Allow NATS communication (port 4222) on OUTPUT
+              iptables -A OUTPUT -p tcp --dport 4222 -j ACCEPT
+              # Now set all chain policies to DROP
+              iptables -P INPUT DROP
+              iptables -P FORWARD DROP
+              iptables -P OUTPUT DROP
+              ;;
+          restricted)
+              echo "Network policy: egress=restricted"
+              # Add all ACCEPT rules before setting DROP policies to avoid
+              # a window where traffic is dropped while rules are being added.
+              iptables -A INPUT -i lo -j ACCEPT
+              iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+              iptables -A OUTPUT -o lo -j ACCEPT
+
+              # Allow DNS to gateway
+              iptables -A OUTPUT -d 172.16.0.1 -p udp --dport 53 -j ACCEPT
+              iptables -A OUTPUT -d 172.16.0.1 -p tcp --dport 53 -j ACCEPT
+
+              # Allow established connections
+              iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+              # Parse and allow domains from HIVE_EGRESS_ALLOWLIST (JSON array)
+              if [ -n "''${HIVE_EGRESS_ALLOWLIST:-}" ]; then
+                  echo "$HIVE_EGRESS_ALLOWLIST" | tr -d '[]"' | tr ',' ' ' | tr ' ' '\n' | while read -r domain; do
+                      [ -z "$domain" ] && continue
+                      for ip in $(nslookup "$domain" 2>/dev/null | awk '/^Address: / { print $2 }'); do
+                          if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                              iptables -A OUTPUT -d "$ip" -j ACCEPT
+                          else
+                              echo "WARNING: skipping invalid IP from nslookup: $ip" >&2
+                          fi
+                      done
+                  done
+              fi
+
+              # Now set DROP policies after all ACCEPT rules are in place
+              iptables -P INPUT DROP
+              iptables -P FORWARD DROP
+              iptables -P OUTPUT DROP
+              ;;
+          full)
+              echo "Network policy: egress=full (no restrictions)"
+              ;;
+      esac
+    '';
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+  };
+
+  # ---------------------------------------------------------------------------
+  # Volume mount service (parses HIVE_VOLUMES from sidecar.conf)
+  # ---------------------------------------------------------------------------
+  systemd.services.hive-volumes = {
+    description = "Hive Shared Volume Mounts";
+    after = [ "agent.mount" ];
+    wants = [ "agent.mount" ];
+    wantedBy = [ "multi-user.target" ];
+    before = [ "hive-sidecar.service" ];
+
+    path = [ pkgs.util-linux pkgs.coreutils ];
+
+    # SEC-P3-004: Wait for sidecar.conf to be fully written before sourcing.
+    script = ''
+      HIVE_VOLUMES=""
+
+      _conf="/agent/sidecar.conf"
+      _retries=0
+      while [ "$_retries" -lt 30 ]; do
+        if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+          if tail -c 1 "$_conf" | od -An -tx1 | grep -q '0a'; then
+            break
+          fi
+        fi
+        _retries=$((_retries + 1))
+        echo "Waiting for $_conf to be fully written (attempt $_retries/30)..." >&2
+        sleep 1
+      done
+
+      if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+        . "$_conf"
+      else
+        echo "WARNING: $_conf not found or empty after 30s, using defaults" >&2
+      fi
+
+      [ -z "''${HIVE_VOLUMES:-}" ] && exit 0
+
+      OLD_IFS="$IFS"
+      IFS='|'
+      for volspec in $HIVE_VOLUMES; do
+          IFS="$OLD_IFS"
+          device=$(echo "$volspec" | cut -d: -f1)
+          mountpoint=$(echo "$volspec" | cut -d: -f2)
+          access=$(echo "$volspec" | cut -d: -f3)
+
+          # Reject dangerous guest mount paths to prevent overwriting critical system directories
+          case "$mountpoint" in
+              /|/etc|/bin|/sbin|/usr|/lib|/dev|/proc|/sys|/boot|/run|/agent|/nix)
+                  echo "ERROR: refusing to mount volume to dangerous path: $mountpoint" >&2
+                  continue
+                  ;;
+              /etc/*|/bin/*|/sbin/*|/usr/*|/lib/*|/dev/*|/proc/*|/sys/*|/boot/*|/run/*|/agent/*|/nix/*)
+                  echo "ERROR: refusing to mount volume under dangerous path: $mountpoint" >&2
+                  continue
+                  ;;
+          esac
+
+          # Validate device name matches expected virtio block device pattern
+          case "$device" in
+              /dev/vd[a-z]) ;;
+              *)
+                  echo "ERROR: invalid device name: $device (expected /dev/vd[a-z])" >&2
+                  continue
+                  ;;
+          esac
+
+          mkdir -p "$mountpoint"
+          mount_opts="rw"
+          if [ "$access" = "ro" ]; then
+              mount_opts="ro"
+          fi
+          if ! mount -o "$mount_opts" "$device" "$mountpoint"; then
+              echo "ERROR: failed to mount $device at $mountpoint" >&2
+          fi
+      done
+      IFS="$OLD_IFS"
+    '';
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
     };
   };
 
@@ -233,8 +451,8 @@ in
   # ---------------------------------------------------------------------------
   # Serial console (debugging)
   # ---------------------------------------------------------------------------
-  # Auto-login root on the serial console so operators can inspect the VM.
-  services.getty.autologinUser = "root";
+  # Manual login is required for security — no auto-login on the serial console.
+  # Operators must authenticate to inspect the VM.
 
   # ---------------------------------------------------------------------------
   # Minimize image size
@@ -258,6 +476,8 @@ in
   environment.systemPackages = with pkgs; [
     bashInteractive
     coreutils
+    dnsutils     # for nslookup (egress allowlist resolution)
+    iptables     # for egress policy enforcement
     iproute2
     cacert
     curl
@@ -293,8 +513,8 @@ in
 
       # Install the sidecar binary at /opt/hive/sidecar.
       # The systemd service (hive-sidecar.service) exec's this path directly.
-      # sidecarBin is either the real compiled binary or a stub that prints an
-      # error — see the sidecarBin derivation in the let block above.
+      # The build will abort if the sidecar binary is missing — see the
+      # sidecarBin derivation in the let block above.
       install -Dm755 ${sidecarBin}/bin/hive-sidecar ./files/opt/hive/sidecar
     '';
   };

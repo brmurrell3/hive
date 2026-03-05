@@ -1,11 +1,12 @@
 #!/bin/bash
-# Build a minimal Alpine Linux rootfs for Firecracker VMs.
+# Build an OpenClaw rootfs image with Node.js 20.
+# Extends the base rootfs with Node.js for OpenClaw agent runtime.
 #
 # This script does NOT require root or loop-mount support.  It uses
 # `mkfs.ext4 -d <dir>` (e2fsprogs >= 1.43) to create the ext4 image directly
 # from a staging directory populated by Docker + local files.
 #
-# Usage: ./build-rootfs.sh <output_image> <size> <sidecar_binary>
+# Usage: ./build-rootfs-openclaw.sh <output_image> <size> <sidecar_binary>
 #
 # Requirements:
 #   - Docker       (to extract the Alpine base filesystem)
@@ -13,14 +14,14 @@
 #                  On macOS: brew install e2fsprogs
 #                  then add /opt/homebrew/opt/e2fsprogs/sbin to PATH
 #
-# The resulting ext4 image is a bootable Firecracker rootfs.  Pair it with a
-# vmlinux kernel (see `make download-kernel`) to launch a VM.
+# The resulting ext4 image is a bootable Firecracker rootfs containing
+# Node.js 20 LTS for running OpenClaw agents.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-OUTPUT="${1:-rootfs.ext4}"
-SIZE="${2:-512M}"
+OUTPUT="${1:-rootfs-openclaw.ext4}"
+SIZE="${2:-1G}"
 SIDECAR="${3:-hive-sidecar}"
 
 # ---------------------------------------------------------------------------
@@ -61,16 +62,21 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# 1. Extract Alpine base filesystem via Docker (no root needed)
+# 1. Extract Alpine base filesystem with Node.js 20 via Docker
 # ---------------------------------------------------------------------------
-echo "==> Extracting Alpine base filesystem..."
+echo "==> Extracting Alpine base filesystem with Node.js 20..."
 if ! command -v docker &>/dev/null; then
     echo "Error: Docker is required to build the rootfs"
     exit 1
 fi
 
 mkdir -p "$STAGEDIR"
-CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/sh -c "apk add --no-cache bind-tools iptables iproute2 && /bin/true")
+
+# Build a temporary image that includes Node.js 20 from Alpine repos.
+# Alpine 3.19 ships nodejs-20 in its main repository.
+CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/sh -c "
+    apk add --no-cache bind-tools nodejs npm iptables iproute2
+")
 if ! docker start -a "$CONTAINER_ID"; then
     echo "Error: docker start failed for container $CONTAINER_ID" >&2
     exit 1
@@ -78,6 +84,28 @@ fi
 docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
 docker rm "$CONTAINER_ID" >/dev/null
 CONTAINER_ID=""
+
+# Verify Node.js was installed
+if [ ! -f "$STAGEDIR/usr/bin/node" ]; then
+    echo "Warning: Node.js binary not found in image — trying alternative install method..."
+    # Fallback: use a multi-stage approach with explicit apk in chroot-like fashion
+    CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/true)
+    docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
+    docker rm "$CONTAINER_ID" >/dev/null
+    CONTAINER_ID=""
+
+    # Install Node.js using a Docker run with bind mount
+    docker run --rm --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" \
+        -v "$STAGEDIR:/rootfs" alpine:3.19 \
+        /bin/sh -c "apk add --no-cache --root /rootfs --initdb bind-tools nodejs npm iptables iproute2"
+fi
+
+# Strip unnecessary files to keep image size down
+echo "==> Stripping unnecessary files to reduce image size..."
+rm -rf "$STAGEDIR/usr/share/man" \
+       "$STAGEDIR/usr/share/doc" \
+       "$STAGEDIR/usr/share/info" \
+       "$STAGEDIR/var/cache/apk"/*
 
 # ---------------------------------------------------------------------------
 # 2. Install the sidecar binary
@@ -98,12 +126,12 @@ if [ -d "$SCRIPT_DIR/overlay" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Write the init script
+# 4. Write the init script (same as base rootfs)
 # ---------------------------------------------------------------------------
 echo "==> Installing init script..."
 cat > "$STAGEDIR/init" << 'INITEOF'
 #!/bin/sh
-# Hive VM init script
+# Hive VM init script (OpenClaw variant)
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
@@ -285,8 +313,6 @@ mkdir -p "$STAGEDIR/agent"
 # 6. Create the ext4 image using mkfs.ext4 -d (no loop mount, no root)
 # ---------------------------------------------------------------------------
 echo "==> Creating ext4 image ($SIZE) from staging directory..."
-# truncate creates the raw file at the target size; mkfs.ext4 -d then formats
-# it and populates it from the staging directory in one pass.
 truncate -s "$SIZE" "$WORKDIR/rootfs.ext4"
 "$MKE2FS" -t ext4 -q -d "$STAGEDIR" "$WORKDIR/rootfs.ext4"
 
@@ -296,4 +322,4 @@ truncate -s "$SIZE" "$WORKDIR/rootfs.ext4"
 echo "==> Moving image to $OUTPUT..."
 mv "$WORKDIR/rootfs.ext4" "$OUTPUT"
 
-echo "==> Done: $OUTPUT"
+echo "==> Done: $OUTPUT (OpenClaw variant with Node.js)"
