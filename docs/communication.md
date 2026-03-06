@@ -1,4 +1,6 @@
-# 03-COMMUNICATION.md
+[← Back to Documentation](README.md)
+
+# Hive Communication Specification
 
 ## TRANSPORT LAYERS
 
@@ -207,7 +209,7 @@ Same as within-team, differences:
 **Firmware agents:**
 - Capabilities as firmware SDK functions, invoked via MQTT request/response
 
-### Tool Naming & Collision Resolution (Issue #9)
+### Tool Naming & Collision Resolution
 
 | Scenario | Tool Name | Notes |
 |----------|-----------|-------|
@@ -220,7 +222,7 @@ Same as within-team, differences:
 
 ---
 
-## ERROR HANDLING (Issue #12)
+## ERROR HANDLING
 
 ### Error Object Schema
 
@@ -335,7 +337,7 @@ POST /team/broadcast
 
 ---
 
-## BINARY ENCODING (Issue #2)
+## BINARY ENCODING
 
 ### Large Payloads
 
@@ -370,7 +372,7 @@ Tier 3 firmware devices (MQTT):
 
 ---
 
-## PERSISTENCE MODEL (Issue #16)
+## PERSISTENCE MODEL
 
 ### Team-Level Persistence
 
@@ -439,14 +441,4 @@ hive.capabilities.registry      [ephemeral]
 - Binary blob references: UUID-based, no PII in filenames
 - Message signing: OPTIONAL Phase 2 enhancement
 
----
-
-## ISSUE RESOLUTION REFERENCE
-
-| Issue | Resolution | Location |
-|-------|-----------|----------|
-| #2 (Binary data) | Blob reference system, MessagePack encoding | BINARY ENCODING section |
-| #9 (Naming collisions) | Team-ID suffixing, priority rules | TOOL NAMING & COLLISION RESOLUTION |
-| #12 (Error handling) | Structured error object, retry policy, circuit breaker | ERROR HANDLING section |
-| #16 (JetStream persistence) | Team-level opt-in, org-level selective, non-persistent list | PERSISTENCE MODEL section |
 

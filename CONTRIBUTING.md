@@ -7,7 +7,7 @@ everything you need to get started.
 
 ### Prerequisites
 
-- Go 1.23+
+- Go 1.25+
 - Linux with KVM for VM features (macOS works for building and testing with mocks)
 - Docker (optional, for building rootfs images)
 
@@ -25,21 +25,7 @@ make build
 make test
 ```
 
-### Running Tests
-
-```bash
-# Unit tests only (fast, no external dependencies)
-make test-unit
-
-# Integration tests (spins up embedded NATS)
-make test-integration
-
-# VM tests (requires Linux with /dev/kvm)
-make test-vm
-
-# Use mock mode on macOS or without KVM
-HIVE_TEST_FIRECRACKER=mock make test
-```
+For detailed test instructions (build tags, mock mode, real Firecracker), see the [Testing Guide](docs/testing.md). For the full project layout, see the [README](README.md#project-layout).
 
 ## How to Contribute
 
@@ -88,17 +74,6 @@ Open an issue describing:
 - Use present tense ("Add feature" not "Added feature")
 - Keep the subject line under 72 characters
 - Reference issue numbers where applicable
-
-## Project Structure
-
-```
-cmd/           Binary entrypoints (hived, hivectl, hive-agent)
-internal/      Library packages (not importable externally)
-docs/          Specification documents
-rootfs/        Firecracker VM rootfs build scripts
-sdk/           Firmware SDKs (C, MicroPython)
-testdata/      Test fixtures
-```
 
 ## License
 

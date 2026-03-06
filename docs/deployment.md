@@ -1,10 +1,8 @@
-# DEPLOYMENT SPEC v3
+[← Back to Documentation](README.md)
 
-Consolidated deployment spec for Hive covering NixOS configuration, bootstrap/installation, pre-built images, node discovery/join, and agent-to-node assignment.
+# Hive Deployment Specification
 
-Format: optimized for Claude Code. Terse, structured, deterministic. Minimal prose.
-
-Resolves review issue #4 (agent-to-node assignment friction).
+NixOS configuration, bootstrap/installation, pre-built images, node discovery/join, and agent-to-node assignment.
 
 ---
 
@@ -253,11 +251,9 @@ Device wiped and re-flashed: re-runs join. Control plane matches by hostname or 
 
 ## AGENT-TO-NODE ASSIGNMENT
 
-**Issue #4 Resolution:** Tier 2 device joins → gets auto-generated node ID → user must find ID via hivectl nodes list → write into manifest placement.nodeId. Friction.
+Agent-to-node assignment supports multiple mechanisms with priority-based matching.
 
-**Solution:** TWO mechanisms with priority-based matching.
-
-### Mechanism 1: Self-Declaration (NEW, resolves #4)
+### Mechanism 1: Self-Declaration
 
 Tier 2 device config (hive-config.yaml or /etc/hive/config.yaml) includes optional agentId field.
 

@@ -1,102 +1,33 @@
+[← Back to Documentation](README.md)
+
 # Hive Operations Guide
 
-Complete guide to building, running, and testing every feature of Hive end-to-end.
+Operational reference for every Hive feature. For build and test instructions, see the [main README](../README.md). For a quick tutorial, see [Getting Started](getting-started.md).
 
 ---
 
 ## Table of Contents
 
-1. [Prerequisites](#1-prerequisites)
-2. [Build Everything](#2-build-everything)
-3. [Run the Test Suite](#3-run-the-test-suite)
-4. [Scaffold a Cluster](#4-scaffold-a-cluster)
-5. [Start the Control Plane](#5-start-the-control-plane)
-6. [Validate Configuration](#6-validate-configuration)
-7. [Manage Agents (VM Lifecycle)](#7-manage-agents-vm-lifecycle)
-8. [Join Tokens](#8-join-tokens)
-9. [Node Management](#9-node-management)
-10. [Join a Tier 2 Native Agent](#10-join-a-tier-2-native-agent)
-11. [RBAC and User Management](#11-rbac-and-user-management)
-12. [Firmware Agents (Tier 3)](#12-firmware-agents-tier-3)
-13. [Dashboard and Web UI](#13-dashboard-and-web-ui)
-14. [Prometheus Metrics](#14-prometheus-metrics)
-15. [Log Aggregation](#15-log-aggregation)
-16. [NATS Messaging and Pub/Sub](#16-nats-messaging-and-pubsub)
-17. [Build the Rootfs Images](#17-build-the-rootfs-images)
-18. [Production Hardening](#18-production-hardening)
-19. [Full End-to-End Walkthrough](#19-full-end-to-end-walkthrough)
-20. [Troubleshooting](#20-troubleshooting)
+1. [Scaffold a Cluster](#1-scaffold-a-cluster)
+2. [Start the Control Plane](#2-start-the-control-plane)
+3. [Validate Configuration](#3-validate-configuration)
+4. [Manage Agents (VM Lifecycle)](#4-manage-agents-vm-lifecycle)
+5. [Join Tokens](#5-join-tokens)
+6. [Node Management](#6-node-management)
+7. [Join a Tier 2 Native Agent](#7-join-a-tier-2-native-agent)
+8. [RBAC and User Management](#8-rbac-and-user-management)
+9. [Firmware Agents (Tier 3)](#9-firmware-agents-tier-3)
+10. [Dashboard and Web UI](#10-dashboard-and-web-ui)
+11. [Prometheus Metrics](#11-prometheus-metrics)
+12. [Log Aggregation](#12-log-aggregation)
+13. [NATS Messaging and Pub/Sub](#13-nats-messaging-and-pubsub)
+14. [Build the Rootfs Images](#14-build-the-rootfs-images)
+15. [Production Hardening](#15-production-hardening)
+16. [Troubleshooting](#16-troubleshooting)
 
 ---
 
-## 1. Prerequisites
-
-**Required:**
-- Go 1.23+ (`go version`)
-- Linux host for VM features (Firecracker requires `/dev/kvm`)
-- macOS works for everything except VM lifecycle (use `HIVE_TEST_FIRECRACKER=mock`)
-
-**Optional (per feature):**
-- Docker — for building the Alpine rootfs (`rootfs/build-rootfs.sh`)
-- Nix with flakes — for building the NixOS rootfs (`rootfs/nixos/`)
-- Firecracker binary — for real VM lifecycle (not needed for mock mode)
-- `nats` CLI — for manual pub/sub testing (`go install github.com/nats-io/natscli/nats@latest`)
-- ESP-IDF / Arduino CLI / Pico SDK — only for firmware builds
-- A serial device — only for firmware flash/monitor
-
----
-
-## 2. Build Everything
-
-```bash
-# From the project root:
-cd path/to/hive
-
-# Build all three binaries
-make build
-
-# This produces:
-#   ./hived        — control plane daemon
-#   ./hivectl      — CLI tool
-#   ./hive-agent   — tier 2 native agent
-```
-
-Verify the builds:
-
-```bash
-./hivectl version
-# hivectl v0.1.0
-
-./hive-agent version
-# hive-agent dev darwin/arm64
-```
-
----
-
-## 3. Run the Test Suite
-
-```bash
-# Unit tests (no external dependencies, fast)
-make test-unit
-
-# Integration tests (starts embedded NATS, uses filesystem)
-make test-integration
-
-# Both at once
-make test
-
-# VM tests (requires /dev/kvm — Linux only)
-make test-vm
-
-# Full regression with race detection
-go test -tags unit,integration -race -count=1 -timeout 5m ./...
-```
-
-Current test coverage: 22 packages, all passing.
-
----
-
-## 4. Scaffold a Cluster
+## 1. Scaffold a Cluster
 
 Create a fresh cluster directory with all the template files:
 
@@ -126,7 +57,7 @@ cat my-cluster/teams/default.yaml
 
 ---
 
-## 5. Start the Control Plane
+## 2. Start the Control Plane
 
 ```bash
 # Start hived pointing at the cluster directory
@@ -152,7 +83,7 @@ hived runs in the foreground. It:
 
 ---
 
-## 6. Validate Configuration
+## 3. Validate Configuration
 
 Validate all YAML manifests (cluster + agents + teams) without starting anything:
 
@@ -171,7 +102,7 @@ If there are errors (e.g., missing required fields, invalid agent IDs, duplicate
 
 ---
 
-## 7. Manage Agents (VM Lifecycle)
+## 4. Manage Agents (VM Lifecycle)
 
 Agents run inside Firecracker VMs on Linux. On macOS or without `/dev/kvm`, use mock mode:
 
@@ -280,7 +211,7 @@ FAILED  → CREATING  (restart)
 
 ---
 
-## 8. Join Tokens
+## 5. Join Tokens
 
 Tokens authenticate Tier 2/3 nodes joining the cluster. The raw token is shown once at creation time; only a SHA-256 hash is stored.
 
@@ -305,7 +236,7 @@ Tokens authenticate Tier 2/3 nodes joining the cluster. The raw token is shown o
 
 ---
 
-## 9. Node Management
+## 6. Node Management
 
 Nodes are registered when agents join via `hive-agent join`. Once registered, you can manage them:
 
@@ -348,7 +279,7 @@ Tier classification is automatic based on hardware:
 
 ---
 
-## 10. Join a Tier 2 Native Agent
+## 7. Join a Tier 2 Native Agent
 
 Tier 2 agents run natively on hardware (no VM). They use `hive-agent join` to connect to the control plane.
 
@@ -394,7 +325,7 @@ The agent will:
 
 ---
 
-## 11. RBAC and User Management
+## 8. RBAC and User Management
 
 Three roles with different permissions:
 
@@ -436,7 +367,7 @@ Three roles with different permissions:
 
 ---
 
-## 12. Firmware Agents (Tier 3)
+## 9. Firmware Agents (Tier 3)
 
 Firmware agents run on microcontrollers (ESP32, Raspberry Pi Pico, etc.) and communicate via MQTT.
 
@@ -531,7 +462,7 @@ The MQTT bridge translates between MQTT topics and NATS subjects:
 
 ---
 
-## 13. Dashboard and Web UI
+## 10. Dashboard and Web UI
 
 The dashboard is a single-page web application served by hived's HTTP server.
 
@@ -633,7 +564,7 @@ The embedded SPA at `http://localhost:8080/` provides:
 
 ---
 
-## 14. Prometheus Metrics
+## 11. Prometheus Metrics
 
 The metrics collector exposes a `/metrics` endpoint in Prometheus text exposition format.
 
@@ -691,7 +622,7 @@ scrape_configs:
 
 ---
 
-## 15. Log Aggregation
+## 12. Log Aggregation
 
 Agent logs are streamed via NATS and persisted to local JSONL files.
 
@@ -739,7 +670,7 @@ nats pub hive.logs.my-agent '{
 
 ---
 
-## 16. NATS Messaging and Pub/Sub
+## 13. NATS Messaging and Pub/Sub
 
 With hived running, you can interact with the embedded NATS server using the `nats` CLI.
 
@@ -822,7 +753,7 @@ nats stream list
 
 ---
 
-## 17. Build the Rootfs Images
+## 14. Build the Rootfs Images
 
 ### Alpine Rootfs (current)
 
@@ -878,7 +809,7 @@ The NixOS rootfs includes:
 
 ---
 
-## 18. Production Hardening
+## 15. Production Hardening
 
 ### Graceful Shutdown
 
@@ -925,144 +856,7 @@ The resource monitor checks node usage every 30 seconds:
 
 ---
 
-## 19. Full End-to-End Walkthrough
-
-This walks through every feature in order, from zero to a running cluster.
-
-```bash
-# ── Step 1: Build ──
-make build
-
-# ── Step 2: Scaffold ──
-./hivectl init demo-cluster
-
-# ── Step 3: Add a second agent ──
-mkdir -p demo-cluster/agents/summarizer
-cat > demo-cluster/agents/summarizer/manifest.yaml << 'EOF'
-apiVersion: hive/v1
-kind: Agent
-metadata:
-  id: summarizer
-  team: default
-spec:
-  runtime:
-    type: openclaw
-    model:
-      provider: anthropic
-      name: claude-sonnet-4-5
-  capabilities:
-    - name: summarize
-      description: Summarize text
-      inputs:
-        - name: text
-          type: string
-      outputs:
-        - name: summary
-          type: string
-  resources:
-    memory: "512Mi"
-    vcpus: 2
-EOF
-
-# ── Step 4: Validate ──
-./hivectl validate --cluster-root demo-cluster
-# Validation passed.
-
-# ── Step 5: Start hived ──
-./hived --cluster-root demo-cluster &
-HIVED_PID=$!
-sleep 2
-
-# ── Step 6: Start agents (mock mode for macOS) ──
-export HIVE_TEST_FIRECRACKER=mock
-./hivectl agents start example-agent --cluster-root demo-cluster
-./hivectl agents start summarizer --cluster-root demo-cluster
-
-# ── Step 7: List agents ──
-./hivectl agents list --cluster-root demo-cluster
-# AGENT_ID        TEAM     STATE    UPTIME
-# example-agent   default  RUNNING  3s
-# summarizer      default  RUNNING  1s
-
-# ── Step 8: Check detailed status ──
-./hivectl agents status example-agent --cluster-root demo-cluster
-
-# ── Step 9: Create a join token ──
-TOKEN=$(./hivectl tokens create --ttl 24h --cluster-root demo-cluster)
-echo "Token: $TOKEN"
-
-# ── Step 10: List tokens ──
-./hivectl tokens list --cluster-root demo-cluster
-
-# ── Step 11: Create RBAC users ──
-./hivectl users create admin-user --role admin --cluster-root demo-cluster
-./hivectl users create team-operator --role operator --teams default --cluster-root demo-cluster
-./hivectl users create viewer-user --role viewer --agents example-agent --cluster-root demo-cluster
-
-# ── Step 12: List users ──
-./hivectl users list --cluster-root demo-cluster
-
-# ── Step 13: Test NATS pub/sub ──
-# (Install nats CLI: go install github.com/nats-io/natscli/nats@latest)
-# In another terminal:
-nats sub 'hive.health.>' &
-SUB_PID=$!
-sleep 1
-
-# Simulate a heartbeat
-nats pub hive.health.test-device '{
-  "id":"hb-1","from":"test-device","to":"hived",
-  "type":"health","timestamp":"2026-03-03T10:00:00Z",
-  "payload":{"healthy":true,"uptime_seconds":60,"tier":"firmware"}
-}'
-sleep 1
-kill $SUB_PID 2>/dev/null
-
-# ── Step 14: Test agent restart ──
-./hivectl agents restart example-agent --cluster-root demo-cluster
-
-# ── Step 15: Stop an agent ──
-./hivectl agents stop summarizer --cluster-root demo-cluster
-
-# ── Step 16: List again (one running, one stopped) ──
-./hivectl agents list --cluster-root demo-cluster
-
-# ── Step 17: Destroy the stopped agent ──
-./hivectl agents destroy summarizer --cluster-root demo-cluster
-
-# ── Step 18: Node management (simulate) ──
-# Nodes appear via hive-agent join; for testing, inspect state.db directly
-cat demo-cluster/state.db | python3 -m json.tool
-
-# ── Step 19: Revoke the token ──
-PREFIX=$(./hivectl tokens list --cluster-root demo-cluster 2>/dev/null | tail -1 | awk '{print $1}')
-./hivectl tokens revoke "$PREFIX" --cluster-root demo-cluster 2>/dev/null || true
-
-# ── Step 20: Update and revoke users ──
-./hivectl users update team-operator --role admin --cluster-root demo-cluster
-./hivectl users revoke viewer-user --cluster-root demo-cluster
-
-# ── Step 21: Final status check ──
-./hivectl agents list --cluster-root demo-cluster
-./hivectl tokens list --cluster-root demo-cluster
-./hivectl users list --cluster-root demo-cluster
-
-# ── Step 22: Graceful shutdown ──
-kill -TERM $HIVED_PID
-wait $HIVED_PID 2>/dev/null
-
-# ── Step 23: Verify state persisted ──
-cat demo-cluster/state.db | python3 -m json.tool
-
-# ── Step 24: Run the full test suite ──
-make test
-
-echo "All features tested successfully."
-```
-
----
-
-## 20. Troubleshooting
+## 16. Troubleshooting
 
 ### Port conflicts
 

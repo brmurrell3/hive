@@ -1,4 +1,8 @@
+[← Back to Documentation](README.md)
+
 # Testing Hive Before Hardware
+
+For build instructions, see the [main README](../README.md).
 
 Two tiers of testing, from easiest to most realistic.
 

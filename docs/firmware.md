@@ -1,4 +1,6 @@
-# HIVE FIRMWARE SDK
+[← Back to Documentation](README.md)
+
+# Hive Firmware SDK
 
 Two SDKs for Tier 3 devices:
 
@@ -41,7 +43,7 @@ MQTT bridge on control plane handles translation between formats
 
 ---
 
-# BUILD TOOLCHAIN (resolves review issue #7)
+# BUILD TOOLCHAIN
 
 Command: `hivectl firmware build AGENT_ID [--target PLATFORM]`
 
@@ -139,7 +141,7 @@ Process:
 3. Monitor serial output for boot confirmation
 4. On successful boot: device joins cluster via MQTT
 
-## OTA Flash (resolves review issue #8)
+## OTA Flash
 
 ```
 hivectl firmware update AGENT_ID --binary path/to/firmware.bin
@@ -172,7 +174,7 @@ Or triggered automatically when firmware/ source changes and build produces new 
 
 ---
 
-# OTA SECURITY (resolves review issue #8)
+# OTA SECURITY
 
 ## Current State (homelab acceptable)
 

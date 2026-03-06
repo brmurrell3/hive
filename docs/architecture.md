@@ -1,4 +1,6 @@
-# Hive Architecture Specification v3
+[← Back to Documentation](README.md)
+
+# Hive Architecture Specification
 
 ## CONCEPTS
 

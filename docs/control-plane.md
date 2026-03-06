@@ -1,6 +1,6 @@
-# 04-CONTROL-PLANE.md
+[← Back to Documentation](README.md)
 
-Consolidated control plane spec for Hive. Format optimized for Claude Code. Terse, structured, deterministic. Minimized prose.
+# Hive Control Plane Specification
 
 ## OVERVIEW
 
@@ -8,7 +8,7 @@ Consolidated control plane spec for Hive. Format optimized for Claude Code. Ters
 
 ---
 
-## NATS MANAGEMENT (resolves review #6)
+## NATS MANAGEMENT
 
 **Phase 1 (single-node)**: NATS embedded in hived
 - hived starts NATS server in-process via nats-server Go library
@@ -118,7 +118,7 @@ Also: FAILED (from RUNNING after maxRestarts exceeded)
 1. Generate unique CID for virtio-vsock
 2. Create rootfs copy-on-write overlay on base image
 3. Create/reuse workspace at `.state/agents/{AGENT_ID}/workspace/`
-4. Sync agent directory files to workspace (MEMORY.md exception per 02-SCHEMAS)
+4. Sync agent directory files to workspace (MEMORY.md exception per [schemas](schemas.md))
 5. Create TAP device, add to bridge `hivebr0`
 6. Apply iptables for egress policy
 7. Write Firecracker config JSON
@@ -245,7 +245,7 @@ Also: FAILED (from RUNNING after maxRestarts)
 
 ---
 
-## CLUSTER ROOT SYNC (resolves review #5)
+## CLUSTER ROOT SYNC
 
 **Phase 1 (single-node)**: No sync needed. One filesystem, one watcher.
 

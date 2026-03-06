@@ -1,6 +1,26 @@
 # Hive
 
-Declarative framework for orchestrating LLM agent teams across heterogeneous hardware. Define agents in YAML, deploy to Firecracker microVMs, Raspberry Pis, or microcontrollers, and route capabilities over NATS.
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
+
+## What is Hive?
+
+Existing LLM frameworks assume homogeneous cloud infrastructure, but real deployments mix hardware tiers: workstations, Raspberry Pis, and microcontrollers. Hive bridges that gap.
+
+**Hive is a declarative framework for orchestrating LLM agent teams across heterogeneous hardware.** Define agents in YAML, deploy to Firecracker microVMs, Raspberry Pis, or microcontrollers, and route capabilities over NATS — all from a single control plane.
+
+### Architecture
+
+Hive uses a three-tier execution model:
+
+| Tier | Hardware | Execution | Isolation | Examples |
+|------|----------|-----------|-----------|----------|
+| **1** | Linux + KVM, 4GB+ RAM | Firecracker microVM | Full (kernel, memory, network) | Workstations, servers, NUCs |
+| **2** | Linux + systemd, 512MB+ RAM | Native process | Process-level | Raspberry Pi, Jetson Nano, old laptops |
+| **3** | Network-capable MCU | Firmware (C/MicroPython SDK) | Device-level | ESP32, Pi Pico W, Arduino |
+
+All tiers communicate over a unified NATS message bus. Tier 3 devices connect via an MQTT-NATS bridge.
 
 ## Features
 
@@ -17,7 +37,7 @@ Declarative framework for orchestrating LLM agent teams across heterogeneous har
 
 ## Requirements
 
-- Go 1.23+
+- Go 1.25+
 - Linux with KVM for Firecracker VMs (macOS works for building and testing with mocks)
 
 ## Quick Start
@@ -36,6 +56,8 @@ make build
 ./bin/hived --cluster-root my-cluster
 ```
 
+See the [Getting Started](docs/getting-started.md) guide for a full walkthrough.
+
 ## What's in a Cluster
 
 ```
@@ -46,27 +68,6 @@ my-cluster/
 │       └── manifest.yaml           # Agent: runtime, capabilities, resources
 └── teams/
     └── default.yaml                # Team: lead agent, shared config
-```
-
-## Managing Agents
-
-```bash
-# Use mock mode on macOS or without KVM
-export HIVE_TEST_FIRECRACKER=mock
-
-./bin/hivectl agents start example-agent --cluster-root my-cluster
-./bin/hivectl agents list --cluster-root my-cluster
-./bin/hivectl agents status example-agent --cluster-root my-cluster
-./bin/hivectl agents restart example-agent --cluster-root my-cluster
-./bin/hivectl agents stop example-agent --cluster-root my-cluster
-```
-
-## Tests
-
-```bash
-make test-unit          # Fast, no dependencies
-make test-integration   # Spins up embedded NATS
-make test               # Both
 ```
 
 ## Project Layout
@@ -99,7 +100,7 @@ internal/
   dashboard/       REST + WebSocket API
   types/           Shared type definitions
   testutil/        Test helpers
-docs/              Specification documents
+docs/              Documentation and specifications
 rootfs/            Firecracker VM rootfs build scripts
 sdk/
   firmware-c/          C SDK for microcontrollers
@@ -108,16 +109,26 @@ sdk/
 
 ## Documentation
 
-- [Architecture](docs/01-ARCHITECTURE.md) — Agent tiers, node types, components
-- [Schemas](docs/02-SCHEMAS.md) — YAML manifest specification
-- [Communication](docs/03-COMMUNICATION.md) — NATS subjects, message envelope format
-- [Control Plane](docs/04-CONTROL-PLANE.md) — hived internals
-- [Execution](docs/05-EXECUTION.md) — Sidecar, runtime lifecycle, boot sequences
-- [Firmware](docs/06-FIRMWARE.md) — C and MicroPython SDKs, OTA protocol
-- [CLI Reference](docs/07-CLI-AND-INTERACTION.md) — All hivectl commands
-- [Deployment](docs/08-DEPLOYMENT.md) — NixOS modules, node joining, images
-- [Operations Guide](OPERATIONS.md) — Full end-to-end walkthrough
-- [Testing Guide](TESTING.md) — Test strategy and setup
+### Guides
+
+| Document | Description |
+|----------|-------------|
+| [Getting Started](docs/getting-started.md) | Scaffold, validate, start, and manage agents |
+| [Operations Guide](docs/operations.md) | Full operational reference for all features |
+| [Testing Guide](docs/testing.md) | Test strategy, mock mode, and real Firecracker |
+
+### Specifications
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/architecture.md) | Agent tiers, node types, components |
+| [Schemas](docs/schemas.md) | YAML manifest specification |
+| [Communication](docs/communication.md) | NATS subjects, message envelope format |
+| [Control Plane](docs/control-plane.md) | hived internals, reconciler, scheduler |
+| [Execution](docs/execution.md) | Sidecar, runtime lifecycle, boot sequences |
+| [Firmware](docs/firmware.md) | C and MicroPython SDKs, OTA protocol |
+| [CLI Reference](docs/cli-reference.md) | All hivectl commands |
+| [Deployment](docs/deployment.md) | NixOS modules, node joining, images |
 
 ## License
 

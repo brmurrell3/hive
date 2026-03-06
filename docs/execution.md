@@ -1,9 +1,8 @@
-# 05-EXECUTION.md
-## Hive Execution Specification - All Tiers
+[← Back to Documentation](README.md)
 
-Consolidated execution spec for Hive covering Tier 1 VM, Tier 1 native, Tier 2, and Tier 3. Format optimized for Claude Code. Terse, structured, deterministic.
+# Hive Execution Specification
 
-Resolves: review #3 (sidecar confusion), #11 (health semantics per tier), #14 (workspace state vs agent definition).
+Covers Tier 1 VM, Tier 1 native, Tier 2, and Tier 3 execution models.
 
 ---
 
@@ -201,7 +200,7 @@ Exposed to other agents via capabilities. Manifest declares hardware. Capability
 
 ## TIER 3 EXECUTION: MICROCONTROLLER FIRMWARE
 
-See 06-FIRMWARE.md for SDK, build toolchain, and OTA details.
+See [firmware.md](firmware.md) for SDK, build toolchain, and OTA details.
 
 Requirements: network (WiFi/Ethernet/BLE gateway), programmable, flash storage
 Isolation: none (bare metal)

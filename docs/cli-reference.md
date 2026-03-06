@@ -1,6 +1,6 @@
-# Hive CLI & Interaction Spec
+[← Back to Documentation](README.md)
 
-**Status**: v3 | **Phase**: 1-4 | **Updated**: 2026-03-03
+# Hive CLI & Interaction Reference
 
 ## COMMAND STRUCTURE
 
@@ -109,7 +109,7 @@ All commands accept:
 
 ---
 
-## HIVECTL CONNECT COMMAND (Resolves Issue #13)
+## HIVECTL CONNECT COMMAND
 
 **Usage**: `hivectl connect AGENT_ID [--web]`
 
@@ -239,7 +239,7 @@ Injected by control plane into team lead sidecar. Enables team coordination:
 
 ---
 
-## OBSERVABILITY (Resolves Issue #15)
+## OBSERVABILITY
 
 ### Log Collection
 
@@ -370,8 +370,3 @@ REST/WebSocket API exposed by hived. Does **not** replace CLI in Phases 1-3; sup
 - Table output is deterministic (sorted by primary key)
 - JSON output includes version key for schema versioning
 
----
-
-**Resolved Issues**:
-- **#13 (hivectl connect underspecified)**: Behavior fully specified per agent type and runtime
-- **#15 (observability/logging)**: Log collection, access patterns, and Phase 4 roadmap defined

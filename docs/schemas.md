@@ -1,8 +1,8 @@
+[← Back to Documentation](README.md)
+
 # Hive Manifest Schema Specification
 
-Single source of truth for all YAML schemas in Hive. Deterministic, structured, optimized for Claude Code.
-
-This document resolves review issues #1, #2, #7, #9, #10, #11, #14, and #17.
+Single source of truth for all YAML schemas in Hive.
 
 ## CLUSTER CONFIG (cluster.yaml)
 
