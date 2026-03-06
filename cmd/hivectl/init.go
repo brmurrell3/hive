@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -84,14 +85,16 @@ func scaffoldCluster(dir string) error {
 
 // wizardValues holds the values collected from interactive prompts.
 type wizardValues struct {
-	ClusterName  string
-	AgentID      string
-	OpenRouterKey string
-	TelegramToken string
+	ClusterName    string
+	AgentID        string
+	OpenRouterKey  string
+	TelegramToken  string
 	TelegramUserID string
-	DesktopIP    string
-	JoinToken    string
-	Dir          string
+	DesktopIP      string
+	JoinToken      string
+	Dir            string
+	AbsDir         string
+	User           string
 }
 
 // scaffoldClusterInteractive runs the interactive wizard.
@@ -174,40 +177,22 @@ func scaffoldClusterInteractive(dir string) error {
 		f.Close()
 	}
 
-	absDir, _ := filepath.Abs(dir)
+	v.AbsDir, _ = filepath.Abs(dir)
+	v.User = currentUser()
 
-	fmt.Printf("\nCluster root created at %s\n", absDir)
+	fmt.Printf("\nCluster root created at %s\n", v.AbsDir)
+
+	// On NixOS, write flake.nix and offer to install it.
+	if isNixOS() {
+		if err := writeNixOSFlake(v, scanner); err != nil {
+			fmt.Printf("  (could not write NixOS config: %s)\n", err)
+			fmt.Println("  You can manually configure /etc/nixos/flake.nix")
+		}
+	}
+
 	fmt.Println()
-	fmt.Println("Generated files:")
-	fmt.Printf("  cluster.yaml\n")
-	fmt.Printf("  agents/%s/manifest.yaml\n", v.AgentID)
-	fmt.Printf("  agents/%s/openclaw.json\n", v.AgentID)
-	fmt.Printf("  teams/default.yaml\n")
-	fmt.Printf("  setup-pi.sh\n")
-	fmt.Printf("  state.db  (pre-seeded with join token)\n")
-	fmt.Println()
-	fmt.Println("NixOS flake config (paste into /etc/nixos/flake.nix):")
-	fmt.Println()
-	fmt.Printf(`  services.hived = {
-    enable = true;
-    clusterRoot = "%s";
-    user = "%s";
-    group = "users";
-    openFirewall = true;
-    agent = {
-      enable = true;
-      id = "%s";
-      manifest = "%s/agents/%s/manifest.yaml";
-      openclawConfig = "%s/agents/%s/openclaw.json";
-      joinToken = "%s";
-    };
-  };
-`, absDir, currentUser(), v.AgentID, absDir, v.AgentID, absDir, v.AgentID, rawToken)
-	fmt.Println()
-	fmt.Println("Then: sudo nixos-rebuild switch")
-	fmt.Println()
-	fmt.Println("For Pi deployment instead:")
-	fmt.Println("  scp " + absDir + "/setup-pi.sh pi@<PI_IP>:~/setup-pi.sh")
+	fmt.Println("For Pi deployment:")
+	fmt.Printf("  scp %s/setup-pi.sh pi@<PI_IP>:~/setup-pi.sh\n", v.AbsDir)
 	fmt.Println("  ssh pi@<PI_IP> 'bash ~/setup-pi.sh'")
 
 	return nil
@@ -238,6 +223,84 @@ func promptRequired(scanner *bufio.Scanner, prompt string) string {
 		}
 		fmt.Println("  (required)")
 	}
+}
+
+// isNixOS returns true if the system is running NixOS.
+func isNixOS() bool {
+	_, err := os.Stat("/etc/nixos")
+	return err == nil
+}
+
+// writeNixOSFlake renders the NixOS flake.nix and installs it to /etc/nixos/.
+func writeNixOSFlake(v wizardValues, scanner *bufio.Scanner) error {
+	tmpl, err := template.New("nixos-flake").Parse(nixosFlakeTmpl)
+	if err != nil {
+		return fmt.Errorf("parsing flake template: %w", err)
+	}
+
+	// Write to a temp file first.
+	tmpFile, err := os.CreateTemp("", "hive-flake-*.nix")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmpl.Execute(tmpFile, v); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("rendering flake: %w", err)
+	}
+	tmpFile.Close()
+
+	fmt.Println()
+	fmt.Print("Install NixOS config to /etc/nixos/flake.nix? [Y/n]: ")
+	scanner.Scan()
+	answer := strings.TrimSpace(strings.ToLower(scanner.Text()))
+	if answer != "" && answer != "y" && answer != "yes" {
+		// Write to cluster root instead.
+		fallback := filepath.Join(v.AbsDir, "flake.nix")
+		data, _ := os.ReadFile(tmpPath)
+		if err := os.WriteFile(fallback, data, 0644); err != nil {
+			return fmt.Errorf("writing %s: %w", fallback, err)
+		}
+		fmt.Printf("  Written to %s (copy to /etc/nixos/flake.nix manually)\n", fallback)
+		return nil
+	}
+
+	// Use sudo cp to install to /etc/nixos/.
+	cmd := exec.Command("sudo", "cp", tmpPath, "/etc/nixos/flake.nix")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("sudo cp failed: %w", err)
+	}
+
+	fmt.Println("  Installed /etc/nixos/flake.nix")
+	fmt.Println()
+
+	// Offer to rebuild.
+	fmt.Print("Run 'sudo nixos-rebuild switch' now? [Y/n]: ")
+	scanner.Scan()
+	answer = strings.TrimSpace(strings.ToLower(scanner.Text()))
+	if answer == "" || answer == "y" || answer == "yes" {
+		fmt.Println()
+		rebuild := exec.Command("sudo", "nixos-rebuild", "switch")
+		rebuild.Stdin = os.Stdin
+		rebuild.Stdout = os.Stdout
+		rebuild.Stderr = os.Stderr
+		if err := rebuild.Run(); err != nil {
+			return fmt.Errorf("nixos-rebuild failed: %w", err)
+		}
+		fmt.Println()
+		fmt.Println("Done! hived and hive-agent are running.")
+		fmt.Println("  Check status: systemctl status hived hive-agent")
+	} else {
+		fmt.Println()
+		fmt.Println("Run when ready: sudo nixos-rebuild switch")
+	}
+
+	return nil
 }
 
 // currentUser returns the current OS username.
@@ -601,4 +664,38 @@ echo "=== Done ==="
 echo "Check status:  sudo systemctl status hive-agent"
 echo "View logs:     journalctl -u hive-agent -f"
 echo "Test Telegram: send a message to your bot"
+`
+
+const nixosFlakeTmpl = `{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    hive.url = "github:brmurrell3/hive";
+  };
+
+  outputs = { self, nixpkgs, hive, ... }: {
+    nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        hive.nixosModules.default
+        {
+          services.hived = {
+            enable = true;
+            clusterRoot = "{{.AbsDir}}";
+            user = "{{.User}}";
+            group = "users";
+            openFirewall = true;
+            agent = {
+              enable = true;
+              id = "{{.AgentID}}";
+              manifest = "{{.AbsDir}}/agents/{{.AgentID}}/manifest.yaml";
+              openclawConfig = "{{.AbsDir}}/agents/{{.AgentID}}/openclaw.json";
+              joinToken = "{{.JoinToken}}";
+            };
+          };
+        }
+      ];
+    };
+  };
+}
 `
