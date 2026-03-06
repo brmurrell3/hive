@@ -173,25 +173,38 @@ in
 
           # Ensure work directory exists.
           mkdir -p "${workDir}"
+
+          # Wait for hived to write the NATS auth token.
+          for i in $(seq 1 30); do
+            [ -f "${cfg.clusterRoot}/.state/nats-auth-token" ] && break
+            sleep 1
+          done
         '';
 
-        joinArgs = lib.concatStringsSep " " (
-          [
-            "${agentPackage}/bin/hive-agent" "join"
-            "--control-plane" agentCfg.controlPlane
-            "--agent-id" agentCfg.id
-            "--manifest" agentCfg.manifest
-            "--runtime-cmd" "${userHome}/.local/bin/openclaw"
-            "--runtime-args" "start"
-            "--work-dir" workDir
-            "--http-addr" agentCfg.httpAddr
-          ] ++ lib.optional (agentCfg.joinToken != "") "--token ${agentCfg.joinToken}"
-        );
+        # Wrapper script that reads the NATS auth token at runtime.
+        joinScript = pkgs.writeShellScript "hive-agent-join" ''
+          NATS_TOKEN_FILE="${cfg.clusterRoot}/.state/nats-auth-token"
+          NATS_TOKEN=""
+          if [ -f "$NATS_TOKEN_FILE" ]; then
+            NATS_TOKEN=$(cat "$NATS_TOKEN_FILE")
+          fi
+
+          exec ${agentPackage}/bin/hive-agent join \
+            --control-plane ${agentCfg.controlPlane} \
+            --agent-id ${agentCfg.id} \
+            --manifest ${agentCfg.manifest} \
+            --runtime-cmd ${userHome}/.local/bin/openclaw \
+            --runtime-args start \
+            --work-dir ${workDir} \
+            --http-addr ${agentCfg.httpAddr} \
+            ${lib.optionalString (agentCfg.joinToken != "") "--token ${agentCfg.joinToken}"} \
+            ''${NATS_TOKEN:+--nats-token "$NATS_TOKEN"}
+        '';
       in
       {
         description = "Hive Agent (${agentCfg.id})";
         after = [ "network.target" "hived.service" ];
-        wants = [ "hived.service" ];
+        requires = [ "hived.service" ];
         wantedBy = [ "multi-user.target" ];
 
         path = [ pkgs.nodejs_22 pkgs.git ];
@@ -206,7 +219,7 @@ in
           User = cfg.user;
           Group = cfg.group;
           ExecStartPre = "+${setupScript}";
-          ExecStart = joinArgs;
+          ExecStart = joinScript;
           Restart = "on-failure";
           RestartSec = 10;
         };
