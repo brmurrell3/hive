@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -74,24 +73,16 @@ func TestAggregator_ReceivesLogs(t *testing.T) {
 	// Wait for the message to be processed.
 	time.Sleep(500 * time.Millisecond)
 
-	// Check that the log file was created.
-	date := now.Format("2006-01-02")
-	logFile := filepath.Join(logDir, "agent-1", date+".jsonl")
-
-	data, err := os.ReadFile(logFile)
+	// Query the database to verify the entry was stored.
+	results, err := agg.Query("agent-1", QueryOpts{})
 	if err != nil {
-		t.Fatalf("reading log file %s: %v", logFile, err)
+		t.Fatalf("querying logs: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(results))
 	}
 
-	if len(data) == 0 {
-		t.Fatal("log file is empty")
-	}
-
-	var written LogEntry
-	if err := json.Unmarshal(data[:len(data)-1], &written); err != nil { // -1 for trailing newline
-		t.Fatalf("parsing written log entry: %v", err)
-	}
-
+	written := results[0]
 	if written.AgentID != "agent-1" {
 		t.Errorf("expected agent_id=agent-1, got %s", written.AgentID)
 	}
@@ -101,43 +92,14 @@ func TestAggregator_ReceivesLogs(t *testing.T) {
 	if written.Message != "test log message" {
 		t.Errorf("expected message='test log message', got %s", written.Message)
 	}
+	if written.Fields["key"] != "value" {
+		t.Errorf("expected fields[key]=value, got %v", written.Fields["key"])
+	}
 }
 
 func TestAggregator_Query(t *testing.T) {
 	logDir := t.TempDir()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-
-	// Pre-write some log entries directly to files.
-	agentDir := filepath.Join(logDir, "agent-query")
-	if err := os.MkdirAll(agentDir, 0755); err != nil {
-		t.Fatalf("creating agent dir: %v", err)
-	}
-
-	now := time.Now().UTC()
-	entries := []LogEntry{
-		{AgentID: "agent-query", Timestamp: now.Add(-3 * time.Hour), Level: "info", Message: "first"},
-		{AgentID: "agent-query", Timestamp: now.Add(-2 * time.Hour), Level: "warn", Message: "second"},
-		{AgentID: "agent-query", Timestamp: now.Add(-1 * time.Hour), Level: "error", Message: "third"},
-		{AgentID: "agent-query", Timestamp: now, Level: "info", Message: "fourth"},
-	}
-
-	date := now.Format("2006-01-02")
-	logFile := filepath.Join(agentDir, date+".jsonl")
-	f, err := os.Create(logFile)
-	if err != nil {
-		t.Fatalf("creating log file: %v", err)
-	}
-
-	for _, entry := range entries {
-		data, err := json.Marshal(entry)
-		if err != nil {
-			t.Fatalf("marshaling entry: %v", err)
-		}
-		if _, err := f.Write(append(data, '\n')); err != nil {
-			t.Fatalf("writing entry: %v", err)
-		}
-	}
-	f.Close()
 
 	srv := testutil.NATSServer(t)
 	nc := testutil.NATSConnect(t, srv)
@@ -147,6 +109,26 @@ func TestAggregator_Query(t *testing.T) {
 		LogDir:   logDir,
 		Logger:   logger,
 	})
+
+	if err := agg.Start(); err != nil {
+		t.Fatalf("starting aggregator: %v", err)
+	}
+	defer agg.Stop()
+
+	// Insert entries directly via writeEntry.
+	now := time.Now().UTC()
+	entries := []LogEntry{
+		{AgentID: "agent-query", Timestamp: now.Add(-3 * time.Hour), Level: "info", Message: "first"},
+		{AgentID: "agent-query", Timestamp: now.Add(-2 * time.Hour), Level: "warn", Message: "second"},
+		{AgentID: "agent-query", Timestamp: now.Add(-1 * time.Hour), Level: "error", Message: "third"},
+		{AgentID: "agent-query", Timestamp: now, Level: "info", Message: "fourth"},
+	}
+
+	for i, entry := range entries {
+		if err := agg.writeEntry(entry); err != nil {
+			t.Fatalf("writing entry %d: %v", i, err)
+		}
+	}
 
 	// Query all entries.
 	results, err := agg.Query("agent-query", QueryOpts{})
@@ -243,46 +225,62 @@ func TestAggregator_Follow(t *testing.T) {
 	}
 }
 
-func TestAggregator_Rotation(t *testing.T) {
+func TestAggregator_Retention(t *testing.T) {
 	logDir := t.TempDir()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	srv := testutil.NATSServer(t)
 	nc := testutil.NATSConnect(t, srv)
 
-	// Use a very small max file size to trigger rotation.
 	agg := NewAggregator(AggregatorConfig{
-		NATSConn:    nc,
-		LogDir:      logDir,
-		MaxFileSize: 50, // 50 bytes - will rotate quickly
-		Logger:      logger,
+		NATSConn:      nc,
+		LogDir:        logDir,
+		RetentionDays: 1, // 1 day retention
+		Logger:        logger,
 	})
 
-	// Write several entries to trigger rotation.
+	if err := agg.Start(); err != nil {
+		t.Fatalf("starting aggregator: %v", err)
+	}
+	defer agg.Stop()
+
 	now := time.Now().UTC()
-	for i := 0; i < 5; i++ {
-		entry := LogEntry{
-			AgentID:   "agent-rotate",
-			Timestamp: now,
-			Level:     "info",
-			Message:   "rotation test message that is long enough to exceed 50 bytes",
-		}
-		if err := agg.writeEntry(entry); err != nil {
-			t.Fatalf("writing entry %d: %v", i, err)
-		}
+
+	// Write an old entry (beyond retention) and a recent one.
+	old := LogEntry{
+		AgentID:   "agent-ret",
+		Timestamp: now.Add(-48 * time.Hour),
+		Level:     "info",
+		Message:   "old message",
+	}
+	recent := LogEntry{
+		AgentID:   "agent-ret",
+		Timestamp: now,
+		Level:     "info",
+		Message:   "recent message",
 	}
 
-	// Check that rotated files were created.
-	agentDir := filepath.Join(logDir, "agent-rotate")
-	files, err := os.ReadDir(agentDir)
+	if err := agg.writeEntry(old); err != nil {
+		t.Fatalf("writing old entry: %v", err)
+	}
+	if err := agg.writeEntry(recent); err != nil {
+		t.Fatalf("writing recent entry: %v", err)
+	}
+
+	// Run retention cleanup.
+	if err := agg.cleanRetention(); err != nil {
+		t.Fatalf("cleaning retention: %v", err)
+	}
+
+	// Only the recent entry should remain.
+	results, err := agg.Query("agent-ret", QueryOpts{})
 	if err != nil {
-		t.Fatalf("reading agent dir: %v", err)
+		t.Fatalf("querying logs: %v", err)
 	}
-
-	if len(files) < 2 {
-		t.Errorf("expected at least 2 files (original + rotated), got %d", len(files))
-		for _, f := range files {
-			t.Logf("  file: %s", f.Name())
-		}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 entry after retention cleanup, got %d", len(results))
+	}
+	if results[0].Message != "recent message" {
+		t.Errorf("expected 'recent message', got %s", results[0].Message)
 	}
 }

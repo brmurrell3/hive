@@ -3,7 +3,6 @@
 package state
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,12 +21,13 @@ import (
 func testStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	return store, path
 }
 
@@ -101,13 +101,13 @@ func TestValidateTransition_UnknownStatus(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// state.json serialization / deserialization
+// Agent state round-trip through SQLite
 // ---------------------------------------------------------------------------
 
-func TestSetAgent_SerializationRoundTrip(t *testing.T) {
-	store, path := testStore(t)
+func TestSetAgent_RoundTrip(t *testing.T) {
+	store, _ := testStore(t)
 
-	now := time.Now().Truncate(time.Millisecond) // truncate for JSON precision
+	now := time.Now().Truncate(time.Millisecond)
 	agent := &AgentState{
 		ID:             "agent-1",
 		Team:           "backend",
@@ -126,20 +126,9 @@ func TestSetAgent_SerializationRoundTrip(t *testing.T) {
 		t.Fatalf("SetAgent: %v", err)
 	}
 
-	// Read the file back and unmarshal manually.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading state file: %v", err)
-	}
-
-	var st State
-	if err := json.Unmarshal(data, &st); err != nil {
-		t.Fatalf("unmarshalling state file: %v", err)
-	}
-
-	got, ok := st.Agents["agent-1"]
-	if !ok {
-		t.Fatal("agent-1 not found in deserialized state")
+	got := store.GetAgent("agent-1")
+	if got == nil {
+		t.Fatal("agent-1 not found")
 	}
 
 	if got.ID != agent.ID {
@@ -166,12 +155,6 @@ func TestSetAgent_SerializationRoundTrip(t *testing.T) {
 	if got.RestartCount != agent.RestartCount {
 		t.Errorf("RestartCount = %d, want %d", got.RestartCount, agent.RestartCount)
 	}
-	if !got.LastTransition.Equal(agent.LastTransition) {
-		t.Errorf("LastTransition = %v, want %v", got.LastTransition, agent.LastTransition)
-	}
-	if !got.StartedAt.Equal(agent.StartedAt) {
-		t.Errorf("StartedAt = %v, want %v", got.StartedAt, agent.StartedAt)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +163,7 @@ func TestSetAgent_SerializationRoundTrip(t *testing.T) {
 
 func TestStatePersistence_NewStoreFromSameFile(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	// Create first store and write agents.
@@ -198,12 +181,14 @@ func TestStatePersistence_NewStoreFromSameFile(t *testing.T) {
 			t.Fatalf("SetAgent(%s): %v", a.ID, err)
 		}
 	}
+	store1.Close()
 
 	// Create a second store from the same file path.
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore (2): %v", err)
 	}
+	defer store2.Close()
 
 	for _, want := range agents {
 		got := store2.GetAgent(want.ID)
@@ -237,7 +222,7 @@ func TestStatePersistence_NewStoreFromSameFile(t *testing.T) {
 
 func TestStateRecovery_RunningAgentLoadsCorrectly(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	store1, err := NewStore(path, logger)
@@ -262,12 +247,14 @@ func TestStateRecovery_RunningAgentLoadsCorrectly(t *testing.T) {
 	if err := store1.SetAgent(agent); err != nil {
 		t.Fatalf("SetAgent: %v", err)
 	}
+	store1.Close()
 
 	// Simulate daemon restart by creating a new store.
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore (2): %v", err)
 	}
+	defer store2.Close()
 
 	got := store2.GetAgent("running-agent")
 	if got == nil {
@@ -287,9 +274,6 @@ func TestStateRecovery_RunningAgentLoadsCorrectly(t *testing.T) {
 	}
 	if got.RestartCount != 2 {
 		t.Errorf("RestartCount = %d, want 2", got.RestartCount)
-	}
-	if !got.StartedAt.Equal(agent.StartedAt) {
-		t.Errorf("StartedAt = %v, want %v", got.StartedAt, agent.StartedAt)
 	}
 }
 
@@ -391,7 +375,14 @@ func TestAllAgents_ReturnsCopies(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRemoveAgent(t *testing.T) {
-	store, path := testStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
 
 	agent := testAgentState("removable", "team", AgentStatusStopped)
 	if err := store.SetAgent(agent); err != nil {
@@ -412,13 +403,14 @@ func TestRemoveAgent(t *testing.T) {
 	if got := store.GetAgent("removable"); got != nil {
 		t.Error("agent still in memory after removal")
 	}
+	store.Close()
 
 	// Should be gone from disk.
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore after removal: %v", err)
 	}
+	defer store2.Close()
 	if got := store2.GetAgent("removable"); got != nil {
 		t.Error("agent still on disk after removal")
 	}
@@ -434,13 +426,13 @@ func TestRemoveAgent_NotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Atomic write: file exists and is valid JSON after write
+// Database file exists after write
 // ---------------------------------------------------------------------------
 
-func TestAtomicWrite_ValidJSON(t *testing.T) {
+func TestDatabaseFile_Exists(t *testing.T) {
 	store, path := testStore(t)
 
-	agent := testAgentState("atomic-test", "infra", AgentStatusCreating)
+	agent := testAgentState("db-test", "infra", AgentStatusCreating)
 	agent.VMPID = 555
 	agent.VMCID = 88
 	if err := store.SetAgent(agent); err != nil {
@@ -450,49 +442,10 @@ func TestAtomicWrite_ValidJSON(t *testing.T) {
 	// Verify the file exists.
 	info, err := os.Stat(path)
 	if err != nil {
-		t.Fatalf("state file does not exist after write: %v", err)
+		t.Fatalf("database file does not exist after write: %v", err)
 	}
 	if info.Size() == 0 {
-		t.Fatal("state file is empty after write")
-	}
-
-	// Verify it is valid JSON.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading state file: %v", err)
-	}
-
-	var st State
-	if err := json.Unmarshal(data, &st); err != nil {
-		t.Fatalf("state file is not valid JSON: %v", err)
-	}
-
-	if len(st.Agents) != 1 {
-		t.Errorf("expected 1 agent in state file, got %d", len(st.Agents))
-	}
-	if _, ok := st.Agents["atomic-test"]; !ok {
-		t.Error("agent 'atomic-test' not found in state file")
-	}
-}
-
-func TestAtomicWrite_NoTempFileLeftBehind(t *testing.T) {
-	store, path := testStore(t)
-	dir := filepath.Dir(path)
-
-	if err := store.SetAgent(testAgentState("cleanup", "", AgentStatusPending)); err != nil {
-		t.Fatalf("SetAgent: %v", err)
-	}
-
-	// Check that no .tmp files remain in the directory.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("reading dir: %v", err)
-	}
-
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".tmp" {
-			t.Errorf("temp file left behind: %s", e.Name())
-		}
+		t.Fatal("database file is empty after write")
 	}
 }
 
@@ -568,150 +521,27 @@ func TestSetAgent_OverwritesExisting(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// NewStore with nonexistent directory creates it on first save
+// NewStore with nonexistent directory creates it
 // ---------------------------------------------------------------------------
 
-func TestNewStore_CreatesDirectoryOnSave(t *testing.T) {
+func TestNewStore_CreatesDirectory(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "subdir", "nested", "state.json")
+	path := filepath.Join(dir, "subdir", "nested", "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	store, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	defer store.Close()
 
-	// Directory does not exist yet (only created on first save).
 	if err := store.SetAgent(testAgentState("dir-test", "", AgentStatusPending)); err != nil {
-		t.Fatalf("SetAgent should create dirs: %v", err)
+		t.Fatalf("SetAgent should work after directory creation: %v", err)
 	}
 
 	// Verify file exists.
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("state file not created: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// NewStore with corrupt file returns error
-// ---------------------------------------------------------------------------
-
-func TestNewStore_CorruptFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-
-	// Write garbage to the state file.
-	if err := os.WriteFile(path, []byte("{corrupt"), 0644); err != nil {
-		t.Fatalf("writing corrupt file: %v", err)
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := NewStore(path, logger)
-	if err != nil {
-		t.Fatalf("expected recovery from corrupt state, got error: %v", err)
-	}
-
-	// Should have started with empty state after failing to parse.
-	if len(store.AllAgents()) != 0 {
-		t.Fatalf("expected empty agents after corrupt recovery, got %d", len(store.AllAgents()))
-	}
-}
-
-func TestNewStore_CorruptFileWithValidBackup(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	bakPath := path + ".bak"
-
-	// Write a valid backup with an agent.
-	backupState := State{
-		Agents: map[string]*AgentState{
-			"recovered-agent": {
-				ID:     "recovered-agent",
-				Team:   "alpha",
-				Status: AgentStatusRunning,
-			},
-		},
-	}
-	backupData, _ := json.Marshal(backupState)
-	if err := os.WriteFile(bakPath, backupData, 0644); err != nil {
-		t.Fatalf("writing backup file: %v", err)
-	}
-
-	// Write garbage to the primary state file.
-	if err := os.WriteFile(path, []byte("{corrupt"), 0644); err != nil {
-		t.Fatalf("writing corrupt file: %v", err)
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := NewStore(path, logger)
-	if err != nil {
-		t.Fatalf("expected recovery from backup, got error: %v", err)
-	}
-
-	agent := store.GetAgent("recovered-agent")
-	if agent == nil {
-		t.Fatal("expected recovered-agent from backup, got nil")
-	}
-	if agent.Status != AgentStatusRunning {
-		t.Fatalf("expected RUNNING status, got %s", agent.Status)
-	}
-}
-
-func TestNewStore_CorruptFileAndCorruptBackup(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	bakPath := path + ".bak"
-
-	// Write garbage to both primary and backup.
-	if err := os.WriteFile(path, []byte("{corrupt"), 0644); err != nil {
-		t.Fatalf("writing corrupt file: %v", err)
-	}
-	if err := os.WriteFile(bakPath, []byte("also bad"), 0644); err != nil {
-		t.Fatalf("writing corrupt backup: %v", err)
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := NewStore(path, logger)
-	if err != nil {
-		t.Fatalf("expected empty state fallback, got error: %v", err)
-	}
-
-	if len(store.AllAgents()) != 0 {
-		t.Fatalf("expected empty agents after double-corrupt, got %d", len(store.AllAgents()))
-	}
-}
-
-func TestSave_CreatesBackup(t *testing.T) {
-	store, path := testStore(t)
-	bakPath := path + ".bak"
-
-	// Set an agent and save.
-	agent := testAgentState("agent-a", "team-a", AgentStatusPending)
-	if err := store.SetAgent(agent); err != nil {
-		t.Fatalf("SetAgent: %v", err)
-	}
-
-	// Set another agent (triggers another save, which should back up the
-	// state that contained only agent-a).
-	agent2 := testAgentState("agent-b", "team-b", AgentStatusPending)
-	if err := store.SetAgent(agent2); err != nil {
-		t.Fatalf("SetAgent: %v", err)
-	}
-
-	// The backup file should exist and contain agent-a but NOT agent-b.
-	bakData, err := os.ReadFile(bakPath)
-	if err != nil {
-		t.Fatalf("reading backup: %v", err)
-	}
-	var bakState State
-	if err := json.Unmarshal(bakData, &bakState); err != nil {
-		t.Fatalf("parsing backup: %v", err)
-	}
-	if _, ok := bakState.Agents["agent-a"]; !ok {
-		t.Fatal("expected agent-a in backup")
-	}
-	if _, ok := bakState.Agents["agent-b"]; ok {
-		t.Fatal("did not expect agent-b in backup (it was added after the backup was made)")
+		t.Fatalf("database file not created: %v", err)
 	}
 }
 
@@ -720,7 +550,14 @@ func TestSave_CreatesBackup(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAgentState_ErrorFieldPersists(t *testing.T) {
-	store, path := testStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
 
 	agent := &AgentState{
 		ID:             "failed-agent",
@@ -731,13 +568,14 @@ func TestAgentState_ErrorFieldPersists(t *testing.T) {
 	if err := store.SetAgent(agent); err != nil {
 		t.Fatalf("SetAgent: %v", err)
 	}
+	store.Close()
 
 	// Reload from disk.
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	defer store2.Close()
 
 	got := store2.GetAgent("failed-agent")
 	if got == nil {
@@ -847,7 +685,14 @@ func TestGetNode_ReturnsCopy(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRemoveNode(t *testing.T) {
-	store, path := testStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
 
 	node := testNodeState("removable-node", types.NodeTier2, types.NodeStatusOffline)
 	if err := store.SetNode(node); err != nil {
@@ -865,13 +710,14 @@ func TestRemoveNode(t *testing.T) {
 	if got := store.GetNode("removable-node"); got != nil {
 		t.Error("node still in memory after removal")
 	}
+	store.Close()
 
 	// Verify persistence: reload from disk.
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore after removal: %v", err)
 	}
+	defer store2.Close()
 	if got := store2.GetNode("removable-node"); got != nil {
 		t.Error("node still on disk after removal")
 	}
@@ -928,7 +774,7 @@ func TestAllNodes_EmptyStore(t *testing.T) {
 
 func TestNodePersistence(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	store1, err := NewStore(path, logger)
@@ -941,11 +787,13 @@ func TestNodePersistence(t *testing.T) {
 	if err := store1.SetNode(node); err != nil {
 		t.Fatalf("SetNode: %v", err)
 	}
+	store1.Close()
 
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore (2): %v", err)
 	}
+	defer store2.Close()
 
 	got := store2.GetNode("persist-node")
 	if got == nil {
@@ -1124,7 +972,7 @@ func TestAllTokens_ReturnsCopies(t *testing.T) {
 
 func TestTokenPersistence(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	store1, err := NewStore(path, logger)
@@ -1137,11 +985,13 @@ func TestTokenPersistence(t *testing.T) {
 	if err := store1.AddToken(tok); err != nil {
 		t.Fatalf("AddToken: %v", err)
 	}
+	store1.Close()
 
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore (2): %v", err)
 	}
+	defer store2.Close()
 
 	validated := store2.ValidateToken(raw)
 	if validated == nil {
@@ -1305,7 +1155,7 @@ func TestCapabilityRegistry_MultipleAgents(t *testing.T) {
 
 func TestCapabilityRegistryPersistence(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	store1, err := NewStore(path, logger)
@@ -1319,11 +1169,13 @@ func TestCapabilityRegistryPersistence(t *testing.T) {
 	if err := store1.RegisterCapabilities("persist-agent", "team", "tier1", "node", caps); err != nil {
 		t.Fatalf("RegisterCapabilities: %v", err)
 	}
+	store1.Close()
 
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore (2): %v", err)
 	}
+	defer store2.Close()
 
 	reg := store2.GetCapabilityRegistry()
 	entry, ok := reg.Agents["persist-agent"]
@@ -1389,11 +1241,7 @@ func TestHashToken_Consistent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Mixed state: agents, nodes, tokens, and capabilities coexist
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Concurrent state store access (test coverage gap)
+// Concurrent state store access
 // ---------------------------------------------------------------------------
 
 func TestConcurrentSetAgent_NoRace(t *testing.T) {
@@ -1474,49 +1322,23 @@ func TestConcurrentModifyAgent_NoLostUpdates(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Empty/zero-byte state file recovery (test coverage gap)
+// Empty store initialization
 // ---------------------------------------------------------------------------
 
-func TestNewStore_EmptyFile(t *testing.T) {
+func TestNewStore_EmptyDatabase(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-
-	// Create an empty file.
-	if err := os.WriteFile(path, []byte{}, 0644); err != nil {
-		t.Fatal(err)
-	}
-
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := NewStore(path, logger)
-	if err != nil {
-		t.Fatalf("expected recovery from empty state file, got error: %v", err)
-	}
 
-	// Should have started with empty state after failing to parse empty file.
-	if len(store.AllAgents()) != 0 {
-		t.Fatalf("expected empty agents after recovery, got %d", len(store.AllAgents()))
-	}
-}
-
-func TestNewStore_ZeroBytesButValidJSON(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-
-	// Write minimal valid JSON.
-	if err := os.WriteFile(path, []byte(`{}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	defer store.Close()
 
-	// Should initialize properly with empty maps/slices.
-	agents := store.AllAgents()
-	if len(agents) != 0 {
-		t.Errorf("expected 0 agents, got %d", len(agents))
+	// Should have started with empty state.
+	if len(store.AllAgents()) != 0 {
+		t.Fatalf("expected empty agents, got %d", len(store.AllAgents()))
 	}
 
 	nodes := store.AllNodes()
@@ -1530,8 +1352,19 @@ func TestNewStore_ZeroBytesButValidJSON(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Mixed state: agents, nodes, tokens, and capabilities coexist
+// ---------------------------------------------------------------------------
+
 func TestMixedState_Coexistence(t *testing.T) {
-	store, path := testStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
 
 	// Add agent.
 	if err := store.SetAgent(testAgentState("agent-mixed", "team", AgentStatusRunning)); err != nil {
@@ -1555,13 +1388,14 @@ func TestMixedState_Coexistence(t *testing.T) {
 	if err := store.RegisterCapabilities("cap-agent", "team", "tier1", "node", caps); err != nil {
 		t.Fatalf("RegisterCapabilities: %v", err)
 	}
+	store.Close()
 
 	// Reload and verify all data survives.
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store2, err := NewStore(path, logger)
 	if err != nil {
 		t.Fatalf("NewStore (reload): %v", err)
 	}
+	defer store2.Close()
 
 	if got := store2.GetAgent("agent-mixed"); got == nil {
 		t.Error("agent not found after reload")

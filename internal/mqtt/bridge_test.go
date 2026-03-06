@@ -55,32 +55,26 @@ func addTestToken(t *testing.T, store *state.Store) string {
 	return raw
 }
 
-// buildMQTTConnect builds an MQTT CONNECT packet.
-// clientID is the MQTT client identifier.
-// username and password are optional MQTT credentials.
+// MQTT packet helpers for raw protocol testing.
+
 func buildMQTTConnect(clientID, username, password string) []byte {
 	// Variable header
 	var varHeader []byte
-	// Protocol Name: "MQTT"
-	varHeader = append(varHeader, 0x00, 0x04) // length
+	varHeader = append(varHeader, 0x00, 0x04) // Protocol Name length
 	varHeader = append(varHeader, []byte("MQTT")...)
-	// Protocol Level: 4 (MQTT 3.1.1)
-	varHeader = append(varHeader, 0x04)
-	// Connect Flags
-	flags := byte(0x02) // clean session
+	varHeader = append(varHeader, 0x04) // Protocol Level 4 (MQTT 3.1.1)
+	flags := byte(0x02)                 // clean session
 	if username != "" {
-		flags |= 0x80 // username flag
+		flags |= 0x80
 	}
 	if password != "" {
-		flags |= 0x40 // password flag
+		flags |= 0x40
 	}
 	varHeader = append(varHeader, flags)
-	// Keep Alive: 60s
-	varHeader = append(varHeader, 0x00, 0x3C)
+	varHeader = append(varHeader, 0x00, 0x3C) // Keep Alive: 60s
 
 	// Payload
 	var payload []byte
-	// Client ID
 	payload = append(payload, mqttString(clientID)...)
 	if username != "" {
 		payload = append(payload, mqttString(username)...)
@@ -90,33 +84,26 @@ func buildMQTTConnect(clientID, username, password string) []byte {
 	}
 
 	remainLen := len(varHeader) + len(payload)
-
 	var packet []byte
-	packet = append(packet, 0x10) // CONNECT packet type
+	packet = append(packet, 0x10) // CONNECT
 	packet = append(packet, encodeRemainingLength(remainLen)...)
 	packet = append(packet, varHeader...)
 	packet = append(packet, payload...)
-
 	return packet
 }
 
-// buildMQTTPublish builds an MQTT PUBLISH packet (QoS 0).
 func buildMQTTPublish(topic string, payload []byte) []byte {
 	topicBytes := []byte(topic)
 	remainLen := 2 + len(topicBytes) + len(payload)
-
 	var packet []byte
 	packet = append(packet, 0x30) // PUBLISH, QoS 0
 	packet = append(packet, encodeRemainingLength(remainLen)...)
-	// Topic length (2 bytes, big-endian)
 	packet = append(packet, byte(len(topicBytes)>>8), byte(len(topicBytes)))
 	packet = append(packet, topicBytes...)
 	packet = append(packet, payload...)
-
 	return packet
 }
 
-// mqttString encodes a string as an MQTT length-prefixed UTF-8 string.
 func mqttString(s string) []byte {
 	b := make([]byte, 2+len(s))
 	binary.BigEndian.PutUint16(b, uint16(len(s)))
@@ -124,7 +111,22 @@ func mqttString(s string) []byte {
 	return b
 }
 
-// startBridge creates and starts an MQTT bridge for testing, using port 0 for random allocation.
+func encodeRemainingLength(length int) []byte {
+	var encoded []byte
+	for {
+		encodedByte := byte(length % 128)
+		length /= 128
+		if length > 0 {
+			encodedByte |= 0x80
+		}
+		encoded = append(encoded, encodedByte)
+		if length == 0 {
+			break
+		}
+	}
+	return encoded
+}
+
 func startBridge(t *testing.T, nc *nats.Conn, store *state.Store) *Bridge {
 	t.Helper()
 
@@ -139,6 +141,9 @@ func startBridge(t *testing.T, nc *nats.Conn, store *state.Store) *Bridge {
 		t.Fatalf("bridge.Start: %v", err)
 	}
 
+	// Wait for the server to be listening.
+	time.Sleep(200 * time.Millisecond)
+
 	t.Cleanup(func() {
 		bridge.Stop()
 	})
@@ -147,17 +152,16 @@ func startBridge(t *testing.T, nc *nats.Conn, store *state.Store) *Bridge {
 }
 
 // connectAndAuth creates a TCP connection to the bridge and sends an MQTT CONNECT.
-// Returns the connection and the CONNACK return code.
 func connectAndAuth(t *testing.T, bridge *Bridge, clientID, username, password string) (net.Conn, byte) {
 	t.Helper()
 
-	addr := fmt.Sprintf("127.0.0.1:%d", bridge.Port())
+	port := bridge.Port()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("TCP connect to bridge: %v", err)
 	}
 
-	// Send CONNECT
 	pkt := buildMQTTConnect(clientID, username, password)
 	if _, err := conn.Write(pkt); err != nil {
 		conn.Close()
@@ -210,7 +214,6 @@ func TestBridge_StartsAndAcceptsTCP(t *testing.T) {
 		t.Fatal("bridge port is 0, expected a real port")
 	}
 
-	// Verify we can open a TCP connection.
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -244,8 +247,7 @@ func TestBridge_ConnectWithValidAuth(t *testing.T) {
 	}
 
 	// Verify the client is tracked.
-	// Allow a small window for the bridge to register the client.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	agents := bridge.ConnectedAgents()
 	found := false
 	for _, a := range agents {
@@ -274,7 +276,6 @@ func TestBridge_ConnectWithInvalidAuth(t *testing.T) {
 
 	_, returnCode := connectAndAuth(t, bridge, "bad-client", "bad-client", "wrong-token-value")
 
-	// Return code 5 = not authorized
 	if returnCode != 5 {
 		t.Errorf("CONNACK return code = %d, want 5 (not authorized)", returnCode)
 	}
@@ -292,7 +293,6 @@ func TestBridge_ConnectWithNoPassword(t *testing.T) {
 
 	bridge := startBridge(t, nc, store)
 
-	// T3-03: CONNECT with no password should be rejected (auth required).
 	conn, returnCode := connectAndAuth(t, bridge, "anon-client", "", "")
 	defer conn.Close()
 
@@ -343,7 +343,6 @@ func TestBridge_PublishBridgesToNATS(t *testing.T) {
 		t.Fatalf("sending PUBLISH: %v", err)
 	}
 
-	// Wait for the message to arrive on NATS.
 	select {
 	case data := <-received:
 		if string(data) != string(payload) {
@@ -364,51 +363,15 @@ func TestTopicToSubjectMapping(t *testing.T) {
 		mqttTopic   string
 		natsSubject string
 	}{
-		{
-			name:        "health topic",
-			mqttTopic:   "hive/health/agent-1",
-			natsSubject: "hive.health.agent-1",
-		},
-		{
-			name:        "agent inbox",
-			mqttTopic:   "hive/agent/agent-1/inbox",
-			natsSubject: "hive.agent.agent-1.inbox",
-		},
-		{
-			name:        "team broadcast",
-			mqttTopic:   "hive/team/sensors/broadcast",
-			natsSubject: "hive.team.sensors.broadcast",
-		},
-		{
-			name:        "capability request",
-			mqttTopic:   "hive/capabilities/agent-1/read-temp/request",
-			natsSubject: "hive.capabilities.agent-1.read-temp.request",
-		},
-		{
-			name:        "capability response",
-			mqttTopic:   "hive/capabilities/agent-1/read-temp/response",
-			natsSubject: "hive.capabilities.agent-1.read-temp.response",
-		},
-		{
-			name:        "join request",
-			mqttTopic:   "hive/join/request",
-			natsSubject: "hive.join.request",
-		},
-		{
-			name:        "join status",
-			mqttTopic:   "hive/join/status/agent-1",
-			natsSubject: "hive.join.status.agent-1",
-		},
-		{
-			name:        "single level",
-			mqttTopic:   "test",
-			natsSubject: "test",
-		},
-		{
-			name:        "deeply nested",
-			mqttTopic:   "a/b/c/d/e/f",
-			natsSubject: "a.b.c.d.e.f",
-		},
+		{"health topic", "hive/health/agent-1", "hive.health.agent-1"},
+		{"agent inbox", "hive/agent/agent-1/inbox", "hive.agent.agent-1.inbox"},
+		{"team broadcast", "hive/team/sensors/broadcast", "hive.team.sensors.broadcast"},
+		{"capability request", "hive/capabilities/agent-1/read-temp/request", "hive.capabilities.agent-1.read-temp.request"},
+		{"capability response", "hive/capabilities/agent-1/read-temp/response", "hive.capabilities.agent-1.read-temp.response"},
+		{"join request", "hive/join/request", "hive.join.request"},
+		{"join status", "hive/join/status/agent-1", "hive.join.status.agent-1"},
+		{"single level", "test", "test"},
+		{"deeply nested", "a/b/c/d/e/f", "a.b.c.d.e.f"},
 	}
 
 	for _, tt := range tests {
@@ -418,7 +381,6 @@ func TestTopicToSubjectMapping(t *testing.T) {
 				t.Errorf("mqttTopicToNATSSubject(%q) = %q, want %q", tt.mqttTopic, got, tt.natsSubject)
 			}
 
-			// Also test the reverse mapping.
 			gotReverse := natsSubjectToMQTTTopic(tt.natsSubject)
 			if gotReverse != tt.mqttTopic {
 				t.Errorf("natsSubjectToMQTTTopic(%q) = %q, want %q", tt.natsSubject, gotReverse, tt.mqttTopic)
@@ -452,14 +414,16 @@ func TestBridge_StopIsClean(t *testing.T) {
 		t.Fatalf("bridge.Start: %v", err)
 	}
 
+	time.Sleep(200 * time.Millisecond)
 	port := bridge.Port()
 
-	// Stop the bridge.
 	if err := bridge.Stop(); err != nil {
 		t.Fatalf("bridge.Stop: %v", err)
 	}
 
-	// Verify the port is no longer accepting connections.
+	// Wait a bit for the port to be released.
+	time.Sleep(100 * time.Millisecond)
+
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 	if err == nil {
@@ -485,7 +449,6 @@ func TestBridge_PingPong(t *testing.T) {
 
 	bridge := startBridge(t, nc, store)
 
-	// Connect and authenticate.
 	conn, returnCode := connectAndAuth(t, bridge, "ping-client", "ping-client", rawToken)
 	if returnCode != 0 {
 		t.Fatalf("CONNACK return code = %d, want 0", returnCode)

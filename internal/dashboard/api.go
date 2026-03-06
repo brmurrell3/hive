@@ -2,15 +2,11 @@ package dashboard
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +16,7 @@ import (
 	"github.com/hivehq/hive/internal/state"
 	"github.com/hivehq/hive/internal/types"
 	"github.com/nats-io/nats.go"
+	"nhooyr.io/websocket"
 )
 
 // StoreReader is the interface for reading state from the store.
@@ -194,11 +191,11 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	}
 
 	overview := map[string]interface{}{
-		"node_count":    len(nodes),
-		"team_count":    len(teams),
-		"agent_count":   len(agents),
+		"node_count":     len(nodes),
+		"team_count":     len(teams),
+		"agent_count":    len(agents),
 		"uptime_seconds": int(time.Since(s.startTime).Seconds()),
-		"agent_status":  statusCounts,
+		"agent_status":   statusCounts,
 	}
 
 	s.writeJSON(w, http.StatusOK, overview)
@@ -492,18 +489,9 @@ func (s *Server) subscribeNATS() error {
 	return nil
 }
 
-// --- WebSocket Implementation (RFC 6455) ---
+// --- WebSocket Implementation (nhooyr.io/websocket) ---
 
-const (
-	wsGUID            = "258EAFA5-E914-47DA-95CA-5AB9DC11B65A"
-	wsOpText   byte   = 0x1
-	wsOpClose  byte   = 0x8
-	wsOpPing   byte   = 0x9
-	wsOpPong   byte   = 0xA
-	wsMaxFrameSize    = 1 << 20 // 1 MB max frame size
-)
-
-// handleWebSocket handles the WebSocket upgrade handshake and connection.
+// handleWebSocket handles the WebSocket upgrade and connection using nhooyr.io/websocket.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -523,53 +511,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Verify upgrade headers.
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		s.writeError(w, http.StatusBadRequest, "missing Upgrade: websocket header")
-		return
-	}
-	if !headerContains(r.Header.Get("Connection"), "Upgrade") {
-		s.writeError(w, http.StatusBadRequest, "missing Connection: Upgrade header")
-		return
-	}
-
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		s.writeError(w, http.StatusBadRequest, "missing Sec-WebSocket-Key header")
-		return
-	}
-
-	// Compute the accept key per RFC 6455.
-	acceptKey := computeAcceptKey(key)
-
-	// Hijack the connection.
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		s.writeError(w, http.StatusInternalServerError, "server does not support hijacking")
-		return
-	}
-
-	conn, bufrw, err := hj.Hijack()
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: []string{"*"},
+	})
 	if err != nil {
-		s.logger.Error("failed to hijack connection", "error", err)
-		return
-	}
-
-	// Send the 101 Switching Protocols response.
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + acceptKey + "\r\n" +
-		"\r\n"
-
-	if _, err := bufrw.WriteString(response); err != nil {
-		s.logger.Error("failed to write WebSocket upgrade response", "error", err)
-		conn.Close()
-		return
-	}
-	if err := bufrw.Flush(); err != nil {
-		s.logger.Error("failed to flush WebSocket upgrade response", "error", err)
-		conn.Close()
+		s.logger.Error("failed to accept WebSocket connection", "error", err)
 		return
 	}
 
@@ -580,157 +526,44 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.register(client)
 
-	s.logger.Debug("WebSocket client connected", "remote_addr", conn.RemoteAddr())
+	s.logger.Debug("WebSocket client connected")
 
 	// Start writer goroutine.
 	go s.wsWriter(client)
 
-	// Start reader goroutine (blocks until connection closes).
-	go s.wsReader(client)
+	// Reader loop (blocks until connection closes).
+	s.wsReader(client)
 }
 
-// wsReader reads frames from the WebSocket connection.
+// wsReader reads messages from the WebSocket connection.
+// Dashboard WebSocket is server-push only; we just drain client messages.
 func (s *Server) wsReader(client *wsClient) {
 	defer func() {
 		s.hub.unregister(client)
-		client.conn.Close()
-		s.logger.Debug("WebSocket client disconnected", "remote_addr", client.conn.RemoteAddr())
+		client.conn.Close(websocket.StatusNormalClosure, "")
+		s.logger.Debug("WebSocket client disconnected")
 	}()
 
 	for {
-		opcode, _, err := wsReadFrame(client.conn)
+		_, _, err := client.conn.Read(context.Background())
 		if err != nil {
 			return
 		}
-
-		switch opcode {
-		case wsOpClose:
-			// Send close frame back.
-			wsWriteFrame(client.conn, wsOpClose, nil)
-			return
-		case wsOpPing:
-			// Respond with pong.
-			wsWriteFrame(client.conn, wsOpPong, nil)
-		case wsOpText:
-			// Dashboard WebSocket is server-push only; ignore text frames from clients.
-		}
+		// Ignore all client messages (server-push only).
 	}
 }
 
 // wsWriter writes queued messages to the WebSocket connection.
 func (s *Server) wsWriter(client *wsClient) {
 	for data := range client.send {
-		if err := wsWriteFrame(client.conn, wsOpText, data); err != nil {
-			s.logger.Debug("failed to write WebSocket frame", "error", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.conn.Write(ctx, websocket.MessageText, data)
+		cancel()
+		if err != nil {
+			s.logger.Debug("failed to write WebSocket message", "error", err)
 			return
 		}
 	}
-}
-
-// computeAcceptKey computes the Sec-WebSocket-Accept value per RFC 6455.
-func computeAcceptKey(key string) string {
-	h := sha1.New()
-	h.Write([]byte(key))
-	h.Write([]byte(wsGUID))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
-}
-
-// headerContains checks if a header value contains a token (case-insensitive).
-func headerContains(header, token string) bool {
-	for _, part := range strings.Split(header, ",") {
-		if strings.EqualFold(strings.TrimSpace(part), token) {
-			return true
-		}
-	}
-	return false
-}
-
-// wsReadFrame reads a single WebSocket frame from the connection.
-// Returns the opcode, payload, and any error.
-func wsReadFrame(conn net.Conn) (byte, []byte, error) {
-	// Read the first two bytes (FIN/opcode and mask/payload length).
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return 0, nil, err
-	}
-
-	opcode := header[0] & 0x0F
-	masked := (header[1] & 0x80) != 0
-	payloadLen := uint64(header[1] & 0x7F)
-
-	// Extended payload length.
-	switch payloadLen {
-	case 126:
-		ext := make([]byte, 2)
-		if _, err := io.ReadFull(conn, ext); err != nil {
-			return 0, nil, err
-		}
-		payloadLen = uint64(binary.BigEndian.Uint16(ext))
-	case 127:
-		ext := make([]byte, 8)
-		if _, err := io.ReadFull(conn, ext); err != nil {
-			return 0, nil, err
-		}
-		payloadLen = binary.BigEndian.Uint64(ext)
-	}
-
-	if payloadLen > wsMaxFrameSize {
-		return 0, nil, fmt.Errorf("frame too large: %d bytes", payloadLen)
-	}
-
-	// Read masking key if present.
-	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	// Read payload.
-	payload := make([]byte, payloadLen)
-	if payloadLen > 0 {
-		if _, err := io.ReadFull(conn, payload); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	// Unmask payload if masked.
-	if masked {
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
-	}
-
-	return opcode, payload, nil
-}
-
-// wsWriteFrame writes a single WebSocket frame to the connection.
-// Server frames are not masked per RFC 6455.
-func wsWriteFrame(conn net.Conn, opcode byte, payload []byte) error {
-	// FIN bit set, opcode.
-	frame := []byte{0x80 | opcode}
-
-	// Payload length (no mask bit for server frames).
-	payloadLen := len(payload)
-	switch {
-	case payloadLen <= 125:
-		frame = append(frame, byte(payloadLen))
-	case payloadLen <= 65535:
-		frame = append(frame, 126)
-		ext := make([]byte, 2)
-		binary.BigEndian.PutUint16(ext, uint16(payloadLen))
-		frame = append(frame, ext...)
-	default:
-		frame = append(frame, 127)
-		ext := make([]byte, 8)
-		binary.BigEndian.PutUint64(ext, uint64(payloadLen))
-		frame = append(frame, ext...)
-	}
-
-	frame = append(frame, payload...)
-
-	_, err := conn.Write(frame)
-	return err
 }
 
 // --- WebSocket Hub ---
@@ -744,7 +577,7 @@ type wsHub struct {
 
 // wsClient represents a connected WebSocket client.
 type wsClient struct {
-	conn net.Conn
+	conn *websocket.Conn
 	send chan []byte
 }
 
@@ -801,8 +634,7 @@ func (h *wsHub) Broadcast(eventType string, data interface{}) {
 		case client.send <- msg:
 		default:
 			// Client send buffer is full; skip to avoid blocking.
-			h.logger.Warn("WebSocket client send buffer full, dropping message",
-				"remote_addr", client.conn.RemoteAddr())
+			h.logger.Warn("WebSocket client send buffer full, dropping message")
 		}
 	}
 }
@@ -814,7 +646,7 @@ func (h *wsHub) closeAll() {
 
 	for client := range h.clients {
 		close(client.send)
-		client.conn.Close()
+		client.conn.Close(websocket.StatusGoingAway, "server shutting down")
 		delete(h.clients, client)
 	}
 }

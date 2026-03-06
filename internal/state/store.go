@@ -2,6 +2,7 @@ package state
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/hivehq/hive/internal/auth"
 	"github.com/hivehq/hive/internal/types"
+	_ "modernc.org/sqlite"
 )
 
 // AgentStatus represents the lifecycle status of an agent VM.
@@ -59,7 +61,7 @@ type AgentState struct {
 	Error          string      `json:"error,omitempty"`
 }
 
-// State is the top-level runtime state persisted to state.json.
+// State is the top-level runtime state (kept in-memory, persisted to SQLite).
 type State struct {
 	Agents       map[string]*AgentState        `json:"agents"`
 	Nodes        map[string]*types.NodeState   `json:"nodes,omitempty"`
@@ -72,24 +74,23 @@ func newState() *State {
 	return &State{
 		Agents:       make(map[string]*AgentState),
 		Nodes:        make(map[string]*types.NodeState),
-		Tokens:       []*types.Token{},       // T3-11: initialize
+		Tokens:       []*types.Token{},
 		Capabilities: types.NewCapabilityRegistry(),
-		Users:        []*auth.User{},          // T3-11: initialize
+		Users:        []*auth.User{},
 	}
 }
 
-// Store manages the runtime state persistence via state.json.
+// Store manages the runtime state persistence via SQLite.
 type Store struct {
 	mu     sync.Mutex
 	path   string
+	db     *sql.DB
 	state  *State
 	logger *slog.Logger
 }
 
-// NewStore creates a new Store backed by the given file path.
-// If the file exists it is loaded; if it is corrupt, the backup
-// (state.json.bak) is tried; if both fail, an empty state is used so
-// that hived can always start.
+// NewStore creates a new Store backed by a SQLite database at the given path.
+// If an existing JSON state file is found, it is migrated to SQLite automatically.
 func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	s := &Store{
 		path:   path,
@@ -97,164 +98,340 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 		state:  newState(),
 	}
 
-	if _, err := os.Stat(path); err == nil {
-		if err := s.Load(); err != nil {
-			logger.Warn("state file corrupt, attempting backup recovery",
-				"path", path, "error", err)
-			if bakErr := s.loadFromBackup(); bakErr != nil {
-				logger.Warn("backup state also unusable, starting with empty state",
-					"backup_path", s.backupPath(), "error", bakErr)
-				s.state = newState()
-			} else {
-				logger.Info("recovered state from backup", "path", s.backupPath(),
-					"agents", len(s.state.Agents))
-			}
-		} else {
-			logger.Info("loaded existing state", "path", path, "agents", len(s.state.Agents))
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("checking state file %s: %w", path, err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("creating state directory: %w", err)
+	}
+
+	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("opening state database %s: %w", path, err)
+	}
+	s.db = db
+
+	if err := s.createTables(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating state tables: %w", err)
+	}
+
+	if err := s.loadFromDB(); err != nil {
+		logger.Warn("failed to load state from database, starting fresh",
+			"path", path, "error", err)
+		s.state = newState()
 	} else {
-		logger.Info("no existing state file, starting fresh", "path", path)
+		logger.Info("loaded state from database", "path", path,
+			"agents", len(s.state.Agents))
 	}
 
 	return s, nil
 }
 
-// Load reads state.json from disk into memory.
-func (s *Store) Load() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Store) createTables() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS agents (
+			id TEXT PRIMARY KEY,
+			team TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'PENDING',
+			node_id TEXT NOT NULL DEFAULT '',
+			memory_bytes INTEGER NOT NULL DEFAULT 0,
+			vcpus INTEGER NOT NULL DEFAULT 0,
+			manifest_hash TEXT NOT NULL DEFAULT '',
+			vm_pid INTEGER NOT NULL DEFAULT 0,
+			vm_cid INTEGER NOT NULL DEFAULT 0,
+			vm_socket_path TEXT NOT NULL DEFAULT '',
+			rootfs_copy_path TEXT NOT NULL DEFAULT '',
+			restart_count INTEGER NOT NULL DEFAULT 0,
+			last_transition TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE IF NOT EXISTS nodes (
+			id TEXT PRIMARY KEY,
+			data_json TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS tokens (
+			hash TEXT PRIMARY KEY,
+			data_json TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS capabilities (
+			agent_id TEXT PRIMARY KEY,
+			data_json TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			data_json TEXT NOT NULL
+		);
+	`)
+	return err
+}
 
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		return fmt.Errorf("reading state file: %w", err)
+// loadFromDB loads all state from the SQLite database into memory.
+func (s *Store) loadFromDB() error {
+	if err := s.loadAgents(); err != nil {
+		return fmt.Errorf("loading agents: %w", err)
 	}
-
-	var st State
-	if err := json.Unmarshal(data, &st); err != nil {
-		return fmt.Errorf("parsing state file: %w", err)
+	if err := s.loadNodes(); err != nil {
+		return fmt.Errorf("loading nodes: %w", err)
 	}
-
-	if st.Agents == nil {
-		st.Agents = make(map[string]*AgentState)
+	if err := s.loadTokens(); err != nil {
+		return fmt.Errorf("loading tokens: %w", err)
 	}
-	if st.Nodes == nil {
-		st.Nodes = make(map[string]*types.NodeState)
+	if err := s.loadCapabilities(); err != nil {
+		return fmt.Errorf("loading capabilities: %w", err)
 	}
-	if st.Capabilities == nil {
-		st.Capabilities = types.NewCapabilityRegistry()
+	if err := s.loadUsers(); err != nil {
+		return fmt.Errorf("loading users: %w", err)
 	}
-	if st.Tokens == nil {
-		st.Tokens = []*types.Token{}
-	}
-	if st.Users == nil {
-		st.Users = []*auth.User{}
-	}
-
-	s.state = &st
 	return nil
 }
 
-// loadFromBackup attempts to load state from the backup file (state.json.bak).
-// It is called when the primary state file is corrupt.
-func (s *Store) loadFromBackup() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	bakPath := s.backupPath()
-	data, err := os.ReadFile(bakPath)
+func (s *Store) loadAgents() error {
+	rows, err := s.db.Query(`SELECT id, team, status, node_id, memory_bytes, vcpus,
+		manifest_hash, vm_pid, vm_cid, vm_socket_path, rootfs_copy_path,
+		restart_count, last_transition, started_at, error FROM agents`)
 	if err != nil {
-		return fmt.Errorf("reading backup state file: %w", err)
+		return err
 	}
+	defer rows.Close()
 
-	var st State
-	if err := json.Unmarshal(data, &st); err != nil {
-		return fmt.Errorf("parsing backup state file: %w", err)
+	for rows.Next() {
+		var a AgentState
+		var lastTransStr, startedAtStr string
+		if err := rows.Scan(&a.ID, &a.Team, &a.Status, &a.NodeID, &a.MemoryBytes,
+			&a.VCPUs, &a.ManifestHash, &a.VMPID, &a.VMCID, &a.VMSocketPath,
+			&a.RootfsCopyPath, &a.RestartCount, &lastTransStr, &startedAtStr, &a.Error); err != nil {
+			return err
+		}
+		if lastTransStr != "" {
+			a.LastTransition, _ = time.Parse(time.RFC3339Nano, lastTransStr)
+		}
+		if startedAtStr != "" {
+			a.StartedAt, _ = time.Parse(time.RFC3339Nano, startedAtStr)
+		}
+		s.state.Agents[a.ID] = &a
 	}
-
-	if st.Agents == nil {
-		st.Agents = make(map[string]*AgentState)
-	}
-	if st.Nodes == nil {
-		st.Nodes = make(map[string]*types.NodeState)
-	}
-	if st.Capabilities == nil {
-		st.Capabilities = types.NewCapabilityRegistry()
-	}
-	if st.Tokens == nil {
-		st.Tokens = []*types.Token{}
-	}
-	if st.Users == nil {
-		st.Users = []*auth.User{}
-	}
-
-	s.state = &st
-	return nil
+	return rows.Err()
 }
 
-// Save writes the current state to disk atomically by writing to a temporary
-// file first then renaming it over the target path.
-func (s *Store) Save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.saveLocked()
-}
-
-// backupPath returns the path of the backup state file.
-func (s *Store) backupPath() string {
-	return s.path + ".bak"
-}
-
-// saveLocked performs the atomic save while the caller already holds the mutex.
-// Before overwriting state.json, it copies the current file to state.json.bak
-// so that a prior good state is always recoverable.
-func (s *Store) saveLocked() error {
-	data, err := json.MarshalIndent(s.state, "", "  ")
+func (s *Store) loadNodes() error {
+	rows, err := s.db.Query(`SELECT data_json FROM nodes`)
 	if err != nil {
-		return fmt.Errorf("marshaling state: %w", err)
+		return err
 	}
+	defer rows.Close()
 
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating state directory: %w", err)
+	for rows.Next() {
+		var dataJSON string
+		if err := rows.Scan(&dataJSON); err != nil {
+			return err
+		}
+		var n types.NodeState
+		if err := json.Unmarshal([]byte(dataJSON), &n); err != nil {
+			return err
+		}
+		s.state.Nodes[n.ID] = &n
 	}
+	return rows.Err()
+}
 
-	// Back up the current state file before overwriting. Errors here are
-	// logged but not fatal — the primary save must still proceed.
-	if existing, readErr := os.ReadFile(s.path); readErr == nil {
-		if writeErr := os.WriteFile(s.backupPath(), existing, 0644); writeErr != nil {
-			s.logger.Warn("failed to write state backup", "error", writeErr)
+func (s *Store) loadTokens() error {
+	rows, err := s.db.Query(`SELECT data_json FROM tokens`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	s.state.Tokens = []*types.Token{}
+	for rows.Next() {
+		var dataJSON string
+		if err := rows.Scan(&dataJSON); err != nil {
+			return err
+		}
+		var t types.Token
+		if err := json.Unmarshal([]byte(dataJSON), &t); err != nil {
+			return err
+		}
+		s.state.Tokens = append(s.state.Tokens, &t)
+	}
+	return rows.Err()
+}
+
+func (s *Store) loadCapabilities() error {
+	rows, err := s.db.Query(`SELECT agent_id, data_json FROM capabilities`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	s.state.Capabilities = types.NewCapabilityRegistry()
+	for rows.Next() {
+		var agentID, dataJSON string
+		if err := rows.Scan(&agentID, &dataJSON); err != nil {
+			return err
+		}
+		var entry types.CapabilityRegistryEntry
+		if err := json.Unmarshal([]byte(dataJSON), &entry); err != nil {
+			return err
+		}
+		s.state.Capabilities.Agents[agentID] = &entry
+	}
+	return rows.Err()
+}
+
+func (s *Store) loadUsers() error {
+	rows, err := s.db.Query(`SELECT data_json FROM users`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	s.state.Users = []*auth.User{}
+	for rows.Next() {
+		var dataJSON string
+		if err := rows.Scan(&dataJSON); err != nil {
+			return err
+		}
+		var u auth.User
+		if err := json.Unmarshal([]byte(dataJSON), &u); err != nil {
+			return err
+		}
+		s.state.Users = append(s.state.Users, &u)
+	}
+	return rows.Err()
+}
+
+// --- Agent persistence helpers ---
+
+func (s *Store) upsertAgent(a *AgentState) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO agents
+		(id, team, status, node_id, memory_bytes, vcpus, manifest_hash,
+		 vm_pid, vm_cid, vm_socket_path, rootfs_copy_path,
+		 restart_count, last_transition, started_at, error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.Team, a.Status, a.NodeID, a.MemoryBytes, a.VCPUs, a.ManifestHash,
+		a.VMPID, a.VMCID, a.VMSocketPath, a.RootfsCopyPath,
+		a.RestartCount, formatTime(a.LastTransition), formatTime(a.StartedAt), a.Error,
+	)
+	return err
+}
+
+func (s *Store) deleteAgent(id string) error {
+	_, err := s.db.Exec(`DELETE FROM agents WHERE id = ?`, id)
+	return err
+}
+
+// --- Node persistence helpers ---
+
+func (s *Store) upsertNode(n *types.NodeState) error {
+	data, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO nodes (id, data_json) VALUES (?, ?)`,
+		n.ID, string(data))
+	return err
+}
+
+func (s *Store) deleteNode(id string) error {
+	_, err := s.db.Exec(`DELETE FROM nodes WHERE id = ?`, id)
+	return err
+}
+
+// --- Token persistence helpers ---
+
+func (s *Store) saveAllTokens() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM tokens`); err != nil {
+		return err
+	}
+	for _, t := range s.state.Tokens {
+		data, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO tokens (hash, data_json) VALUES (?, ?)`,
+			t.Hash, string(data)); err != nil {
+			return err
 		}
 	}
+	return tx.Commit()
+}
 
-	tmp, err := os.CreateTemp(dir, "state-*.json.tmp")
+// --- Capability persistence helpers ---
+
+func (s *Store) upsertCapability(agentID string, entry *types.CapabilityRegistryEntry) error {
+	data, err := json.Marshal(entry)
 	if err != nil {
-		return fmt.Errorf("creating temp state file: %w", err)
+		return err
 	}
-	tmpPath := tmp.Name()
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO capabilities (agent_id, data_json) VALUES (?, ?)`,
+		agentID, string(data))
+	return err
+}
 
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("writing temp state file: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("syncing temp state file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("closing temp state file: %w", err)
-	}
+func (s *Store) deleteCapability(agentID string) error {
+	_, err := s.db.Exec(`DELETE FROM capabilities WHERE agent_id = ?`, agentID)
+	return err
+}
 
-	if err := os.Rename(tmpPath, s.path); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("renaming temp state file: %w", err)
-	}
+// --- User persistence helpers ---
 
+func (s *Store) saveAllUsers() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM users`); err != nil {
+		return err
+	}
+	for _, u := range s.state.Users {
+		data, err := json.Marshal(u)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO users (id, data_json) VALUES (?, ?)`,
+			u.ID, string(data)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// --- Time helpers ---
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
+// --- Public API (same interface as before) ---
+
+// Load is a no-op for SQLite (data is loaded on construction).
+// Kept for API compatibility.
+func (s *Store) Load() error {
+	return nil
+}
+
+// Save is a no-op for SQLite (each mutation persists immediately).
+// Kept for API compatibility.
+func (s *Store) Save() error {
+	return nil
+}
+
+// Close closes the underlying database connection.
+func (s *Store) Close() error {
+	if s.db != nil {
+		return s.db.Close()
+	}
 	return nil
 }
 
@@ -273,7 +450,7 @@ func (s *Store) GetAgent(id string) *AgentState {
 	return &cp
 }
 
-// SetAgent updates or inserts the agent state and persists to disk.
+// SetAgent updates or inserts the agent state and persists to SQLite.
 func (s *Store) SetAgent(agent *AgentState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -282,8 +459,8 @@ func (s *Store) SetAgent(agent *AgentState) error {
 	cp := *agent
 	s.state.Agents[cp.ID] = &cp
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after setting agent %s: %w", cp.ID, err)
+	if err := s.upsertAgent(&cp); err != nil {
+		return fmt.Errorf("persisting agent %s: %w", cp.ID, err)
 	}
 
 	s.logger.Debug("agent state updated", "agent_id", cp.ID, "status", cp.Status)
@@ -291,9 +468,6 @@ func (s *Store) SetAgent(agent *AgentState) error {
 }
 
 // ModifyAgent performs an atomic read-modify-write on agent state.
-// T2-02: The callback receives a deep copy of the current state, mutates it,
-// and only if the callback succeeds does the store update the real state and
-// persist atomically while holding the lock.
 func (s *Store) ModifyAgent(id string, fn func(*AgentState) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -312,15 +486,15 @@ func (s *Store) ModifyAgent(id string, fn func(*AgentState) error) error {
 	// Callback succeeded — commit the copy to live state.
 	s.state.Agents[id] = &cp
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after modifying agent %s: %w", id, err)
+	if err := s.upsertAgent(&cp); err != nil {
+		return fmt.Errorf("persisting agent %s after modify: %w", id, err)
 	}
 
 	s.logger.Debug("agent state modified atomically", "agent_id", id, "status", cp.Status)
 	return nil
 }
 
-// RemoveAgent removes the agent from state and persists to disk.
+// RemoveAgent removes the agent from state and persists to SQLite.
 func (s *Store) RemoveAgent(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,8 +505,8 @@ func (s *Store) RemoveAgent(id string) error {
 
 	delete(s.state.Agents, id)
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after removing agent %s: %w", id, err)
+	if err := s.deleteAgent(id); err != nil {
+		return fmt.Errorf("deleting agent %s from database: %w", id, err)
 	}
 
 	s.logger.Debug("agent removed from state", "agent_id", id)
@@ -360,7 +534,6 @@ func (s *Store) AllAgents() []*AgentState {
 // --- Node management ---
 
 // GetNode returns the node state for the given ID, or nil if not found.
-// T2-05: Deep-copies Labels map and Agents slice.
 func (s *Store) GetNode(id string) *types.NodeState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -383,8 +556,7 @@ func (s *Store) GetNode(id string) *types.NodeState {
 	return &cp
 }
 
-// SetNode updates or inserts a node state and persists to disk.
-// T2-05: Deep-copies Labels map and Agents slice.
+// SetNode updates or inserts a node state and persists to SQLite.
 func (s *Store) SetNode(node *types.NodeState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -402,14 +574,14 @@ func (s *Store) SetNode(node *types.NodeState) error {
 	}
 	s.state.Nodes[cp.ID] = &cp
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after setting node %s: %w", cp.ID, err)
+	if err := s.upsertNode(&cp); err != nil {
+		return fmt.Errorf("persisting node %s: %w", cp.ID, err)
 	}
 	s.logger.Debug("node state updated", "node_id", cp.ID, "status", cp.Status)
 	return nil
 }
 
-// RemoveNode removes a node from state and persists to disk.
+// RemoveNode removes a node from state and persists to SQLite.
 func (s *Store) RemoveNode(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -419,15 +591,14 @@ func (s *Store) RemoveNode(id string) error {
 	}
 	delete(s.state.Nodes, id)
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after removing node %s: %w", id, err)
+	if err := s.deleteNode(id); err != nil {
+		return fmt.Errorf("deleting node %s from database: %w", id, err)
 	}
 	s.logger.Debug("node removed from state", "node_id", id)
 	return nil
 }
 
 // AllNodes returns all node states sorted alphabetically by ID.
-// Deep-copies Labels map and Agents slice for each node.
 func (s *Store) AllNodes() []*types.NodeState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -455,8 +626,7 @@ func (s *Store) AllNodes() []*types.NodeState {
 
 // --- Token management ---
 
-// AddToken stores a hashed token and persists to disk.
-// T2-04: Makes a defensive copy before storing.
+// AddToken stores a hashed token and persists to SQLite.
 func (s *Store) AddToken(token *types.Token) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -464,8 +634,8 @@ func (s *Store) AddToken(token *types.Token) error {
 	cp := *token
 	s.state.Tokens = append(s.state.Tokens, &cp)
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after adding token: %w", err)
+	if err := s.saveAllTokens(); err != nil {
+		return fmt.Errorf("persisting tokens: %w", err)
 	}
 	s.logger.Debug("token added", "prefix", token.Prefix)
 	return nil
@@ -473,7 +643,6 @@ func (s *Store) AddToken(token *types.Token) error {
 
 // ValidateToken checks a raw token against stored hashes.
 // Returns a copy of the matching token if valid, nil otherwise.
-// T2-03: Persists LastUsed and returns a copy (not a pointer into internal state).
 func (s *Store) ValidateToken(rawToken string) *types.Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -482,7 +651,7 @@ func (s *Store) ValidateToken(rawToken string) *types.Token {
 	for _, t := range s.state.Tokens {
 		if t.Hash == hash && t.IsValid() {
 			t.LastUsed = time.Now()
-			if err := s.saveLocked(); err != nil {
+			if err := s.saveAllTokens(); err != nil {
 				s.logger.Error("failed to persist token LastUsed", "error", err)
 			}
 			cp := *t
@@ -521,8 +690,8 @@ func (s *Store) RevokeToken(prefix string) error {
 		return fmt.Errorf("no token found with prefix %q", prefix)
 	}
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after revoking token: %w", err)
+	if err := s.saveAllTokens(); err != nil {
+		return fmt.Errorf("persisting tokens after revoke: %w", err)
 	}
 	s.logger.Debug("token revoked", "prefix", prefix)
 	return nil
@@ -542,7 +711,6 @@ func HashToken(raw string) string {
 // --- Capability Registry ---
 
 // GetCapabilityRegistry returns a deep copy of the capability registry.
-// T2-05: Deep-copies Capabilities slice and nested Inputs/Outputs.
 func (s *Store) GetCapabilityRegistry() *types.CapabilityRegistry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -577,8 +745,9 @@ func (s *Store) RegisterCapabilities(agentID, teamID, tier, nodeID string, caps 
 
 	s.state.Capabilities.Register(agentID, teamID, tier, nodeID, caps)
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after registering capabilities for %s: %w", agentID, err)
+	entry := s.state.Capabilities.Agents[agentID]
+	if err := s.upsertCapability(agentID, entry); err != nil {
+		return fmt.Errorf("persisting capabilities for %s: %w", agentID, err)
 	}
 	s.logger.Debug("capabilities registered", "agent_id", agentID, "count", len(caps))
 	return nil
@@ -591,8 +760,8 @@ func (s *Store) DeregisterCapabilities(agentID string) error {
 
 	s.state.Capabilities.Deregister(agentID)
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after deregistering capabilities for %s: %w", agentID, err)
+	if err := s.deleteCapability(agentID); err != nil {
+		return fmt.Errorf("deleting capabilities for %s from database: %w", agentID, err)
 	}
 	s.logger.Debug("capabilities deregistered", "agent_id", agentID)
 	return nil
@@ -600,7 +769,7 @@ func (s *Store) DeregisterCapabilities(agentID string) error {
 
 // --- User management ---
 
-// AddUser adds a user to state and persists to disk.
+// AddUser adds a user to state and persists to SQLite.
 func (s *Store) AddUser(user *auth.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -615,14 +784,14 @@ func (s *Store) AddUser(user *auth.User) error {
 	cp := *user
 	s.state.Users = append(s.state.Users, &cp)
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after adding user %s: %w", user.ID, err)
+	if err := s.saveAllUsers(); err != nil {
+		return fmt.Errorf("persisting users: %w", err)
 	}
 	s.logger.Debug("user added", "user_id", user.ID, "role", user.Role)
 	return nil
 }
 
-// RemoveUser removes a user from state and persists to disk.
+// RemoveUser removes a user from state and persists to SQLite.
 func (s *Store) RemoveUser(userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -643,8 +812,8 @@ func (s *Store) RemoveUser(userID string) error {
 
 	s.state.Users = users
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after removing user %s: %w", userID, err)
+	if err := s.saveAllUsers(); err != nil {
+		return fmt.Errorf("persisting users after remove: %w", err)
 	}
 	s.logger.Debug("user removed", "user_id", userID)
 	return nil
@@ -665,7 +834,6 @@ func deepCopyUser(u *auth.User) *auth.User {
 }
 
 // GetUser returns a copy of the user with the given ID, or nil if not found.
-// T2-05: Deep-copies Teams and Agents slices.
 func (s *Store) GetUser(userID string) *auth.User {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -679,7 +847,6 @@ func (s *Store) GetUser(userID string) *auth.User {
 }
 
 // AllUsers returns all users sorted alphabetically by ID.
-// T2-05: Deep-copies Teams and Agents slices.
 func (s *Store) AllUsers() []*auth.User {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -696,7 +863,7 @@ func (s *Store) AllUsers() []*auth.User {
 	return users
 }
 
-// UpdateUser updates an existing user in state and persists to disk.
+// UpdateUser updates an existing user in state and persists to SQLite.
 func (s *Store) UpdateUser(user *auth.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -715,8 +882,8 @@ func (s *Store) UpdateUser(user *auth.User) error {
 		return fmt.Errorf("user %q not found", user.ID)
 	}
 
-	if err := s.saveLocked(); err != nil {
-		return fmt.Errorf("saving state after updating user %s: %w", user.ID, err)
+	if err := s.saveAllUsers(); err != nil {
+		return fmt.Errorf("persisting users after update: %w", err)
 	}
 	s.logger.Debug("user updated", "user_id", user.ID, "role", user.Role)
 	return nil

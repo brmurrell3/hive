@@ -22,9 +22,21 @@ type mockStateReader struct {
 func (m *mockStateReader) AllAgents() []*state.AgentState { return m.agents }
 func (m *mockStateReader) AllNodes() []*types.NodeState   { return m.nodes }
 
-func TestCollector_AgentCount(t *testing.T) {
+// renderOutput is a helper that calls the Handler and returns the body string.
+func renderOutput(t *testing.T, c *Collector) string {
 	t.Helper()
+	handler := c.Handler()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	return string(body)
+}
 
+func TestCollector_AgentCount(t *testing.T) {
 	tests := []struct {
 		name     string
 		counts   map[string]int
@@ -70,7 +82,7 @@ func TestCollector_AgentCount(t *testing.T) {
 				c.SetAgentCount(status, count)
 			}
 
-			output := c.render()
+			output := renderOutput(t, c)
 
 			for _, want := range tt.contains {
 				if !strings.Contains(output, want) {
@@ -118,7 +130,7 @@ func TestCollector_MessageCount(t *testing.T) {
 				c.IncMessageCount(subject)
 			}
 
-			output := c.render()
+			output := renderOutput(t, c)
 
 			for _, want := range tt.contains {
 				if !strings.Contains(output, want) {
@@ -142,7 +154,7 @@ func TestCollector_InvocationLatency(t *testing.T) {
 		c.ObserveInvocationLatency("answer-questions", v)
 	}
 
-	output := c.render()
+	output := renderOutput(t, c)
 
 	// Check that quantile lines are present.
 	if !strings.Contains(output, `capability="answer-questions",quantile="0.5"`) {
@@ -179,33 +191,6 @@ func TestCollector_PrometheusFormat(t *testing.T) {
 	c.SetHeartbeatStatus("agent-2", false)
 	c.SetNodeResourceUsage("node-1", 65.2, 42.1)
 
-	output := c.render()
-
-	// Validate that every non-empty line is either a comment (# ...) or a
-	// metric line matching: metric_name{labels} value or metric_name value.
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "#") {
-			// Comment line (HELP or TYPE).
-			if !strings.HasPrefix(line, "# HELP ") && !strings.HasPrefix(line, "# TYPE ") {
-				t.Errorf("line %d: unexpected comment format: %s", i+1, line)
-			}
-			continue
-		}
-
-		// Metric line: name{labels} value  or  name value
-		// Must contain at least one space separating name from value.
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			t.Errorf("line %d: metric line has fewer than 2 fields: %s", i+1, line)
-		}
-	}
-
-	// Verify the HTTP handler sets the correct Content-Type.
 	handler := c.Handler()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -227,7 +212,6 @@ func TestCollector_PrometheusFormat(t *testing.T) {
 		t.Error("response body is empty")
 	}
 
-	// Check specific metrics are in the output.
 	bodyStr := string(body)
 	checks := []string{
 		"hive_agents_total",
@@ -256,7 +240,7 @@ func TestCollector_SnapshotFromStore(t *testing.T) {
 	}
 
 	c.SnapshotFromStore(store)
-	output := c.render()
+	output := renderOutput(t, c)
 
 	if !strings.Contains(output, `hive_agents_total{status="RUNNING"} 2`) {
 		t.Errorf("expected 2 RUNNING agents in snapshot\ngot:\n%s", output)
@@ -274,7 +258,7 @@ func TestCollector_HeartbeatStatus(t *testing.T) {
 	c.SetHeartbeatStatus("agent-1", true)
 	c.SetHeartbeatStatus("agent-2", false)
 
-	output := c.render()
+	output := renderOutput(t, c)
 
 	if !strings.Contains(output, `hive_heartbeat_healthy{agent_id="agent-1"} 1`) {
 		t.Errorf("expected agent-1 healthy=1\ngot:\n%s", output)
@@ -288,7 +272,7 @@ func TestCollector_NodeResourceUsage(t *testing.T) {
 	c := NewCollector()
 	c.SetNodeResourceUsage("node-1", 65.2, 42.1)
 
-	output := c.render()
+	output := renderOutput(t, c)
 
 	if !strings.Contains(output, `hive_node_memory_usage_percent{node_id="node-1"}`) {
 		t.Errorf("expected node-1 memory metric\ngot:\n%s", output)

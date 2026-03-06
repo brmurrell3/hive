@@ -12,6 +12,7 @@ import (
 
 	"github.com/hivehq/hive/internal/state"
 	"github.com/hivehq/hive/internal/types"
+	"golang.org/x/time/rate"
 )
 
 // StoreAccess is the interface for reading and writing agent/node state.
@@ -246,19 +247,10 @@ type RateLimiterConfig struct {
 	Logger      *slog.Logger
 }
 
-// tokenBucket implements the token bucket algorithm for a single subject.
-type tokenBucket struct {
-	tokens    float64
-	maxTokens float64
-	rate      float64 // tokens per second
-	lastFill  time.Time
-}
-
-// RateLimiter implements per-subject rate limiting using the token bucket
-// algorithm.
+// RateLimiter implements per-subject rate limiting using golang.org/x/time/rate.
 type RateLimiter struct {
 	mu          sync.Mutex
-	buckets     map[string]*tokenBucket
+	limiters    map[string]*rate.Limiter
 	defaultRate int
 	burstSize   int
 	logger      *slog.Logger
@@ -282,7 +274,7 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 	}
 
 	return &RateLimiter{
-		buckets:     make(map[string]*tokenBucket),
+		limiters:    make(map[string]*rate.Limiter),
 		defaultRate: defaultRate,
 		burstSize:   burstSize,
 		logger:      logger,
@@ -293,56 +285,32 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 // limiter. It returns true if the message is allowed, false if rate-limited.
 func (rl *RateLimiter) Allow(subject string) bool {
 	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	bucket, ok := rl.buckets[subject]
+	limiter, ok := rl.limiters[subject]
 	if !ok {
-		bucket = &tokenBucket{
-			tokens:    float64(rl.burstSize),
-			maxTokens: float64(rl.burstSize),
-			rate:      float64(rl.defaultRate),
-			lastFill:  time.Now(),
-		}
-		rl.buckets[subject] = bucket
+		limiter = rate.NewLimiter(rate.Limit(rl.defaultRate), rl.burstSize)
+		rl.limiters[subject] = limiter
 	}
+	rl.mu.Unlock()
 
-	// Refill tokens based on time elapsed.
-	now := time.Now()
-	elapsed := now.Sub(bucket.lastFill).Seconds()
-	bucket.tokens += elapsed * bucket.rate
-	if bucket.tokens > bucket.maxTokens {
-		bucket.tokens = bucket.maxTokens
-	}
-	bucket.lastFill = now
-
-	if bucket.tokens < 1 {
-		return false
-	}
-
-	bucket.tokens--
-	return true
+	return limiter.Allow()
 }
 
 // SetRate sets a custom rate (messages per second) for a specific subject.
-func (rl *RateLimiter) SetRate(subject string, rate int) {
+func (rl *RateLimiter) SetRate(subject string, r int) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	bucket, ok := rl.buckets[subject]
+	limiter, ok := rl.limiters[subject]
 	if !ok {
-		bucket = &tokenBucket{
-			tokens:    float64(rl.burstSize),
-			maxTokens: float64(rl.burstSize),
-			lastFill:  time.Now(),
-		}
-		rl.buckets[subject] = bucket
+		limiter = rate.NewLimiter(rate.Limit(r), rl.burstSize)
+		rl.limiters[subject] = limiter
+	} else {
+		limiter.SetLimit(rate.Limit(r))
 	}
-
-	bucket.rate = float64(rate)
 
 	rl.logger.Info("rate updated for subject",
 		"subject", subject,
-		"rate", rate,
+		"rate", r,
 	)
 }
 

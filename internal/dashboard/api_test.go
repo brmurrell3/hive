@@ -3,15 +3,10 @@
 package dashboard
 
 import (
-	"bufio"
 	"context"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,6 +18,7 @@ import (
 	"github.com/hivehq/hive/internal/state"
 	"github.com/hivehq/hive/internal/types"
 	"github.com/nats-io/nats.go"
+	"nhooyr.io/websocket"
 )
 
 // --- Mock Store ---
@@ -121,9 +117,6 @@ func (m *mockNATSConn) Subscribe(subject string, handler nats.MsgHandler) (*nats
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.subs[subject] = handler
-	// Return a nil subscription; tests that need it can handle it.
-	// Since we can't create a real *nats.Subscription without a real connection,
-	// we return nil. The server only uses the subscription for Unsubscribe on shutdown.
 	return nil, nil
 }
 
@@ -415,62 +408,18 @@ func TestServer_WebSocket(t *testing.T) {
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	t.Cleanup(func() { ts.Close() })
 
-	// Connect via raw TCP for the WebSocket handshake.
-	addr := strings.TrimPrefix(ts.URL, "http://")
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	// Connect via nhooyr.io/websocket client.
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		t.Fatalf("dialing test server: %v", err)
+		t.Fatalf("dialing WebSocket: %v", err)
 	}
-	defer conn.Close()
-
-	// Perform WebSocket handshake.
-	wsKey := base64.StdEncoding.EncodeToString([]byte("test-key-12345678"))
-	handshake := fmt.Sprintf("GET /ws HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"Upgrade: websocket\r\n"+
-		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n"+
-		"\r\n", addr, wsKey)
-
-	if _, err := conn.Write([]byte(handshake)); err != nil {
-		t.Fatalf("writing handshake: %v", err)
-	}
-
-	// Read the upgrade response.
-	reader := bufio.NewReader(conn)
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("reading status line: %v", err)
-	}
-	if !strings.Contains(statusLine, "101") {
-		t.Fatalf("expected 101 response, got: %s", strings.TrimSpace(statusLine))
-	}
-
-	// Read remaining headers.
-	var acceptKey string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("reading header: %v", err)
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			break
-		}
-		if strings.HasPrefix(line, "Sec-WebSocket-Accept:") {
-			acceptKey = strings.TrimSpace(strings.TrimPrefix(line, "Sec-WebSocket-Accept:"))
-		}
-	}
-
-	// Verify accept key.
-	expectedAccept := computeAcceptKey(wsKey)
-	if acceptKey != expectedAccept {
-		t.Errorf("expected accept key %q, got %q", expectedAccept, acceptKey)
-	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Verify client is registered.
-	// Give the server a moment to register the client.
 	time.Sleep(50 * time.Millisecond)
 	if count := srv.hub.clientCount(); count != 1 {
 		t.Errorf("expected 1 WebSocket client, got %d", count)
@@ -483,14 +432,13 @@ func TestServer_WebSocket(t *testing.T) {
 		"new_status": "STOPPED",
 	})
 
-	// Read the broadcast frame.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	opcode, payload, err := wsReadFrame(conn)
+	// Read the broadcast message.
+	readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readCancel()
+
+	_, payload, err := conn.Read(readCtx)
 	if err != nil {
-		t.Fatalf("reading WebSocket frame: %v", err)
-	}
-	if opcode != wsOpText {
-		t.Fatalf("expected text opcode (0x1), got 0x%x", opcode)
+		t.Fatalf("reading WebSocket message: %v", err)
 	}
 
 	var event wsEvent
@@ -509,14 +457,8 @@ func TestServer_WebSocket(t *testing.T) {
 		t.Errorf("expected agent_id 'test-agent', got %v", data["agent_id"])
 	}
 
-	// Send a close frame.
-	closeMask := [4]byte{0x01, 0x02, 0x03, 0x04}
-	closeFrame := []byte{
-		0x88,       // FIN + close opcode
-		0x80 | 0x0, // masked, 0 payload
-	}
-	closeFrame = append(closeFrame, closeMask[:]...)
-	conn.Write(closeFrame)
+	// Close the connection.
+	conn.Close(websocket.StatusNormalClosure, "test done")
 }
 
 func TestServer_WebSocket_BadUpgrade(t *testing.T) {
@@ -529,8 +471,9 @@ func TestServer_WebSocket_BadUpgrade(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected status 400, got %d", resp.StatusCode)
+	// nhooyr.io/websocket returns 426 (Upgrade Required) for non-WebSocket requests.
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Errorf("expected status 426, got %d", resp.StatusCode)
 	}
 }
 
@@ -665,23 +608,6 @@ func TestExtractPathParam(t *testing.T) {
 	}
 }
 
-func TestComputeAcceptKey(t *testing.T) {
-	// RFC 6455 Section 4.2.2 example.
-	key := "dGhlIHNhbXBsZSBub25jZQ=="
-	expected := computeExpectedAcceptKey(key)
-	got := computeAcceptKey(key)
-	if got != expected {
-		t.Errorf("computeAcceptKey(%q) = %q, want %q", key, got, expected)
-	}
-}
-
-func computeExpectedAcceptKey(key string) string {
-	h := sha1.New()
-	h.Write([]byte(key))
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-5AB9DC11B65A"))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
-}
-
 func TestWSHub_BroadcastNoClients(t *testing.T) {
 	hub := newWSHub(slog.Default())
 	// Should not panic with no clients.
@@ -691,12 +617,8 @@ func TestWSHub_BroadcastNoClients(t *testing.T) {
 func TestWSHub_RegisterUnregister(t *testing.T) {
 	hub := newWSHub(slog.Default())
 
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
 	client := &wsClient{
-		conn: c1,
+		conn: nil, // nil conn is fine for hub tracking tests
 		send: make(chan []byte, 10),
 	}
 
@@ -714,214 +636,24 @@ func TestWSHub_RegisterUnregister(t *testing.T) {
 	hub.unregister(client)
 }
 
-func TestWSFrameRoundTrip(t *testing.T) {
-	// Test WebSocket frame encoding/decoding round-trip.
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	message := []byte(`{"type":"test","data":"hello"}`)
-
-	// Write from server side (unmasked).
-	go func() {
-		if err := wsWriteFrame(c1, wsOpText, message); err != nil {
-			t.Errorf("writing frame: %v", err)
-		}
-	}()
-
-	// Read on client side (will be unmasked since server sent it).
-	opcode, payload, err := wsReadFrame(c2)
-	if err != nil {
-		t.Fatalf("reading frame: %v", err)
-	}
-	if opcode != wsOpText {
-		t.Errorf("expected opcode 0x1, got 0x%x", opcode)
-	}
-	if string(payload) != string(message) {
-		t.Errorf("expected payload %q, got %q", message, payload)
-	}
-}
-
-func TestWSFrameLargePayload(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	// Test with payload > 125 bytes (uses 2-byte extended length).
-	message := make([]byte, 1000)
-	for i := range message {
-		message[i] = byte('A' + (i % 26))
-	}
-
-	go func() {
-		if err := wsWriteFrame(c1, wsOpText, message); err != nil {
-			t.Errorf("writing large frame: %v", err)
-		}
-	}()
-
-	opcode, payload, err := wsReadFrame(c2)
-	if err != nil {
-		t.Fatalf("reading large frame: %v", err)
-	}
-	if opcode != wsOpText {
-		t.Errorf("expected opcode 0x1, got 0x%x", opcode)
-	}
-	if len(payload) != len(message) {
-		t.Errorf("expected payload length %d, got %d", len(message), len(payload))
-	}
-}
-
-func TestWSMaskedFrame(t *testing.T) {
-	// Test reading a masked frame (as a client would send).
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	payload := []byte("hello")
-	maskKey := [4]byte{0x37, 0xfa, 0x21, 0x3d}
-
-	go func() {
-		// Write a masked frame manually.
-		frame := []byte{
-			0x81,                     // FIN + text opcode
-			0x80 | byte(len(payload)), // masked + length
-		}
-		frame = append(frame, maskKey[:]...)
-
-		// Mask the payload.
-		masked := make([]byte, len(payload))
-		for i := range payload {
-			masked[i] = payload[i] ^ maskKey[i%4]
-		}
-		frame = append(frame, masked...)
-
-		c1.Write(frame)
-	}()
-
-	opcode, got, err := wsReadFrame(c2)
-	if err != nil {
-		t.Fatalf("reading masked frame: %v", err)
-	}
-	if opcode != wsOpText {
-		t.Errorf("expected opcode 0x1, got 0x%x", opcode)
-	}
-	if string(got) != "hello" {
-		t.Errorf("expected unmasked payload 'hello', got %q", got)
-	}
-}
-
-func TestWSWriteFrameLengths(t *testing.T) {
-	tests := []struct {
-		name    string
-		size    int
-	}{
-		{"tiny", 5},
-		{"max_small", 125},
-		{"medium", 126},
-		{"large", 500},
-		{"extended_16bit", 65535},
-		{"extended_64bit", 65536},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c1, c2 := net.Pipe()
-			defer c1.Close()
-			defer c2.Close()
-
-			payload := make([]byte, tt.size)
-			for i := range payload {
-				payload[i] = byte(i % 256)
-			}
-
-			go func() {
-				wsWriteFrame(c1, wsOpText, payload)
-			}()
-
-			_, got, err := wsReadFrame(c2)
-			if err != nil {
-				t.Fatalf("reading frame of size %d: %v", tt.size, err)
-			}
-			if len(got) != tt.size {
-				t.Errorf("expected %d bytes, got %d", tt.size, len(got))
-			}
-		})
-	}
-}
-
 func TestHeaderContains(t *testing.T) {
+	// headerContains was removed since nhooyr.io/websocket handles upgrade internally.
+	// This test verifies the extractPathParam helper instead.
 	tests := []struct {
-		header string
-		token  string
-		want   bool
+		path string
+		want string
 	}{
-		{"Upgrade", "Upgrade", true},
-		{"upgrade", "Upgrade", true},
-		{"keep-alive, Upgrade", "Upgrade", true},
-		{"keep-alive, upgrade", "Upgrade", true},
-		{"keep-alive", "Upgrade", false},
-		{"", "Upgrade", false},
+		{"/api/agents/foo", "foo"},
+		{"/api/agents/bar/chat", "bar"},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%s_%s", tt.header, tt.token), func(t *testing.T) {
-			got := headerContains(tt.header, tt.token)
-			if got != tt.want {
-				t.Errorf("headerContains(%q, %q) = %v, want %v", tt.header, tt.token, got, tt.want)
-			}
-		})
+		got := extractPathParam(tt.path, "/api/agents/")
+		if got != tt.want {
+			t.Errorf("extractPathParam(%q) = %q, want %q", tt.path, got, tt.want)
+		}
 	}
 }
 
-// TestWSWriteFrame_CloseAndPing tests close and ping frame opcodes.
-func TestWSWriteFrame_CloseAndPing(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	// Write a ping frame.
-	go func() {
-		wsWriteFrame(c1, wsOpPing, nil)
-	}()
-
-	opcode, payload, err := wsReadFrame(c2)
-	if err != nil {
-		t.Fatalf("reading ping frame: %v", err)
-	}
-	if opcode != wsOpPing {
-		t.Errorf("expected ping opcode (0x9), got 0x%x", opcode)
-	}
-	if len(payload) != 0 {
-		t.Errorf("expected empty payload, got %d bytes", len(payload))
-	}
-}
-
-// TestWSWriteFrame_ClosePayload tests a close frame with a status code payload.
-func TestWSWriteFrame_ClosePayload(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	// Write a close frame with a 1000 (normal closure) status.
-	closePayload := make([]byte, 2)
-	binary.BigEndian.PutUint16(closePayload, 1000)
-
-	go func() {
-		wsWriteFrame(c1, wsOpClose, closePayload)
-	}()
-
-	opcode, payload, err := wsReadFrame(c2)
-	if err != nil {
-		t.Fatalf("reading close frame: %v", err)
-	}
-	if opcode != wsOpClose {
-		t.Errorf("expected close opcode (0x8), got 0x%x", opcode)
-	}
-	if len(payload) != 2 {
-		t.Fatalf("expected 2-byte close payload, got %d bytes", len(payload))
-	}
-	code := binary.BigEndian.Uint16(payload)
-	if code != 1000 {
-		t.Errorf("expected close code 1000, got %d", code)
-	}
-}
+// Unused import guard.
+var _ = fmt.Sprintf
