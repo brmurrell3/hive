@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -49,26 +51,42 @@ type VMConfig struct {
 	AgentDrivePath string // path to ext4 disk image for agent files (T1-02)
 }
 
+// MaxSocketPathLen is the maximum length (in bytes) allowed for derived Unix
+// socket paths. The POSIX limit is 108 bytes (including null terminator) on
+// Linux. We use 104 to leave a small safety margin.
+const MaxSocketPathLen = 104
+
 // Manager handles Firecracker VM lifecycle. It coordinates between the
 // Hypervisor interface, the state.Store for persistence, and the filesystem
 // for rootfs copies and socket files.
 type Manager struct {
-	clusterRoot string
-	store       *state.Store
-	logger      *slog.Logger
-	hypervisor  Hypervisor
-	nextCID     uint32
-	mu          sync.Mutex
+	clusterRoot            string
+	natsPort               uint32 // Port of the local NATS server (for vsock forwarding)
+	natsToken              string // Auth token for the NATS server (passed to sidecar via sidecar.conf)
+	store                  *state.Store
+	logger                 *slog.Logger
+	hypervisor             Hypervisor
+	nextCID                uint32
+	forwarders             map[string]*VsockForwarder // agentID -> VsockForwarder
+	skipSocketPathValidation bool // set to true in tests with mock hypervisors
+	mu                     sync.Mutex
 }
 
-// NewManager creates a new VM manager.
-func NewManager(clusterRoot string, store *state.Store, logger *slog.Logger, hyp Hypervisor) *Manager {
+// NewManager creates a new VM manager. natsPort is the port of the local NATS
+// server; it is used to set up vsock forwarding so that guest VMs can reach
+// NATS via virtio-vsock. Pass 0 to disable vsock forwarding. natsToken is the
+// auth token for the embedded NATS server; it is written into each VM's
+// sidecar.conf so the sidecar can authenticate when connecting.
+func NewManager(clusterRoot string, store *state.Store, logger *slog.Logger, hyp Hypervisor, natsPort uint32, natsToken string) *Manager {
 	return &Manager{
 		clusterRoot: clusterRoot,
+		natsPort:    natsPort,
+		natsToken:   natsToken,
 		store:       store,
 		logger:      logger,
 		hypervisor:  hyp,
 		nextCID:     3, // CIDs 0, 1, 2 are reserved
+		forwarders:  make(map[string]*VsockForwarder),
 	}
 }
 
@@ -133,6 +151,23 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 	}
 
 	socketPath := filepath.Join(stateDir, "firecracker.sock")
+
+	// Validate Unix socket path length. The longest derived path is
+	// socketPath + ".vsock" (used by the vsock forwarder). Unix domain
+	// sockets are limited to 108 bytes on Linux (including the null
+	// terminator). We use 104 as the limit to provide a small safety margin.
+	// Skip validation when using a mock hypervisor (tests) since no real
+	// sockets are created and temp dirs on macOS are often very long.
+	if !m.skipSocketPathValidation {
+		longestPath := socketPath + ".vsock"
+		if len(longestPath) > MaxSocketPathLen {
+			return m.failAgent(agentState, fmt.Errorf(
+				"unix socket path too long (%d bytes, max %d): %s — use a shorter cluster root path",
+				len(longestPath), MaxSocketPathLen, longestPath,
+			))
+		}
+	}
+
 	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
 	kernelPath := filepath.Join(m.clusterRoot, "rootfs", "vmlinux")
 	baseRootfs := filepath.Join(m.clusterRoot, "rootfs", "rootfs.ext4")
@@ -142,6 +177,44 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 	// Copy rootfs for this VM (Firecracker requires a dedicated rootfs per VM).
 	if err := copyFile(baseRootfs, rootfsCopy); err != nil {
 		return m.failAgent(agentState, fmt.Errorf("copying rootfs for agent %s: %w", agentID, err))
+	}
+
+	// Ensure the agent directory exists so we can write sidecar.conf into it.
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		os.Remove(rootfsCopy)
+		return m.failAgent(agentState, fmt.Errorf("creating agent directory for %s: %w", agentID, err))
+	}
+
+	// Write sidecar.conf into the agent directory so the VM init script
+	// can source it and pass the values to the sidecar binary.
+	// VSOCK_PORT must match the port in NATS_URL so the vsock proxy inside
+	// the VM listens on the same port that the NATS client connects to.
+	natsPort := m.natsPort
+	if natsPort == 0 {
+		natsPort = 4222
+	}
+	sidecarConf := filepath.Join(agentDir, "sidecar.conf")
+	confContent := fmt.Sprintf("AGENT_ID=%s\nTEAM_ID=%s\nNATS_URL=nats://127.0.0.1:%d\nNATS_TOKEN=%s\nVSOCK_PORT=%d\n",
+		agentID, agent.Metadata.Team, natsPort, m.natsToken, natsPort)
+
+	// Pass the runtime command so the sidecar starts the agent workload.
+	if agent.Spec.Runtime.Type != "" {
+		confContent += fmt.Sprintf("RUNTIME_CMD=%s\n", agent.Spec.Runtime.Type)
+	}
+
+	// Pass capabilities as a JSON array so the sidecar can register them.
+	if len(agent.Spec.Capabilities) > 0 {
+		capsJSON, jsonErr := json.Marshal(agent.Spec.Capabilities)
+		if jsonErr != nil {
+			os.Remove(rootfsCopy)
+			return m.failAgent(agentState, fmt.Errorf("marshaling capabilities for %s: %w", agentID, jsonErr))
+		}
+		confContent += fmt.Sprintf("CAPABILITIES=%s\n", string(capsJSON))
+	}
+
+	if err := os.WriteFile(sidecarConf, []byte(confContent), 0644); err != nil {
+		os.Remove(rootfsCopy)
+		return m.failAgent(agentState, fmt.Errorf("writing sidecar.conf for %s: %w", agentID, err))
 	}
 
 	// T1-02: Create ext4 disk image from agent directory for Firecracker drive API.
@@ -190,8 +263,36 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 		return fmt.Errorf("setting agent state to STARTING: %w", err)
 	}
 
+	// Start the vsock forwarder (host side) before booting the VM so the
+	// guest can connect to NATS immediately upon boot. The forwarder listens
+	// on the Firecracker vsock UDS path with the port suffix and forwards
+	// connections to the local NATS server.
+	if m.natsPort > 0 {
+		vsockUDSPath := socketPath + ".vsock"
+		fwd := NewVsockForwarder(
+			vsockUDSPath,
+			m.natsPort,
+			fmt.Sprintf("127.0.0.1:%d", m.natsPort),
+			m.logger.With("agent_id", agentID),
+		)
+		if err := fwd.Start(context.Background()); err != nil {
+			m.logger.Warn("failed to start vsock forwarder, VM will lack NATS connectivity",
+				"agent_id", agentID,
+				"error", err,
+			)
+			// Non-fatal: the VM can still boot, but the sidecar won't be able
+			// to reach NATS. Log and continue.
+		} else {
+			m.mu.Lock()
+			m.forwarders[agentID] = fwd
+			m.mu.Unlock()
+		}
+	}
+
 	// Start (boot) the VM.
 	if err := m.hypervisor.StartVM(socketPath); err != nil {
+		// Clean up the vsock forwarder if we started one.
+		m.stopForwarder(agentID)
 		os.Remove(rootfsCopy) // T1-05: clean up rootfs copy on failure
 		return m.failAgent(agentState, fmt.Errorf("starting VM for agent %s: %w", agentID, err))
 	}
@@ -239,6 +340,9 @@ func (m *Manager) StopAgent(agentID string) error {
 		return fmt.Errorf("setting agent state to STOPPING: %w", err)
 	}
 
+	// Stop the vsock forwarder for this agent.
+	m.stopForwarder(agentID)
+
 	// Stop the VM via the hypervisor.
 	if err := m.hypervisor.StopVM(agentState.VMSocketPath, agentState.VMPID); err != nil {
 		return m.failAgent(agentState, fmt.Errorf("stopping VM for agent %s: %w", agentID, err))
@@ -268,6 +372,9 @@ func (m *Manager) DestroyAgent(agentID string) error {
 	}
 
 	m.logger.Info("destroying agent", "agent_id", agentID)
+
+	// Stop the vsock forwarder for this agent.
+	m.stopForwarder(agentID)
 
 	// If the VM is still running or starting, forcefully destroy it.
 	if agentState.Status == state.AgentStatusRunning ||
@@ -436,6 +543,37 @@ func (m *Manager) ReconcileOnStartup() error {
 	return nil
 }
 
+// stopForwarder stops and removes the VsockForwarder for the given agent, if one exists.
+func (m *Manager) stopForwarder(agentID string) {
+	m.mu.Lock()
+	fwd, ok := m.forwarders[agentID]
+	if ok {
+		delete(m.forwarders, agentID)
+	}
+	m.mu.Unlock()
+
+	if ok && fwd != nil {
+		fwd.Stop()
+		m.logger.Info("vsock forwarder stopped", "agent_id", agentID)
+	}
+}
+
+// StopAllForwarders stops all active VsockForwarders. Called during Manager shutdown.
+func (m *Manager) StopAllForwarders() {
+	m.mu.Lock()
+	fwds := make(map[string]*VsockForwarder, len(m.forwarders))
+	for k, v := range m.forwarders {
+		fwds[k] = v
+	}
+	m.forwarders = make(map[string]*VsockForwarder)
+	m.mu.Unlock()
+
+	for agentID, fwd := range fwds {
+		fwd.Stop()
+		m.logger.Info("vsock forwarder stopped during shutdown", "agent_id", agentID)
+	}
+}
+
 // resolveResources extracts memory (in MB) and vCPU count from the agent
 // manifest, using defaults if not specified.
 func (m *Manager) resolveResources(agent *types.AgentManifest) (memoryMB int, vcpus int, err error) {
@@ -478,20 +616,45 @@ func (m *Manager) failAgent(agentState *state.AgentState, cause error) error {
 // createAgentDriveImage creates an ext4 disk image from an agent's directory
 // contents. The image can be attached as a secondary Firecracker drive.
 // T1-02: Firecracker requires block device images, not directories.
+//
+// This implementation uses mkfs.ext4 -d to populate the filesystem directly
+// from the source directory without requiring mount/umount (which need root or
+// CAP_SYS_ADMIN). The -d flag was introduced in e2fsprogs 1.43 (2016).
+//
+// If mkfs.ext4 is not found in PATH (e.g. on macOS during development), an
+// empty placeholder file is created instead. The mock hypervisor used in tests
+// never reads the drive image, so this is safe for development and CI on
+// non-Linux platforms.
 func createAgentDriveImage(agentDir, imgPath string) error {
+	mkfsPath, err := exec.LookPath("mkfs.ext4")
+	if err != nil {
+		// mkfs.ext4 is not available (e.g. macOS). Create an empty placeholder
+		// so that the rest of the startup path can proceed. Real deployments on
+		// Linux will always have mkfs.ext4 via e2fsprogs.
+		slog.Warn("mkfs.ext4 not found in PATH; creating empty agent drive placeholder",
+			"agent_dir", agentDir,
+			"img_path", imgPath,
+		)
+		f, createErr := os.Create(imgPath)
+		if createErr != nil {
+			return fmt.Errorf("creating agent drive placeholder: %w", createErr)
+		}
+		return f.Close()
+	}
+
 	// Calculate the size needed (minimum 4MB to fit ext4 metadata).
 	var totalSize int64
-	err := filepath.Walk(agentDir, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	walkErr := filepath.Walk(agentDir, func(_ string, info os.FileInfo, walkEntryErr error) error {
+		if walkEntryErr != nil {
+			return walkEntryErr
 		}
 		if !info.IsDir() {
 			totalSize += info.Size()
 		}
 		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("calculating agent directory size: %w", err)
+	if walkErr != nil {
+		return fmt.Errorf("calculating agent directory size: %w", walkErr)
 	}
 
 	// Add padding for ext4 metadata and overhead (at least 4MB).
@@ -500,58 +663,21 @@ func createAgentDriveImage(agentDir, imgPath string) error {
 		imgSizeMB = 4
 	}
 
-	// Create a sparse file of the right size.
-	f, err := os.Create(imgPath)
-	if err != nil {
-		return fmt.Errorf("creating image file: %w", err)
-	}
-	if err := f.Truncate(imgSizeMB * 1024 * 1024); err != nil {
-		f.Close()
+	// mkfs.ext4 -d <source_dir> populates the filesystem from the directory
+	// without requiring a loop mount. The size argument is in 1K blocks.
+	sizeBlocks := fmt.Sprintf("%dk", imgSizeMB*1024)
+	mkfs := exec.Command(mkfsPath, "-q", "-F", "-d", agentDir, imgPath, sizeBlocks)
+	if out, runErr := mkfs.CombinedOutput(); runErr != nil {
 		os.Remove(imgPath)
-		return fmt.Errorf("sizing image file: %w", err)
-	}
-	f.Close()
-
-	// Format as ext4.
-	mkfs := exec.Command("mkfs.ext4", "-q", "-F", imgPath)
-	if out, err := mkfs.CombinedOutput(); err != nil {
-		os.Remove(imgPath)
-		return fmt.Errorf("mkfs.ext4: %s: %w", string(out), err)
-	}
-
-	// Mount, copy files, unmount.
-	mountPoint, err := os.MkdirTemp("", "hive-agent-mount-*")
-	if err != nil {
-		os.Remove(imgPath)
-		return fmt.Errorf("creating mount point: %w", err)
-	}
-	defer os.RemoveAll(mountPoint)
-
-	mount := exec.Command("mount", "-o", "loop", imgPath, mountPoint)
-	if out, err := mount.CombinedOutput(); err != nil {
-		os.Remove(imgPath)
-		return fmt.Errorf("mounting image: %s: %w", string(out), err)
-	}
-
-	// Copy agent files into the mounted image.
-	cp := exec.Command("cp", "-a", agentDir+"/.", mountPoint+"/")
-	if out, err := cp.CombinedOutput(); err != nil {
-		exec.Command("umount", mountPoint).Run()
-		os.Remove(imgPath)
-		return fmt.Errorf("copying agent files: %s: %w", string(out), err)
-	}
-
-	umount := exec.Command("umount", mountPoint)
-	if out, err := umount.CombinedOutput(); err != nil {
-		os.Remove(imgPath)
-		return fmt.Errorf("unmounting image: %s: %w", string(out), err)
+		return fmt.Errorf("mkfs.ext4 -d: %s: %w", string(out), runErr)
 	}
 
 	return nil
 }
 
-// copyFile copies a regular file from src to dst. It creates dst if it does
-// not exist, or truncates it if it does.
+// copyFile copies a regular file from src to dst atomically. It writes to a
+// temporary file (dst + ".tmp") first, syncs, then renames to dst. This
+// prevents a partial rootfs if hived crashes mid-copy.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -559,18 +685,35 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	out, err := os.Create(dst)
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("creating destination %s: %w", dst, err)
+		return fmt.Errorf("creating temp file %s: %w", tmp, err)
 	}
-	defer func() {
-		if cerr := out.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("closing destination %s: %w", dst, cerr)
-		}
-	}()
 
 	if _, err = io.Copy(out, in); err != nil {
-		return fmt.Errorf("copying %s to %s: %w", src, dst, err)
+		out.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("copying %s to %s: %w", src, tmp, err)
+	}
+
+	// Flush to disk before renaming so the data is durable.
+	if err = out.Sync(); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("syncing temp file %s: %w", tmp, err)
+	}
+
+	if err = out.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("closing temp file %s: %w", tmp, err)
+	}
+
+	// Atomic rename: on the same filesystem this is guaranteed to either
+	// fully succeed or leave dst unchanged.
+	if err = os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("renaming %s to %s: %w", tmp, dst, err)
 	}
 
 	return nil

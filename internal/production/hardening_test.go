@@ -448,15 +448,16 @@ func TestResourceMonitor_RecordsMetrics(t *testing.T) {
 		Store:         store,
 		Metrics:       metrics,
 		Logger:        logger,
-		CheckInterval: 50 * time.Millisecond,
+		CheckInterval: 500 * time.Millisecond,
 	})
 
 	if err := rm.Start(); err != nil {
 		t.Fatalf("failed to start resource monitor: %v", err)
 	}
 
-	// Wait for at least one check cycle.
-	time.Sleep(200 * time.Millisecond)
+	// Wait for at least one check cycle. On Linux, CPU measurement takes
+	// ~200ms per sample so we need a longer wait.
+	time.Sleep(1500 * time.Millisecond)
 	rm.Stop()
 
 	// Verify metrics were recorded.
@@ -469,4 +470,113 @@ func TestResourceMonitor_RecordsMetrics(t *testing.T) {
 	if _, ok := metrics.cpu["node-1"]; !ok {
 		t.Error("expected CPU metrics for node-1")
 	}
+}
+
+func TestSystemMemoryUsage_ReturnsNonZero(t *testing.T) {
+	percent, total, used, err := systemMemoryUsage()
+	if err != nil {
+		t.Fatalf("systemMemoryUsage() failed: %v", err)
+	}
+
+	if total <= 0 {
+		t.Errorf("expected positive total bytes, got %d", total)
+	}
+	if used < 0 {
+		t.Errorf("expected non-negative used bytes, got %d", used)
+	}
+	if percent < 0 || percent > 100 {
+		t.Errorf("expected percent in [0,100], got %.2f", percent)
+	}
+
+	t.Logf("memory: %.1f%% used (%d / %d bytes)", percent, used, total)
+}
+
+func TestSystemCPUUsage_ReturnsBounded(t *testing.T) {
+	percent, err := systemCPUUsage()
+	if err != nil {
+		t.Fatalf("systemCPUUsage() failed: %v", err)
+	}
+
+	if percent < 0 || percent > 100 {
+		t.Errorf("expected percent in [0,100], got %.2f", percent)
+	}
+
+	t.Logf("cpu: %.1f%%", percent)
+}
+
+func TestSystemCPUCount_ReturnsPositive(t *testing.T) {
+	count := systemCPUCount()
+	if count <= 0 {
+		t.Errorf("expected positive CPU count, got %d", count)
+	}
+	t.Logf("cpu count: %d", count)
+}
+
+func TestComputeUsage_LocalNodeUsesRealData(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	rm := NewResourceMonitor(MonitorConfig{
+		Logger: logger,
+	})
+
+	// Create a node that matches the local system's CPU count so it is
+	// detected as the local node.
+	localNode := &types.NodeState{
+		ID:     "local",
+		Status: types.NodeStatusOnline,
+		Resources: types.NodeResources{
+			MemoryTotal: 16 * 1024 * 1024 * 1024,
+			CPUCount:    systemCPUCount(),
+		},
+		Agents: []string{"agent-1"},
+	}
+
+	memPct, cpuPct := rm.computeUsage(localNode)
+
+	// Memory should be non-zero since the Go runtime itself uses memory.
+	if memPct <= 0 {
+		t.Errorf("expected positive memory percent for local node, got %.2f", memPct)
+	}
+	// CPU percent should be in valid range (may be 0 on very idle systems).
+	if cpuPct < 0 || cpuPct > 100 {
+		t.Errorf("expected CPU percent in [0,100], got %.2f", cpuPct)
+	}
+
+	t.Logf("local node: mem=%.1f%%, cpu=%.1f%%", memPct, cpuPct)
+}
+
+func TestComputeUsage_RemoteNodeUsesEstimate(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	rm := NewResourceMonitor(MonitorConfig{
+		Logger: logger,
+	})
+
+	// Create a node with a CPU count that will not match the local system
+	// (use 9999 CPUs which no real system has).
+	remoteNode := &types.NodeState{
+		ID:     "remote",
+		Status: types.NodeStatusOnline,
+		Resources: types.NodeResources{
+			MemoryTotal: 8 * 1024 * 1024 * 1024, // 8GB
+			CPUCount:    9999,
+		},
+		Agents: []string{"agent-1", "agent-2"},
+	}
+
+	memPct, cpuPct := rm.computeUsage(remoteNode)
+
+	// For a remote node with 2 agents and 8GB, memory estimate should be
+	// 2 * 512MB / 8GB = ~12.5%.
+	expectedMem := float64(2*512*1024*1024) / float64(8*1024*1024*1024) * 100.0
+	if memPct < expectedMem-0.1 || memPct > expectedMem+0.1 {
+		t.Errorf("expected memory ~%.1f%%, got %.1f%%", expectedMem, memPct)
+	}
+
+	// CPU estimate: 2 agents / 9999 CPUs * 25 = ~0.005%.
+	if cpuPct < 0 || cpuPct > 1 {
+		t.Errorf("expected very low CPU percent for remote node, got %.4f%%", cpuPct)
+	}
+
+	t.Logf("remote node: mem=%.1f%%, cpu=%.4f%%", memPct, cpuPct)
 }

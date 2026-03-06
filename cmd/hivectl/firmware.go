@@ -89,8 +89,9 @@ func firmwareBuildCmd() *cobra.Command {
 
 func firmwareFlashCmd() *cobra.Command {
 	var (
-		port string
-		baud int
+		port       string
+		baud       int
+		binaryPath string
 	)
 
 	cmd := &cobra.Command{
@@ -118,7 +119,18 @@ func firmwareFlashCmd() *cobra.Command {
 			}
 
 			platform := firmware.Platform(agent.Spec.Firmware.Platform)
-			binaryPath := filepath.Join(absRoot, "agents", agentID, "firmware", "build", "firmware.bin")
+
+			// If --binary is not provided, derive the path from the platform's
+			// default output location under the agent's build directory.
+			if binaryPath == "" {
+				outputDir := filepath.Join(absRoot, "agents", agentID, "firmware", "build")
+				binaryPath, err = firmware.DefaultBinaryPath(platform, outputDir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Hint: use --binary to specify the firmware binary path explicitly.\n")
+					os.Exit(1)
+				}
+			}
 
 			if err := firmware.Flash(firmware.FlashConfig{
 				AgentID:    agentID,
@@ -139,6 +151,7 @@ func firmwareFlashCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&port, "port", "", "Serial port (e.g., /dev/ttyUSB0)")
 	cmd.Flags().IntVar(&baud, "baud", 460800, "Flash baud rate")
+	cmd.Flags().StringVar(&binaryPath, "binary", "", "Path to firmware binary (overrides auto-detected path)")
 
 	return cmd
 }

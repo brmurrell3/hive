@@ -458,7 +458,7 @@ func (c *Client) handleSubscribe(data []byte) error {
 	// Send SUBACK
 	suback := []byte{0x90}
 	remainLen := 2 + len(qosResults)
-	suback = append(suback, byte(remainLen))
+	suback = append(suback, encodeRemainingLength(remainLen)...)
 	suback = append(suback, packetID...)
 	suback = append(suback, qosResults...)
 	c.conn.Write(suback)
@@ -534,15 +534,25 @@ func (b *Bridge) subscribeNATS() error {
 }
 
 // mqttTopicToNATSSubject converts an MQTT topic to a NATS subject.
+// In addition to replacing / with ., it translates MQTT wildcards:
+//   - MQTT '+' (single-level wildcard) becomes NATS '*'
+//   - MQTT '#' (multi-level wildcard) becomes NATS '>'
 func mqttTopicToNATSSubject(topic string) string {
-	// Direct mapping: replace / with .
 	subject := strings.ReplaceAll(topic, "/", ".")
+	subject = strings.ReplaceAll(subject, "+", "*")
+	subject = strings.ReplaceAll(subject, "#", ">")
 	return subject
 }
 
 // natsSubjectToMQTTTopic converts a NATS subject to an MQTT topic.
+// In addition to replacing . with /, it translates NATS wildcards:
+//   - NATS '*' (single-token wildcard) becomes MQTT '+'
+//   - NATS '>' (multi-token wildcard) becomes MQTT '#'
 func natsSubjectToMQTTTopic(subject string) string {
-	return strings.ReplaceAll(subject, ".", "/")
+	topic := strings.ReplaceAll(subject, ".", "/")
+	topic = strings.ReplaceAll(topic, "*", "+")
+	topic = strings.ReplaceAll(topic, ">", "#")
+	return topic
 }
 
 // readMQTTString reads a length-prefixed UTF-8 string from MQTT packet data.

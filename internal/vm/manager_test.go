@@ -26,7 +26,8 @@ func testManager(t *testing.T) (*Manager, *MockHypervisor, *state.Store) {
 		t.Fatal(err)
 	}
 	mock := NewMockHypervisor()
-	mgr := NewManager(dir, store, logger, mock)
+	mgr := NewManager(dir, store, logger, mock, 0, "")
+	mgr.skipSocketPathValidation = true // temp dirs on macOS exceed the 104-byte limit
 
 	// Set up the directory structure and dummy files that StartAgent expects.
 	// It needs rootfs/vmlinux and rootfs/rootfs.ext4 to exist for the copy.
@@ -759,4 +760,123 @@ func TestMultipleAgents_RunningCount(t *testing.T) {
 	if mock.RunningCount() != 2 {
 		t.Errorf("RunningCount = %d, want 2 after stopping one", mock.RunningCount())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Socket path length validation
+// ---------------------------------------------------------------------------
+
+func TestStartAgent_SocketPathTooLong(t *testing.T) {
+	// Create a manager with a deliberately long cluster root so the derived
+	// socket path exceeds MaxSocketPathLen. We enable the validation check
+	// by leaving skipSocketPathValidation as false.
+	dir := t.TempDir()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	store, err := state.NewStore(filepath.Join(dir, "state.json"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := NewMockHypervisor()
+
+	// Build a cluster root that is long enough to exceed the socket path limit.
+	// The full socket path is: {clusterRoot}/.state/agents/{agentID}/firecracker.sock.vsock
+	// which adds ~50 bytes to the cluster root. We need a root longer than
+	// MaxSocketPathLen - 50 to trigger the validation.
+	longDir := filepath.Join(dir, "a-very-long-directory-name-that-will-push-the-socket-path-over-the-maximum-allowed-length-for-unix-domain-sockets")
+	if err := os.MkdirAll(longDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up rootfs files so the manager gets past earlier checks.
+	rootfsDir := filepath.Join(longDir, "rootfs")
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "vmlinux"), []byte("fake-kernel"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "rootfs.ext4"), []byte("fake-rootfs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewManager(longDir, store, logger, mock, 0, "")
+	// Do NOT set skipSocketPathValidation - we want the validation to fire.
+
+	err = mgr.StartAgent(testAgent("test-agent"))
+	if err == nil {
+		t.Fatal("expected error for socket path too long, got nil")
+	}
+
+	// Verify the error message mentions the path length issue.
+	errMsg := err.Error()
+	if !contains(errMsg, "unix socket path too long") {
+		t.Errorf("error = %q, expected it to mention 'unix socket path too long'", errMsg)
+	}
+
+	// Agent should be in FAILED state.
+	agentState := store.GetAgent("test-agent")
+	if agentState == nil {
+		t.Fatal("agent not found after failed start")
+	}
+	if agentState.Status != state.AgentStatusFailed {
+		t.Errorf("Status = %q, want %q", agentState.Status, state.AgentStatusFailed)
+	}
+}
+
+func TestStartAgent_SocketPathShortEnough(t *testing.T) {
+	// Use a short cluster root that is well within the limit.
+	dir := "/tmp/hv"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Skipf("cannot create %s: %v", dir, err)
+	}
+	defer os.RemoveAll(dir)
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	statePath := filepath.Join(dir, "state.json")
+	store, err := state.NewStore(statePath, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up rootfs files.
+	rootfsDir := filepath.Join(dir, "rootfs")
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "vmlinux"), []byte("fake-kernel"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "rootfs.ext4"), []byte("fake-rootfs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := NewMockHypervisor()
+	mgr := NewManager(dir, store, logger, mock, 0, "")
+	// Do NOT skip validation - the short path should pass.
+
+	if err := mgr.StartAgent(testAgent("a")); err != nil {
+		t.Fatalf("StartAgent should succeed with short path: %v", err)
+	}
+
+	agentState := store.GetAgent("a")
+	if agentState == nil {
+		t.Fatal("agent not found after start")
+	}
+	if agentState.Status != state.AgentStatusRunning {
+		t.Errorf("Status = %q, want %q", agentState.Status, state.AgentStatusRunning)
+	}
+}
+
+// contains reports whether s contains substr.
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
+
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

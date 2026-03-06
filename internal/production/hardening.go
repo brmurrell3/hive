@@ -479,32 +479,94 @@ func (rm *ResourceMonitor) check() {
 }
 
 // computeUsage calculates memory and CPU usage percentages for a node.
-// This is a placeholder that returns values based on the node's agent count
-// relative to its total resources. In production, this would use actual
-// runtime metrics reported by the node.
+// For the local node (detected by matching CPU count), it reads actual system
+// resource data. For remote nodes, it falls back to the node's reported
+// resource data if available, or returns zero.
 func (rm *ResourceMonitor) computeUsage(node *types.NodeState) (memPercent, cpuPercent float64) {
 	// If the node has no resources reported, return zero.
 	if node.Resources.MemoryTotal <= 0 {
 		return 0, 0
 	}
 
-	// Estimate memory usage based on the number of agents running on this
-	// node. Each agent VM uses approximately 512MB by default. This is a
-	// rough estimate; real monitoring would use actual process stats.
-	agentCount := len(node.Agents)
-	memUsedEstimate := int64(agentCount) * 512 * 1024 * 1024
-	memPercent = float64(memUsedEstimate) / float64(node.Resources.MemoryTotal) * 100.0
-	if memPercent > 100 {
-		memPercent = 100
-	}
+	// Determine if this is the local node by comparing CPU count to the
+	// system's CPU count. This is a heuristic; in multi-node setups, nodes
+	// report their own metrics via heartbeats.
+	isLocal := node.Resources.CPUCount == systemCPUCount()
 
-	// Estimate CPU usage based on agent count vs CPU count.
-	if node.Resources.CPUCount > 0 {
-		cpuPercent = float64(agentCount) / float64(node.Resources.CPUCount) * 25.0 // rough 25% per agent
-		if cpuPercent > 100 {
-			cpuPercent = 100
-		}
+	if isLocal {
+		memPercent, cpuPercent = rm.computeLocalUsage(node)
+	} else {
+		memPercent, cpuPercent = rm.computeRemoteUsage(node)
 	}
 
 	return memPercent, cpuPercent
+}
+
+// computeLocalUsage reads actual system resource data from the host OS.
+func (rm *ResourceMonitor) computeLocalUsage(node *types.NodeState) (memPercent, cpuPercent float64) {
+	// Read actual memory usage from the OS.
+	memPct, _, _, err := systemMemoryUsage()
+	if err != nil {
+		rm.logger.Warn("failed to read system memory usage, falling back to estimate",
+			"node_id", node.ID,
+			"error", err,
+		)
+		memPercent = rm.estimateMemoryFromAgents(node)
+	} else {
+		memPercent = memPct
+	}
+
+	// Read actual CPU usage from the OS.
+	cpuPct, err := systemCPUUsage()
+	if err != nil {
+		rm.logger.Warn("failed to read system CPU usage, falling back to estimate",
+			"node_id", node.ID,
+			"error", err,
+		)
+		cpuPercent = rm.estimateCPUFromAgents(node)
+	} else {
+		cpuPercent = cpuPct
+	}
+
+	return memPercent, cpuPercent
+}
+
+// computeRemoteUsage estimates resource usage for a remote node based on
+// its agent count. In a full deployment, remote nodes report actual usage
+// via heartbeats. This provides a fallback estimate when real data is
+// unavailable.
+func (rm *ResourceMonitor) computeRemoteUsage(node *types.NodeState) (memPercent, cpuPercent float64) {
+	memPercent = rm.estimateMemoryFromAgents(node)
+	cpuPercent = rm.estimateCPUFromAgents(node)
+	return memPercent, cpuPercent
+}
+
+// estimateMemoryFromAgents estimates memory usage based on agent count.
+// Each agent VM uses approximately 512MB. This is only used as a fallback
+// when actual system readings are unavailable.
+func (rm *ResourceMonitor) estimateMemoryFromAgents(node *types.NodeState) float64 {
+	if node.Resources.MemoryTotal <= 0 {
+		return 0
+	}
+	agentCount := len(node.Agents)
+	memUsedEstimate := int64(agentCount) * 512 * 1024 * 1024
+	pct := float64(memUsedEstimate) / float64(node.Resources.MemoryTotal) * 100.0
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
+}
+
+// estimateCPUFromAgents estimates CPU usage based on agent count vs CPU count.
+// This is only used as a fallback when actual system readings are unavailable.
+func (rm *ResourceMonitor) estimateCPUFromAgents(node *types.NodeState) float64 {
+	if node.Resources.CPUCount <= 0 {
+		return 0
+	}
+	agentCount := len(node.Agents)
+	pct := float64(agentCount) / float64(node.Resources.CPUCount) * 25.0
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
 }

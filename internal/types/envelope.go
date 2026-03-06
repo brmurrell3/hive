@@ -54,6 +54,8 @@ const (
 	MessageTypeCapabilityRequest  MessageType = "capability-request"
 	MessageTypeCapabilityResponse MessageType = "capability-response"
 	MessageTypeError              MessageType = "error"
+	MessageTypeMemoryUpdate       MessageType = "memory-update"
+	MessageTypeNodeHeartbeat      MessageType = "node-heartbeat"
 )
 
 // ValidMessageTypes is the set of valid message types.
@@ -67,6 +69,26 @@ var ValidMessageTypes = map[MessageType]bool{
 	MessageTypeCapabilityRequest:  true,
 	MessageTypeCapabilityResponse: true,
 	MessageTypeError:              true,
+	MessageTypeMemoryUpdate:       true,
+	MessageTypeNodeHeartbeat:      true,
+}
+
+// Validate checks that the envelope has the required fields populated:
+// ID, From, Type must be non-empty, and Timestamp must be non-zero.
+func (e *Envelope) Validate() error {
+	if e.ID == "" {
+		return fmt.Errorf("envelope validation: ID is required")
+	}
+	if e.From == "" {
+		return fmt.Errorf("envelope validation: From is required")
+	}
+	if e.Type == "" {
+		return fmt.Errorf("envelope validation: Type is required")
+	}
+	if e.Timestamp.IsZero() {
+		return fmt.Errorf("envelope validation: Timestamp is required")
+	}
+	return nil
 }
 
 // HealthPayload represents the payload of a health message.

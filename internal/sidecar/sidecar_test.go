@@ -277,28 +277,30 @@ func TestCapabilitiesEndpoint_EmptyList(t *testing.T) {
 // POST /capabilities/{name}/invoke endpoint
 // ---------------------------------------------------------------------------
 
-func TestCapabilityInvoke_ReturnsNotImplemented(t *testing.T) {
+func TestCapabilityInvoke_NoRouter(t *testing.T) {
 	caps := []Capability{
 		{Name: "test-cap", Description: "A test capability"},
 	}
 	s := newTestSidecar(caps)
+	// capRouter is nil in unit tests (no NATS connection), so the handler
+	// returns 503 with an error indicating the router is not ready.
 	mux := testMux(s)
 
 	req := httptest.NewRequest("POST", "/capabilities/test-cap/invoke", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("POST /capabilities/test-cap/invoke status = %d, want %d", w.Code, http.StatusOK)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /capabilities/test-cap/invoke status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 
-	var resp invokeResponse
+	var resp map[string]string
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to unmarshal invoke response: %v", err)
 	}
 
-	if resp.Status != "not_implemented" {
-		t.Errorf("invoke status = %q, want %q", resp.Status, "not_implemented")
+	if resp["error"] != "capability router not ready" {
+		t.Errorf("error = %q, want %q", resp["error"], "capability router not ready")
 	}
 }
 

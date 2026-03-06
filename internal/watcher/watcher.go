@@ -20,6 +20,7 @@ type Watcher struct {
 	logger      *slog.Logger
 	onChange    func(agentID string, content []byte)
 	stopCh      chan struct{}
+	stopOnce    sync.Once
 
 	// debounce tracks pending debounce timers per agent ID so that rapid
 	// successive writes coalesce into a single onChange invocation.
@@ -97,23 +98,28 @@ func (w *Watcher) Start() error {
 }
 
 // Stop shuts down the watcher and releases all resources.
+// It is safe to call Stop multiple times; only the first call takes effect.
 func (w *Watcher) Stop() error {
-	close(w.stopCh)
+	var stopErr error
+	w.stopOnce.Do(func() {
+		close(w.stopCh)
 
-	// Cancel any pending debounce timers.
-	w.mu.Lock()
-	for _, t := range w.debounce {
-		t.Stop()
-	}
-	w.debounce = nil
-	w.mu.Unlock()
+		// Cancel any pending debounce timers.
+		w.mu.Lock()
+		for _, t := range w.debounce {
+			t.Stop()
+		}
+		w.debounce = nil
+		w.mu.Unlock()
 
-	if err := w.fsWatcher.Close(); err != nil {
-		return fmt.Errorf("closing fsnotify watcher: %w", err)
-	}
+		if err := w.fsWatcher.Close(); err != nil {
+			stopErr = fmt.Errorf("closing fsnotify watcher: %w", err)
+			return
+		}
 
-	w.logger.Info("memory watcher stopped")
-	return nil
+		w.logger.Info("memory watcher stopped")
+	})
+	return stopErr
 }
 
 // eventLoop processes fsnotify events until the stop channel is closed.
@@ -138,10 +144,11 @@ func (w *Watcher) eventLoop() {
 	}
 }
 
-// handleEvent processes a single fsnotify event. Only Write events are acted
-// upon; all other event types are ignored.
+// handleEvent processes a single fsnotify event. Write and Create events are
+// acted upon (Create handles editor atomic saves); all other event types are
+// ignored.
 func (w *Watcher) handleEvent(event fsnotify.Event) {
-	if !event.Has(fsnotify.Write) {
+	if !event.Has(fsnotify.Write) && !event.Has(fsnotify.Create) {
 		return
 	}
 

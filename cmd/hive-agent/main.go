@@ -53,6 +53,7 @@ func joinCmd() *cobra.Command {
 		runtimeArgs  string
 		workDir      string
 		httpAddr     string
+		natsToken    string
 	)
 
 	cmd := &cobra.Command{
@@ -73,7 +74,7 @@ func joinCmd() *cobra.Command {
 				return fmt.Errorf("--agent-id is required")
 			}
 
-			return runJoin(logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr)
+			return runJoin(logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr, natsToken)
 		},
 	}
 
@@ -84,11 +85,12 @@ func joinCmd() *cobra.Command {
 	cmd.Flags().StringVar(&runtimeArgs, "runtime-args", "", "Comma-separated arguments for the runtime command")
 	cmd.Flags().StringVar(&workDir, "work-dir", "/var/lib/hive/workspace", "Working directory for the runtime")
 	cmd.Flags().StringVar(&httpAddr, "http-addr", ":9100", "HTTP API listen address")
+	cmd.Flags().StringVar(&natsToken, "nats-token", "", "NATS authentication token")
 
 	return cmd
 }
 
-func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr string) error {
+func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr, natsToken string) error {
 	logger.Info("joining cluster",
 		"control_plane", controlPlane,
 		"agent_id", agentID,
@@ -98,11 +100,16 @@ func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runt
 	natsURL := fmt.Sprintf("nats://%s", controlPlane)
 
 	// Connect to NATS first to send the join request
-	nc, err := nats.Connect(natsURL,
+	natsOpts := []nats.Option{
 		nats.Name(fmt.Sprintf("hive-agent-%s", agentID)),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
 		nats.MaxReconnects(-1),
-	)
+	}
+	if natsToken != "" {
+		natsOpts = append(natsOpts, nats.Token(natsToken))
+	}
+
+	nc, err := nats.Connect(natsURL, natsOpts...)
 	if err != nil {
 		return fmt.Errorf("connecting to NATS at %s: %w", natsURL, err)
 	}
@@ -154,6 +161,7 @@ func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runt
 	cfg := sidecar.Config{
 		AgentID:        agentID,
 		NATSUrl:        natsURL,
+		NATSToken:      natsToken,
 		HTTPAddr:       httpAddr,
 		RuntimeCmd:     runtimeCmd,
 		RuntimeArgs:    rtArgs,

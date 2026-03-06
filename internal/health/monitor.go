@@ -23,6 +23,7 @@ type Monitor struct {
 
 	mu          sync.Mutex
 	lastSeen    map[string]time.Time // agentID → last heartbeat time
+	inRestart   map[string]struct{}  // agentIDs currently being restarted
 	sub         *nats.Subscription
 	stopCh      chan struct{}
 	stopOnce    sync.Once // T3-01: prevent double-close panic
@@ -44,6 +45,7 @@ func NewMonitor(store *state.Store, nc *nats.Conn, interval time.Duration, maxFa
 		interval:    interval,
 		maxFailures: maxFailures,
 		lastSeen:    make(map[string]time.Time),
+		inRestart:   make(map[string]struct{}),
 		stopCh:      make(chan struct{}),
 	}
 }
@@ -177,21 +179,59 @@ func (m *Monitor) checkAgents() {
 	}
 }
 
+// markUnhealthy is called with m.mu held. It updates the agent status to
+// FAILED in the state store and, if a RestartManager is configured, launches
+// the restart in a background goroutine so that the mutex is released
+// immediately and heartbeat processing is never blocked by backoff sleeps.
+//
+// The inRestart set prevents launching multiple concurrent restarts for the
+// same agent; the goroutine removes the entry when it finishes.
 func (m *Monitor) markUnhealthy(agentID string) {
+	// Update state: transition to FAILED and record the error reason.
 	agent := m.store.GetAgent(agentID)
 	if agent == nil {
 		return
 	}
 
+	agent.Status = state.AgentStatusFailed
 	agent.Error = "heartbeat timeout: agent marked unhealthy"
+	agent.LastTransition = time.Now()
 	if err := m.store.SetAgent(agent); err != nil {
 		m.logger.Error("failed to update agent state", "agent_id", agentID, "error", err)
 	}
 
-	// T2-01: Invoke the restart manager if configured.
-	if m.restartManager != nil {
+	// T2-01: Invoke the restart manager asynchronously so the caller's mutex
+	// is released immediately (backoff in HandleUnhealthy can be long).
+	if m.restartManager == nil {
+		return
+	}
+
+	// Guard against duplicate concurrent restarts for the same agent.
+	if _, alreadyRestarting := m.inRestart[agentID]; alreadyRestarting {
+		m.logger.Debug("restart already in progress, skipping", "agent_id", agentID)
+		return
+	}
+	m.inRestart[agentID] = struct{}{}
+
+	go func() {
+		defer func() {
+			m.mu.Lock()
+			delete(m.inRestart, agentID)
+			m.mu.Unlock()
+		}()
+
 		if err := m.restartManager.HandleUnhealthy(agentID); err != nil {
 			m.logger.Error("restart manager error", "agent_id", agentID, "error", err)
 		}
-	}
+	}()
+}
+
+// RemoveAgent cleans up monitor state for a destroyed agent. Call this
+// whenever an agent is removed so that the lastSeen map does not grow
+// without bound over the lifetime of hived.
+func (m *Monitor) RemoveAgent(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.lastSeen, id)
+	delete(m.inRestart, id)
 }

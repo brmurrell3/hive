@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // FlashConfig holds firmware flashing configuration.
@@ -60,10 +61,10 @@ func Flash(cfg FlashConfig) error {
 }
 
 func flashESPIDF(cfg FlashConfig, baud int) error {
-	cmd := exec.Command("idf.py",
-		"-p", cfg.Port,
-		"-b", fmt.Sprintf("%d", baud),
-		"flash",
+	cmd := exec.Command("esptool.py",
+		"--port", cfg.Port,
+		"--baud", fmt.Sprintf("%d", baud),
+		"write_flash", "0x10000", cfg.BinaryPath,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -95,7 +96,8 @@ func flashPicoSDK(cfg FlashConfig) error {
 
 func flashZephyr(cfg FlashConfig) error {
 	cmd := exec.Command("west", "flash",
-		"--build-dir", cfg.BinaryPath,
+		"--build-dir", filepath.Dir(cfg.BinaryPath),
+		"--bin-file", cfg.BinaryPath,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

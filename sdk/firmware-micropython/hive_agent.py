@@ -35,16 +35,15 @@ def _rfc3339_utc():
     """Return an RFC 3339 UTC timestamp string from the system clock.
 
     MicroPython's time.time() returns seconds since 2000-01-01 on most ports.
-    We offset to Unix epoch (1970-01-01) and format manually to avoid pulling
-    in any datetime library.
+    gmtime() expects and returns values relative to that same epoch, with the
+    year field already being the correct calendar year (e.g. 2026).  We call
+    gmtime() directly without any offset and format the result.
     """
-    # Offset between 2000-01-01 and 1970-01-01 in seconds.
-    _EPOCH_OFFSET = 946684800
     try:
         from utime import gmtime
     except ImportError:
         from time import gmtime
-    t = time() + _EPOCH_OFFSET
+    t = time()
     tm = gmtime(t) if callable(gmtime) else None  # pragma: no cover
     if tm is None:
         # Fallback: just return epoch seconds as string.
@@ -130,18 +129,18 @@ class HiveAgent:
         self._client.connect()
 
         # Subscribe to agent inbox.
-        self._client.subscribe(b"hive/agent/{}/inbox".format(self.agent_id))
+        self._client.subscribe("hive/agent/{}/inbox".format(self.agent_id).encode())
 
         # Subscribe to control channel.
-        self._client.subscribe(b"hive/control/{}".format(self.agent_id))
+        self._client.subscribe("hive/control/{}".format(self.agent_id).encode())
 
         # Subscribe to join status.
-        self._client.subscribe(b"hive/join/status/{}".format(self.agent_id))
+        self._client.subscribe("hive/join/status/{}".format(self.agent_id).encode())
 
         # If team_id is set, subscribe to team broadcast.
         if self.team_id:
             self._client.subscribe(
-                b"hive/team/{}/broadcast".format(self.team_id)
+                "hive/team/{}/broadcast".format(self.team_id).encode()
             )
 
         # Publish join request.
@@ -488,14 +487,14 @@ class HiveAgent:
             self._client.connect()
             # Re-subscribe to all topics.
             self._client.subscribe(
-                b"hive/agent/{}/inbox".format(self.agent_id)
+                "hive/agent/{}/inbox".format(self.agent_id).encode()
             )
             self._client.subscribe(
-                b"hive/control/{}".format(self.agent_id)
+                "hive/control/{}".format(self.agent_id).encode()
             )
             if self.team_id:
                 self._client.subscribe(
-                    b"hive/team/{}/broadcast".format(self.team_id)
+                    "hive/team/{}/broadcast".format(self.team_id).encode()
                 )
             for cap_name in self._capabilities:
                 topic = "hive/capabilities/{}/{}/request".format(

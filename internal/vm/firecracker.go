@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -24,19 +26,46 @@ import (
 type FirecrackerHypervisor struct {
 	firecrackerBin string
 	logger         *slog.Logger
+
+	mu        sync.Mutex
+	processes map[string]*firecrackerProcess // socket path -> process
+}
+
+// firecrackerProcess tracks a running Firecracker child process and provides
+// a channel that is closed once cmd.Wait() has returned (i.e. the OS has
+// reaped the process and freed its PID slot).
+type firecrackerProcess struct {
+	cmd     *exec.Cmd
+	done    chan struct{} // closed by the background reaper goroutine
+	logFile *os.File     // per-VM log file for stdout/stderr; closed on stop/destroy
 }
 
 // NewFirecrackerHypervisor creates a new FirecrackerHypervisor.
 // firecrackerBin is the path to the firecracker binary (defaults to "firecracker"
 // which relies on $PATH).
-func NewFirecrackerHypervisor(firecrackerBin string, logger *slog.Logger) *FirecrackerHypervisor {
+//
+// Pre-flight checks are performed at construction time to provide clear error
+// messages when /dev/kvm is missing or the firecracker binary is not installed.
+func NewFirecrackerHypervisor(firecrackerBin string, logger *slog.Logger) (*FirecrackerHypervisor, error) {
+	// Pre-flight check: /dev/kvm must exist and be accessible.
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		return nil, fmt.Errorf("pre-flight check failed: /dev/kvm is not available (KVM is required for Firecracker VMs): %w", err)
+	}
+
+	// Pre-flight check: firecracker binary must be in PATH (or at the given path).
 	if firecrackerBin == "" {
 		firecrackerBin = "firecracker"
 	}
-	return &FirecrackerHypervisor{
-		firecrackerBin: firecrackerBin,
-		logger:         logger,
+	resolvedBin, err := exec.LookPath(firecrackerBin)
+	if err != nil {
+		return nil, fmt.Errorf("pre-flight check failed: firecracker binary %q not found in PATH: %w", firecrackerBin, err)
 	}
+
+	return &FirecrackerHypervisor{
+		firecrackerBin: resolvedBin,
+		logger:         logger,
+		processes:      make(map[string]*firecrackerProcess),
+	}, nil
 }
 
 // firecrackerBootSource is the kernel boot source configuration.
@@ -71,10 +100,58 @@ type firecrackerAction struct {
 	ActionType string `json:"action_type"`
 }
 
-// killAndReap kills a process and calls Wait to prevent zombies (T1-03).
-func killAndReap(cmd *exec.Cmd) {
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
+// startReaper registers cmd in the processes map and starts a background
+// goroutine that calls cmd.Wait(). The goroutine closes fp.done when Wait
+// returns, signalling that the OS has fully reaped the process. If a log file
+// is provided it is stored in the process record and closed by the reaper
+// goroutine after the process exits. The caller must hold f.mu while calling
+// this function.
+func (f *FirecrackerHypervisor) startReaper(socketPath string, cmd *exec.Cmd, logFile *os.File) *firecrackerProcess {
+	fp := &firecrackerProcess{
+		cmd:     cmd,
+		done:    make(chan struct{}),
+		logFile: logFile,
+	}
+	f.processes[socketPath] = fp
+
+	go func() {
+		_ = cmd.Wait()
+		f.mu.Lock()
+		// Only delete the entry if it still points to this process (it may
+		// have been replaced or removed by StopVM/DestroyVM already).
+		if current, ok := f.processes[socketPath]; ok && current == fp {
+			delete(f.processes, socketPath)
+		}
+		f.mu.Unlock()
+		// Close the per-VM log file now that the process has exited.
+		if fp.logFile != nil {
+			fp.logFile.Close()
+		}
+		close(fp.done)
+	}()
+
+	return fp
+}
+
+// waitForReap waits for the background reaper goroutine to call cmd.Wait().
+// It blocks until the process has been reaped or the timeout elapses.
+func waitForReap(fp *firecrackerProcess, timeout time.Duration) {
+	select {
+	case <-fp.done:
+	case <-time.After(timeout):
+	}
+}
+
+// claimProcess removes and returns the tracked process for the given socket
+// path under the lock. Returns nil if no process is tracked.
+func (f *FirecrackerHypervisor) claimProcess(socketPath string) *firecrackerProcess {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fp := f.processes[socketPath]
+	if fp != nil {
+		delete(f.processes, socketPath)
+	}
+	return fp
 }
 
 // CreateVM spawns the Firecracker process and configures the VM via the API
@@ -92,12 +169,21 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	// Remove stale socket if it exists.
 	os.Remove(cfg.SocketPath)
 
+	// Open a per-VM log file for Firecracker's stdout/stderr. This prevents
+	// interleaved output on hived's own stdout/stderr.
+	logPath := filepath.Join(filepath.Dir(cfg.SocketPath), "firecracker.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("opening firecracker log file %s: %w", logPath, err)
+	}
+
 	// Spawn the Firecracker process with the API socket.
 	cmd := exec.Command(f.firecrackerBin, "--api-sock", cfg.SocketPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
+		logFile.Close()
 		return 0, fmt.Errorf("starting firecracker process: %w", err)
 	}
 
@@ -107,9 +193,25 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		"pid", pid,
 	)
 
+	// Register the process and start the background reaper goroutine. The
+	// goroutine is the sole caller of cmd.Wait(), which prevents zombie
+	// accumulation regardless of how the process exits. The reaper also
+	// closes the log file when the process exits.
+	f.mu.Lock()
+	fp := f.startReaper(cfg.SocketPath, cmd, logFile)
+	f.mu.Unlock()
+
 	// Wait for the API socket to appear.
 	if err := waitForSocket(cfg.SocketPath, 5*time.Second); err != nil {
-		killAndReap(cmd) // T1-03: reap to prevent zombie
+		// Remove from map so the reaper goroutine knows we're abandoning it,
+		// then kill and wait for the goroutine to finish.
+		f.mu.Lock()
+		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+			delete(f.processes, cfg.SocketPath)
+		}
+		f.mu.Unlock()
+		_ = cmd.Process.Kill()
+		waitForReap(fp, 5*time.Second)
 		return 0, fmt.Errorf("waiting for API socket: %w", err)
 	}
 
@@ -118,10 +220,16 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	// Configure the boot source (kernel).
 	bootSource := firecrackerBootSource{
 		KernelImagePath: cfg.KernelPath,
-		BootArgs:        "console=ttyS0 reboot=k panic=1 pci=off",
+		BootArgs:        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/init",
 	}
 	if err := apiPut(client, cfg.SocketPath, "/boot-source", bootSource); err != nil {
-		killAndReap(cmd)
+		f.mu.Lock()
+		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+			delete(f.processes, cfg.SocketPath)
+		}
+		f.mu.Unlock()
+		_ = cmd.Process.Kill()
+		waitForReap(fp, 5*time.Second)
 		return 0, fmt.Errorf("configuring boot source: %w", err)
 	}
 
@@ -133,7 +241,13 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		IsReadOnly:   false,
 	}
 	if err := apiPut(client, cfg.SocketPath, "/drives/rootfs", rootfsDrive); err != nil {
-		killAndReap(cmd)
+		f.mu.Lock()
+		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+			delete(f.processes, cfg.SocketPath)
+		}
+		f.mu.Unlock()
+		_ = cmd.Process.Kill()
+		waitForReap(fp, 5*time.Second)
 		return 0, fmt.Errorf("configuring rootfs drive: %w", err)
 	}
 
@@ -145,10 +259,16 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 				DriveID:      "agent",
 				PathOnHost:   cfg.AgentDrivePath,
 				IsRootDevice: false,
-				IsReadOnly:   true,
+				IsReadOnly:   false,
 			}
 			if err := apiPut(client, cfg.SocketPath, "/drives/agent", agentDrive); err != nil {
-				killAndReap(cmd)
+				f.mu.Lock()
+				if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+					delete(f.processes, cfg.SocketPath)
+				}
+				f.mu.Unlock()
+				_ = cmd.Process.Kill()
+				waitForReap(fp, 5*time.Second)
 				return 0, fmt.Errorf("configuring agent drive: %w", err)
 			}
 		}
@@ -161,7 +281,13 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		Smt:        false,
 	}
 	if err := apiPut(client, cfg.SocketPath, "/machine-config", machineCfg); err != nil {
-		killAndReap(cmd)
+		f.mu.Lock()
+		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+			delete(f.processes, cfg.SocketPath)
+		}
+		f.mu.Unlock()
+		_ = cmd.Process.Kill()
+		waitForReap(fp, 5*time.Second)
 		return 0, fmt.Errorf("configuring machine: %w", err)
 	}
 
@@ -172,7 +298,13 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		UDSPath:  vsockPath,
 	}
 	if err := apiPut(client, cfg.SocketPath, "/vsock", vsock); err != nil {
-		killAndReap(cmd)
+		f.mu.Lock()
+		if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+			delete(f.processes, cfg.SocketPath)
+		}
+		f.mu.Unlock()
+		_ = cmd.Process.Kill()
+		waitForReap(fp, 5*time.Second)
 		return 0, fmt.Errorf("configuring vsock: %w", err)
 	}
 
@@ -202,13 +334,19 @@ func (f *FirecrackerHypervisor) StartVM(socketPath string) error {
 
 // StopVM gracefully stops a running VM. It sends SIGTERM to the Firecracker
 // process and waits up to 5 seconds for it to exit. If it does not exit in
-// time, SIGKILL is sent.
+// time, SIGKILL is sent. The background reaper goroutine (started in CreateVM)
+// calls cmd.Wait() to prevent zombie processes.
 func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid PID %d for VM at %s", pid, socketPath)
 	}
 
 	f.logger.Info("stopping Firecracker VM", "socket", socketPath, "pid", pid)
+
+	// Claim the tracked process. After this point the reaper goroutine will
+	// not remove the map entry, but it will still call cmd.Wait() and close
+	// fp.done when the process exits.
+	fp := f.claimProcess(socketPath)
 
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -220,23 +358,44 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 		// Process may already be gone.
 		if isProcessGone(err) {
 			f.logger.Info("VM process already exited", "pid", pid)
+			if fp != nil {
+				waitForReap(fp, 5*time.Second)
+			}
 			cleanupSocket(socketPath)
 			return nil
 		}
 		return fmt.Errorf("sending SIGTERM to PID %d: %w", pid, err)
 	}
 
-	// Wait up to 5 seconds for the process to exit.
-	exited := waitForProcessExit(pid, 5*time.Second)
-	if !exited {
-		f.logger.Warn("VM process did not exit after SIGTERM, sending SIGKILL",
-			"pid", pid,
-		)
-		if err := proc.Signal(syscall.SIGKILL); err != nil && !isProcessGone(err) {
-			return fmt.Errorf("sending SIGKILL to PID %d: %w", pid, err)
+	// Wait up to 5 seconds for the reaper goroutine to confirm the process
+	// exited (i.e. cmd.Wait() returned). Fall back to SIGKILL if needed.
+	if fp != nil {
+		select {
+		case <-fp.done:
+			// Process exited cleanly within the grace period.
+		case <-time.After(5 * time.Second):
+			f.logger.Warn("VM process did not exit after SIGTERM, sending SIGKILL",
+				"pid", pid,
+			)
+			if err := proc.Signal(syscall.SIGKILL); err != nil && !isProcessGone(err) {
+				return fmt.Errorf("sending SIGKILL to PID %d: %w", pid, err)
+			}
+			// Wait for the reaper to confirm SIGKILL took effect.
+			waitForReap(fp, 2*time.Second)
 		}
-		// Wait a short time for SIGKILL to take effect.
-		waitForProcessExit(pid, 2*time.Second)
+	} else {
+		// No tracked process (e.g. hived restarted and lost the cmd handle).
+		// Fall back to polling-based wait, accepting that we cannot call Wait().
+		exited := waitForProcessExit(pid, 5*time.Second)
+		if !exited {
+			f.logger.Warn("VM process did not exit after SIGTERM, sending SIGKILL",
+				"pid", pid,
+			)
+			if err := proc.Signal(syscall.SIGKILL); err != nil && !isProcessGone(err) {
+				return fmt.Errorf("sending SIGKILL to PID %d: %w", pid, err)
+			}
+			waitForProcessExit(pid, 2*time.Second)
+		}
 	}
 
 	cleanupSocket(socketPath)
@@ -244,9 +403,15 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 	return nil
 }
 
-// DestroyVM forcefully kills the VM process and cleans up the socket.
+// DestroyVM forcefully kills the VM process and cleans up the socket. The
+// background reaper goroutine (started in CreateVM) calls cmd.Wait() to
+// prevent zombie processes.
 func (f *FirecrackerHypervisor) DestroyVM(socketPath string, pid int) error {
 	f.logger.Info("destroying Firecracker VM", "socket", socketPath, "pid", pid)
+
+	// Claim the tracked process before sending any signal so the reaper
+	// goroutine does not race with our map removal.
+	fp := f.claimProcess(socketPath)
 
 	if pid > 0 {
 		proc, err := os.FindProcess(pid)
@@ -257,6 +422,12 @@ func (f *FirecrackerHypervisor) DestroyVM(socketPath string, pid int) error {
 					"error", killErr,
 				)
 			}
+		}
+
+		// Wait for the reaper goroutine to confirm the process has been
+		// reaped, preventing zombie accumulation.
+		if fp != nil {
+			waitForReap(fp, 5*time.Second)
 		}
 	}
 
@@ -363,7 +534,13 @@ func isProcessGone(err error) bool {
 	if err == nil {
 		return false
 	}
-	return err == os.ErrProcessDone || err.Error() == "os: process already finished"
+	if err == os.ErrProcessDone || errors.Is(err, os.ErrProcessDone) {
+		return true
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	return err.Error() == "os: process already finished"
 }
 
 // cleanupSocket removes the API socket and vsock files.

@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"github.com/hivehq/hive/internal/config"
 	"github.com/hivehq/hive/internal/state"
 	"github.com/hivehq/hive/internal/types"
-	"github.com/hivehq/hive/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -36,42 +34,21 @@ func agentsCmd() *cobra.Command {
 	return cmd
 }
 
-func newManager() (*vm.Manager, *state.Store, error) {
-	absRoot, err := filepath.Abs(clusterRoot)
-	if err != nil {
-		return nil, nil, fmt.Errorf("resolving cluster root: %w", err)
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	statePath := filepath.Join(absRoot, "state.json")
-	store, err := state.NewStore(statePath, logger)
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening state store: %w", err)
-	}
-
-	var hyp vm.Hypervisor
-	if os.Getenv("HIVE_TEST_FIRECRACKER") == "mock" {
-		hyp = vm.NewMockHypervisor()
-	} else {
-		hyp = vm.NewFirecrackerHypervisor("firecracker", logger)
-	}
-
-	mgr := vm.NewManager(absRoot, store, logger, hyp)
-	return mgr, store, nil
-}
-
 func agentsListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List all agents with their current state",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, store, err := newManager()
+			client, err := newDaemonClient()
 			if err != nil {
 				return err
 			}
+			defer client.Close()
 
-			agents := store.AllAgents()
+			agents, err := client.AgentList()
+			if err != nil {
+				return fmt.Errorf("listing agents: %w", err)
+			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "AGENT_ID\tTEAM\tSTATE\tUPTIME")
@@ -100,15 +77,16 @@ func agentsStatusCmd() *cobra.Command {
 		Short: "Show detailed status for an agent",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, store, err := newManager()
+			client, err := newDaemonClient()
 			if err != nil {
 				return err
 			}
+			defer client.Close()
 
 			agentID := args[0]
-			a := store.GetAgent(agentID)
-			if a == nil {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found\n", agentID)
+			a, err := client.AgentStatus(agentID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 
@@ -130,29 +108,13 @@ func agentsStartCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			agentID := args[0]
 
-			absRoot, err := filepath.Abs(clusterRoot)
-			if err != nil {
-				return fmt.Errorf("resolving cluster root: %w", err)
-			}
-
-			// Load agent manifest
-			agents, err := config.LoadAgents(absRoot)
-			if err != nil {
-				return fmt.Errorf("loading agents: %w", err)
-			}
-
-			agent, ok := agents[agentID]
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
-			}
-
-			mgr, _, err := newManager()
+			client, err := newDaemonClient()
 			if err != nil {
 				return err
 			}
+			defer client.Close()
 
-			if err := mgr.StartAgent(agent); err != nil {
+			if err := client.StartAgent(agentID); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -171,12 +133,13 @@ func agentsStopCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			agentID := args[0]
 
-			mgr, _, err := newManager()
+			client, err := newDaemonClient()
 			if err != nil {
 				return err
 			}
+			defer client.Close()
 
-			if err := mgr.StopAgent(agentID); err != nil {
+			if err := client.StopAgent(agentID); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -195,12 +158,13 @@ func agentsDestroyCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			agentID := args[0]
 
-			mgr, _, err := newManager()
+			client, err := newDaemonClient()
 			if err != nil {
 				return err
 			}
+			defer client.Close()
 
-			if err := mgr.DestroyAgent(agentID); err != nil {
+			if err := client.DestroyAgent(agentID); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -219,28 +183,13 @@ func agentsRestartCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			agentID := args[0]
 
-			absRoot, err := filepath.Abs(clusterRoot)
-			if err != nil {
-				return fmt.Errorf("resolving cluster root: %w", err)
-			}
-
-			agents, err := config.LoadAgents(absRoot)
-			if err != nil {
-				return fmt.Errorf("loading agents: %w", err)
-			}
-
-			agent, ok := agents[agentID]
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
-			}
-
-			mgr, _, err := newManager()
+			client, err := newDaemonClient()
 			if err != nil {
 				return err
 			}
+			defer client.Close()
 
-			if err := mgr.RestartAgent(agentID, agent); err != nil {
+			if err := client.RestartAgent(agentID); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}

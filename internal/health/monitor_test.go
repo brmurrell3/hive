@@ -70,7 +70,7 @@ func publishHeartbeat(t *testing.T, nc *nats.Conn, agentID string, healthy bool)
 func TestMonitor_RecordsHeartbeat(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestMonitor_RecordsHeartbeat(t *testing.T) {
 func TestMonitor_AgentMarkedUnhealthyAfterTimeout(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestMonitor_AgentMarkedUnhealthyAfterTimeout(t *testing.T) {
 func TestMonitor_HeartbeatResetsTimeout(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestMonitor_HeartbeatResetsTimeout(t *testing.T) {
 func TestMonitor_MalformedMessage(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestMonitor_MalformedMessage(t *testing.T) {
 func TestMonitor_RecordHeartbeat_Manual(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestMonitor_RecordHeartbeat_Manual(t *testing.T) {
 func TestMonitor_LastSeen_UnknownAgent(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestMonitor_LastSeen_UnknownAgent(t *testing.T) {
 func TestMonitor_MultipleHeartbeatsUpdateLastSeen(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestMonitor_MultipleHeartbeatsUpdateLastSeen(t *testing.T) {
 func TestMonitor_StopIsSafe(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestMonitor_StopIsSafe(t *testing.T) {
 func TestMonitor_Defaults(t *testing.T) {
 	srv := testutil.NATSServer(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}

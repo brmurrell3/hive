@@ -37,7 +37,7 @@ func TestServer_StartAndConnect(t *testing.T) {
 	}
 	defer srv.Shutdown()
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestServer_PubSub(t *testing.T) {
 	}
 	defer srv.Shutdown()
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestServer_JetStream(t *testing.T) {
 	}
 	defer srv.Shutdown()
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestServer_JetStreamDisabled(t *testing.T) {
 	}
 	defer srv.Shutdown()
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
@@ -231,5 +231,117 @@ func TestServer_JetStreamDisabled(t *testing.T) {
 	_, err = nc.JetStream()
 	if err != nil {
 		return // expected - JetStream not available
+	}
+}
+
+func TestServer_ClusterPort(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := types.NATSConfig{
+		Port:        -1,
+		ClusterPort: -1, // random port for testing
+		JetStream: types.JetStreamConfig{
+			StorePath: tmpDir,
+		},
+	}
+
+	srv, err := NewServer(cfg, tmpDir, testLogger())
+	if err != nil {
+		t.Fatalf("creating server: %v", err)
+	}
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	// Verify the server starts and accepts client connections with cluster port configured.
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
+	if err != nil {
+		t.Fatalf("connecting to NATS with cluster port configured: %v", err)
+	}
+	defer nc.Close()
+
+	if !nc.IsConnected() {
+		t.Fatal("expected connection to be established")
+	}
+}
+
+func TestServer_ClusterPeers(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Start a first server with clustering enabled to get its cluster URL.
+	cfg1 := types.NATSConfig{
+		Port:        -1,
+		ClusterPort: -1,
+		JetStream: types.JetStreamConfig{
+			StorePath: tmpDir,
+		},
+	}
+
+	srv1, err := NewServer(cfg1, tmpDir, testLogger())
+	if err != nil {
+		t.Fatalf("creating server 1: %v", err)
+	}
+
+	if err := srv1.Start(); err != nil {
+		t.Fatalf("starting server 1: %v", err)
+	}
+	defer srv1.Shutdown()
+
+	// Start a second server that peers with the first.
+	tmpDir2 := t.TempDir()
+	clusterURL := srv1.ns.ClusterAddr().String()
+	cfg2 := types.NATSConfig{
+		Port:         -1,
+		ClusterPort:  -1,
+		ClusterPeers: []string{"nats://" + clusterURL},
+		JetStream: types.JetStreamConfig{
+			StorePath: tmpDir2,
+		},
+	}
+
+	srv2, err := NewServer(cfg2, tmpDir2, testLogger())
+	if err != nil {
+		t.Fatalf("creating server 2: %v", err)
+	}
+
+	if err := srv2.Start(); err != nil {
+		t.Fatalf("starting server 2: %v", err)
+	}
+	defer srv2.Shutdown()
+
+	// Verify both servers accept connections.
+	nc1, err := nats.Connect(srv1.ClientURL(), nats.Token(srv1.AuthToken()))
+	if err != nil {
+		t.Fatalf("connecting to server 1: %v", err)
+	}
+	defer nc1.Close()
+
+	nc2, err := nats.Connect(srv2.ClientURL(), nats.Token(srv2.AuthToken()))
+	if err != nil {
+		t.Fatalf("connecting to server 2: %v", err)
+	}
+	defer nc2.Close()
+
+	if !nc1.IsConnected() {
+		t.Fatal("expected connection to server 1")
+	}
+	if !nc2.IsConnected() {
+		t.Fatal("expected connection to server 2")
+	}
+}
+
+func TestServer_InvalidClusterPeerURL(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := types.NATSConfig{
+		Port:         -1,
+		ClusterPeers: []string{"://not-a-valid-url"},
+		JetStream: types.JetStreamConfig{
+			StorePath: tmpDir,
+		},
+	}
+
+	_, err := NewServer(cfg, tmpDir, testLogger())
+	if err == nil {
+		t.Fatal("expected error for invalid cluster peer URL, got nil")
 	}
 }

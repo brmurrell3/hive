@@ -155,10 +155,15 @@ func buildArduino(cfg BuildConfig) (string, error) {
 		return "", fmt.Errorf("no .ino file found in %s", cfg.SourceDir)
 	}
 
+	// arduino-cli compile takes the sketch directory, not the .ino file directly.
+	// Output files are named <sketch-dir>.ino.bin in the output directory.
+	sketchDir := filepath.Dir(inoFile)
+	sketchName := filepath.Base(sketchDir)
+
 	cmd := exec.Command("arduino-cli", "compile",
 		"--fqbn", fqbn,
 		"--output-dir", cfg.OutputDir,
-		inoFile,
+		sketchDir,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -167,7 +172,7 @@ func buildArduino(cfg BuildConfig) (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(cfg.OutputDir, filepath.Base(inoFile)+".bin"), nil
+	return filepath.Join(cfg.OutputDir, sketchName+".ino.bin"), nil
 }
 
 func buildPicoSDK(cfg BuildConfig) (string, error) {
@@ -249,6 +254,30 @@ func buildBareMetal(cfg BuildConfig) (string, error) {
 func checkToolchain(name string) error {
 	_, err := exec.LookPath(name)
 	return err
+}
+
+// DefaultBinaryPath returns the expected output binary path for a given platform
+// and output directory, matching the paths returned by the Build functions.
+// This is used by the flash command to locate a previously built binary without
+// re-running the build.
+func DefaultBinaryPath(platform Platform, outputDir string) (string, error) {
+	switch platform {
+	case PlatformESPIDF:
+		return filepath.Join(outputDir, "firmware.bin"), nil
+	case PlatformArduino:
+		// Arduino CLI names the binary after the sketch directory: <sketch>.ino.bin.
+		// Without knowing the sketch name at this point, return a glob-friendly
+		// sentinel so callers know they must search or provide --binary explicitly.
+		return "", fmt.Errorf("arduino binary path depends on sketch name; use --binary to specify the path explicitly")
+	case PlatformPicoSDK:
+		return filepath.Join(outputDir, "firmware.uf2"), nil
+	case PlatformZephyr:
+		return filepath.Join(outputDir, "zephyr", "zephyr.bin"), nil
+	case PlatformBareMetal:
+		return filepath.Join(outputDir, "firmware.bin"), nil
+	default:
+		return "", fmt.Errorf("unsupported platform: %s", platform)
+	}
 }
 
 // BuildFromManifest builds firmware using settings from the agent manifest.

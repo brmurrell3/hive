@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/hivehq/hive/internal/capability"
 )
 
 // healthResponse is the JSON structure returned by GET /health.
@@ -16,9 +18,10 @@ type healthResponse struct {
 	UptimeSeconds int    `json:"uptime_seconds"`
 }
 
-// invokeResponse is the JSON structure returned by POST /capabilities/{name}/invoke.
-type invokeResponse struct {
-	Status string `json:"status"`
+// invokeRequest is the JSON body accepted by POST /capabilities/{name}/invoke.
+type invokeRequest struct {
+	Inputs  map[string]interface{} `json:"inputs,omitempty"`
+	Timeout string                 `json:"timeout,omitempty"` // e.g. "30s"
 }
 
 // setupHTTPRoutes registers all HTTP handlers on the provided ServeMux.
@@ -100,7 +103,8 @@ func handleCapabilities(s *Sidecar) http.HandlerFunc {
 }
 
 // handleCapabilityInvoke returns an http.HandlerFunc that handles capability
-// invocation requests. This is a placeholder for M5 implementation.
+// invocation requests. It bridges HTTP invocations into the NATS capability
+// routing system via the sidecar's capability.Router.
 //
 // It expects paths of the form POST /capabilities/{name}/invoke.
 func handleCapabilityInvoke(s *Sidecar) http.HandlerFunc {
@@ -136,16 +140,66 @@ func handleCapabilityInvoke(s *Sidecar) http.HandlerFunc {
 			return
 		}
 
-		// Placeholder response; actual invocation will be implemented in M5.
-		s.logger.Info("capability invoke requested (placeholder)",
+		// Decode optional request body.
+		var req invokeRequest
+		if r.Body != nil && r.ContentLength != 0 {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "invalid request body: " + err.Error(),
+				}, s.logger)
+				return
+			}
+		}
+
+		s.logger.Info("capability invoke via HTTP, executing locally",
 			"capability", capName,
+			"agent_id", s.agentID,
 		)
 
-		resp := invokeResponse{
-			Status: "not_implemented",
+		// Guard: capability router may be nil if NATS is not yet connected.
+		if s.capRouter == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "capability router not ready",
+			}, s.logger)
+			return
 		}
-		writeJSON(w, http.StatusOK, resp, s.logger)
+
+		// Execute the capability locally via the router's registered handler.
+		// We use CallLocal instead of Invoke to avoid publishing back to the
+		// same NATS subject the router subscribes to, which would cause an
+		// infinite loop.
+		resp := s.capRouter.CallLocal(capName, req.Inputs)
+
+		// Map the capability.InvocationResponse to a friendly HTTP response.
+		httpResp := buildInvokeHTTPResponse(resp)
+		status := http.StatusOK
+		if resp.Status == "error" {
+			status = http.StatusUnprocessableEntity
+		} else if resp.Status == "timeout" {
+			status = http.StatusGatewayTimeout
+		}
+		writeJSON(w, status, httpResp, s.logger)
 	}
+}
+
+// buildInvokeHTTPResponse converts an InvocationResponse into the JSON body
+// returned to the HTTP caller.
+func buildInvokeHTTPResponse(resp *capability.InvocationResponse) map[string]interface{} {
+	out := map[string]interface{}{
+		"status":      resp.Status,
+		"duration_ms": resp.DurationMs,
+	}
+	if resp.Outputs != nil {
+		out["outputs"] = resp.Outputs
+	}
+	if resp.Error != nil {
+		out["error"] = map[string]interface{}{
+			"code":      resp.Error.Code,
+			"message":   resp.Error.Message,
+			"retryable": resp.Error.Retryable,
+		}
+	}
+	return out
 }
 
 // writeJSON marshals v to JSON and writes it to the response with the given

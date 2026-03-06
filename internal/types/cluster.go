@@ -26,6 +26,12 @@ type NATSConfig struct {
 	Mode         string          `yaml:"mode,omitempty" json:"mode,omitempty"`                 // "embedded" or "external"
 	URLs         []string        `yaml:"urls,omitempty" json:"urls,omitempty"`                  // external NATS URLs
 	ClusterPeers []string        `yaml:"clusterPeers,omitempty" json:"clusterPeers,omitempty"` // for NATS clustering
+	// AuthToken is the NATS authentication token. If empty, a random token is
+	// generated at startup and written to .state/nats-auth-token for clients.
+	AuthToken string `yaml:"authToken,omitempty" json:"authToken,omitempty"`
+	// Host is the bind address for the NATS server. Defaults to "127.0.0.1"
+	// to prevent any external network access.
+	Host string `yaml:"host,omitempty" json:"host,omitempty"`
 }
 
 type JetStreamConfig struct {

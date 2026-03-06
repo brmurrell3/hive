@@ -170,6 +170,21 @@ func (r *Reconciler) runOnce() {
 				"agent_id", action.AgentID,
 				"error", err,
 			)
+			continue
+		}
+		// After a successful create or restart, stamp the ManifestHash onto the
+		// agent state so that drift detection works on the next reconcile pass.
+		if (action.Type == ActionCreate || action.Type == ActionRestart) && action.Manifest != nil {
+			hash := ManifestHash(action.Manifest)
+			if agentState := r.store.GetAgent(action.AgentID); agentState != nil {
+				agentState.ManifestHash = hash
+				if err := r.store.SetAgent(agentState); err != nil {
+					r.logger.Error("reconciler: failed to persist manifest hash",
+						"agent_id", action.AgentID,
+						"error", err,
+					)
+				}
+			}
 		}
 	}
 }

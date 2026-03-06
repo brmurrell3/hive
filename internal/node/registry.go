@@ -1,9 +1,12 @@
 package node
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"time"
 
 	"github.com/hivehq/hive/internal/state"
@@ -13,22 +16,28 @@ import (
 
 // Registry manages node registration and lifecycle.
 type Registry struct {
-	store    *state.Store
-	natsConn *nats.Conn
-	logger   *slog.Logger
-	sub      *nats.Subscription
+	store         *state.Store
+	natsConn      *nats.Conn
+	logger        *slog.Logger
+	sub           *nats.Subscription
+	hbSub         *nats.Subscription // subscription for node heartbeats
+	advertiseAddr string             // externally-reachable NATS URL for joining nodes
 }
 
 // NewRegistry creates a new node registry.
-func NewRegistry(store *state.Store, nc *nats.Conn, logger *slog.Logger) *Registry {
+// advertiseAddr is the externally-reachable NATS URL (e.g. "nats://192.168.1.10:4222")
+// that joining nodes should use. If empty, the registry falls back to the
+// connected URL, which may be a loopback address.
+func NewRegistry(store *state.Store, nc *nats.Conn, logger *slog.Logger, advertiseAddr string) *Registry {
 	return &Registry{
-		store:    store,
-		natsConn: nc,
-		logger:   logger.With("component", "node-registry"),
+		store:         store,
+		natsConn:      nc,
+		logger:        logger.With("component", "node-registry"),
+		advertiseAddr: advertiseAddr,
 	}
 }
 
-// Start subscribes to join requests on NATS.
+// Start subscribes to join requests and node heartbeats on NATS.
 func (r *Registry) Start() error {
 	sub, err := r.natsConn.Subscribe("hive.join.request", func(msg *nats.Msg) {
 		r.handleJoinRequest(msg)
@@ -37,16 +46,33 @@ func (r *Registry) Start() error {
 		return fmt.Errorf("subscribing to join requests: %w", err)
 	}
 	r.sub = sub
-	r.logger.Info("node registry started, listening for join requests")
+
+	hbSub, err := r.natsConn.Subscribe("hive.node.*.heartbeat", func(msg *nats.Msg) {
+		r.handleNodeHeartbeat(msg)
+	})
+	if err != nil {
+		return fmt.Errorf("subscribing to node heartbeats: %w", err)
+	}
+	r.hbSub = hbSub
+
+	r.logger.Info("node registry started, listening for join requests and heartbeats")
 	return nil
 }
 
 // Stop unsubscribes from NATS.
 func (r *Registry) Stop() error {
+	var firstErr error
 	if r.sub != nil {
-		return r.sub.Unsubscribe()
+		if err := r.sub.Unsubscribe(); err != nil {
+			firstErr = err
+		}
 	}
-	return nil
+	if r.hbSub != nil {
+		if err := r.hbSub.Unsubscribe(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // handleJoinRequest processes a join request from a node.
@@ -120,10 +146,11 @@ func (r *Registry) handleJoinRequest(msg *nats.Msg) {
 		"hostname", req.Hostname,
 	)
 
-	// Build NATS URL for the joining node
-	natsURL := ""
-	if r.natsConn != nil {
-		// The connected server's URL can be used by the joining node
+	// Build NATS URL for the joining node. Prefer the explicitly configured
+	// advertise address so that the URL is reachable from remote nodes.
+	// Fall back to the local connection URL only if no advertise address is set.
+	natsURL := r.advertiseAddr
+	if natsURL == "" && r.natsConn != nil {
 		natsURL = r.natsConn.ConnectedUrl()
 	}
 
@@ -152,12 +179,48 @@ func (r *Registry) respondToJoin(msg *nats.Msg, resp types.JoinResponse) {
 	}
 }
 
-// generateNodeID creates a stable node ID from hostname and arch.
+// handleNodeHeartbeat processes a heartbeat message from a registered node.
+// Nodes publish heartbeats on hive.node.{nodeID}.heartbeat using the standard
+// Envelope format with Type = "node-heartbeat" and From = nodeID.
+func (r *Registry) handleNodeHeartbeat(msg *nats.Msg) {
+	var env types.Envelope
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		r.logger.Warn("invalid node heartbeat envelope", "error", err)
+		return
+	}
+
+	if env.Type != types.MessageTypeNodeHeartbeat {
+		return
+	}
+
+	nodeID := env.From
+	if nodeID == "" {
+		r.logger.Warn("node heartbeat missing node ID")
+		return
+	}
+
+	if err := r.RecordHeartbeat(nodeID); err != nil {
+		r.logger.Debug("node heartbeat for unknown node", "node_id", nodeID, "error", err)
+		return
+	}
+
+	r.logger.Debug("node heartbeat received", "node_id", nodeID)
+}
+
+// generateNodeID creates a unique node ID from hostname and arch with a
+// random 6-hex-character suffix to prevent collisions among nodes that share
+// the same default hostname (e.g. multiple Raspberry Pis with "raspberrypi").
 func generateNodeID(hostname, arch string) string {
 	if hostname == "" {
 		hostname = "unknown"
 	}
-	return fmt.Sprintf("%s-%s", hostname, arch[:min(8, len(arch))])
+	archPart := arch[:min(8, len(arch))]
+	var buf [3]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// Fallback: use a timestamp-derived suffix if crypto/rand fails.
+		return fmt.Sprintf("%s-%s-%06x", hostname, archPart, time.Now().UnixNano()&0xffffff)
+	}
+	return fmt.Sprintf("%s-%s-%s", hostname, archPart, hex.EncodeToString(buf[:]))
 }
 
 func min(a, b int) int {
@@ -165,6 +228,54 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ResolveAdvertiseAddr builds a NATS URL suitable for advertising to remote
+// nodes based on the cluster's NATS configuration. If host is a specific
+// non-loopback address, it is used directly. If host is "0.0.0.0" or empty,
+// the function discovers the machine's first non-loopback IPv4 address.
+// Returns "" if no suitable address can be determined.
+func ResolveAdvertiseAddr(host string, port int) string {
+	if port == 0 {
+		port = 4222
+	}
+
+	// If the configured host is a specific, non-wildcard, non-loopback address, use it.
+	if host != "" && host != "0.0.0.0" && host != "::" {
+		ip := net.ParseIP(host)
+		if ip != nil && !ip.IsLoopback() {
+			return fmt.Sprintf("nats://%s:%d", host, port)
+		}
+		// host might be a hostname; if it's not "localhost", use it as-is.
+		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			return fmt.Sprintf("nats://%s:%d", host, port)
+		}
+	}
+
+	// Host is empty, 0.0.0.0, ::, or loopback — try to find a non-loopback interface IP.
+	if outIP := getOutboundIP(); outIP != "" {
+		return fmt.Sprintf("nats://%s:%d", outIP, port)
+	}
+
+	// Could not determine an external address.
+	return ""
+}
+
+// getOutboundIP returns the preferred outbound IPv4 address of this machine
+// by dialing a UDP socket to a public address (no actual traffic is sent).
+// Returns "" if no suitable address is found.
+func getOutboundIP() string {
+	conn, err := net.Dial("udp4", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ""
+	}
+	return localAddr.IP.String()
 }
 
 // RecordHeartbeat updates the last heartbeat time for a node.

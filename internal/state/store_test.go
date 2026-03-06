@@ -606,9 +606,112 @@ func TestNewStore_CorruptFile(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	_, err := NewStore(path, logger)
-	if err == nil {
-		t.Fatal("expected error loading corrupt state file, got nil")
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("expected recovery from corrupt state, got error: %v", err)
+	}
+
+	// Should have started with empty state after failing to parse.
+	if len(store.AllAgents()) != 0 {
+		t.Fatalf("expected empty agents after corrupt recovery, got %d", len(store.AllAgents()))
+	}
+}
+
+func TestNewStore_CorruptFileWithValidBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	bakPath := path + ".bak"
+
+	// Write a valid backup with an agent.
+	backupState := State{
+		Agents: map[string]*AgentState{
+			"recovered-agent": {
+				ID:     "recovered-agent",
+				Team:   "alpha",
+				Status: AgentStatusRunning,
+			},
+		},
+	}
+	backupData, _ := json.Marshal(backupState)
+	if err := os.WriteFile(bakPath, backupData, 0644); err != nil {
+		t.Fatalf("writing backup file: %v", err)
+	}
+
+	// Write garbage to the primary state file.
+	if err := os.WriteFile(path, []byte("{corrupt"), 0644); err != nil {
+		t.Fatalf("writing corrupt file: %v", err)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("expected recovery from backup, got error: %v", err)
+	}
+
+	agent := store.GetAgent("recovered-agent")
+	if agent == nil {
+		t.Fatal("expected recovered-agent from backup, got nil")
+	}
+	if agent.Status != AgentStatusRunning {
+		t.Fatalf("expected RUNNING status, got %s", agent.Status)
+	}
+}
+
+func TestNewStore_CorruptFileAndCorruptBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	bakPath := path + ".bak"
+
+	// Write garbage to both primary and backup.
+	if err := os.WriteFile(path, []byte("{corrupt"), 0644); err != nil {
+		t.Fatalf("writing corrupt file: %v", err)
+	}
+	if err := os.WriteFile(bakPath, []byte("also bad"), 0644); err != nil {
+		t.Fatalf("writing corrupt backup: %v", err)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("expected empty state fallback, got error: %v", err)
+	}
+
+	if len(store.AllAgents()) != 0 {
+		t.Fatalf("expected empty agents after double-corrupt, got %d", len(store.AllAgents()))
+	}
+}
+
+func TestSave_CreatesBackup(t *testing.T) {
+	store, path := testStore(t)
+	bakPath := path + ".bak"
+
+	// Set an agent and save.
+	agent := testAgentState("agent-a", "team-a", AgentStatusPending)
+	if err := store.SetAgent(agent); err != nil {
+		t.Fatalf("SetAgent: %v", err)
+	}
+
+	// Set another agent (triggers another save, which should back up the
+	// state that contained only agent-a).
+	agent2 := testAgentState("agent-b", "team-b", AgentStatusPending)
+	if err := store.SetAgent(agent2); err != nil {
+		t.Fatalf("SetAgent: %v", err)
+	}
+
+	// The backup file should exist and contain agent-a but NOT agent-b.
+	bakData, err := os.ReadFile(bakPath)
+	if err != nil {
+		t.Fatalf("reading backup: %v", err)
+	}
+	var bakState State
+	if err := json.Unmarshal(bakData, &bakState); err != nil {
+		t.Fatalf("parsing backup: %v", err)
+	}
+	if _, ok := bakState.Agents["agent-a"]; !ok {
+		t.Fatal("expected agent-a in backup")
+	}
+	if _, ok := bakState.Agents["agent-b"]; ok {
+		t.Fatal("did not expect agent-b in backup (it was added after the backup was made)")
 	}
 }
 
@@ -1384,9 +1487,14 @@ func TestNewStore_EmptyFile(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	_, err := NewStore(path, logger)
-	if err == nil {
-		t.Fatal("expected error for empty state file, got nil")
+	store, err := NewStore(path, logger)
+	if err != nil {
+		t.Fatalf("expected recovery from empty state file, got error: %v", err)
+	}
+
+	// Should have started with empty state after failing to parse empty file.
+	if len(store.AllAgents()) != 0 {
+		t.Fatalf("expected empty agents after recovery, got %d", len(store.AllAgents()))
 	}
 }
 

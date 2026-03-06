@@ -7,11 +7,65 @@
 # Build:
 #   nix build .#rootfs   -> result contains the ext4 rootfs image
 #   nix build .#kernel   -> result contains vmlinux for Firecracker
+#
+# Sidecar binary requirement:
+#   The sidecar binary must be compiled for x86_64-linux before building:
+#
+#     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+#       go build -o /tmp/hive-sidecar ./cmd/hive-sidecar
+#
+#   Then pass the path via the HIVE_SIDECAR environment variable or by
+#   placing it at <repo-root>/bin/linux-amd64/hive-sidecar (the default
+#   picked up by the sidecarBin derivation below).
+#
+#   Alternatively, build the full rootfs via:
+#     make -C rootfs/ rootfs       # builds sidecar then creates ext4 image
+#
 { config, pkgs, lib, modulesPath, ... }:
 
 let
   # Custom kernel with only the subsystems Firecracker needs.
   customKernel = import ./kernel.nix { inherit pkgs lib; };
+
+  # ---------------------------------------------------------------------------
+  # Sidecar binary
+  #
+  # We import the pre-compiled static Linux binary as a Nix derivation so it
+  # participates in the image closure.  The binary must exist at
+  # HIVE_SIDECAR_BIN before invoking `nix build`.
+  #
+  # Default search path (relative to this flake's root, two levels up):
+  #   ../../bin/linux-amd64/hive-sidecar
+  #
+  # Override at build time:
+  #   nix build .#rootfs \
+  #     --override-input sidecarSrc path:/path/to/hive-sidecar
+  # ---------------------------------------------------------------------------
+  sidecarBinPath = builtins.getEnv "HIVE_SIDECAR_BIN";
+
+  # Resolve: env var takes priority; fall back to conventional repo path.
+  resolvedSidecarPath =
+    if sidecarBinPath != ""
+    then sidecarBinPath
+    else toString (../../bin/linux-amd64/hive-sidecar);
+
+  # Wrap the binary in a derivation so Nix can track it as a store path.
+  # If the file does not exist yet the derivation is a stub that installs a
+  # placeholder script that prints a clear error — this prevents a hard build
+  # failure during early development when the binary hasn't been compiled yet.
+  sidecarBin =
+    if builtins.pathExists resolvedSidecarPath
+    then
+      pkgs.runCommand "hive-sidecar" {} ''
+        install -Dm755 ${resolvedSidecarPath} $out/bin/hive-sidecar
+      ''
+    else
+      pkgs.writeShellScriptBin "hive-sidecar" ''
+        echo "ERROR: hive-sidecar binary was not found at build time." >&2
+        echo "       Compile it first:" >&2
+        echo "         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar" >&2
+        exit 1
+      '';
 in
 {
   imports = [
@@ -82,14 +136,50 @@ in
   };
 
   # ---------------------------------------------------------------------------
+  # Mount the agent drive (vdb) containing agent files and sidecar config
+  # ---------------------------------------------------------------------------
+  fileSystems."/agent" = {
+    device = "/dev/vdb";
+    fsType = "ext4";
+    options = [ "rw" ];
+    neededForBoot = false;
+  };
+
+  # ---------------------------------------------------------------------------
   # Hive sidecar service
   # ---------------------------------------------------------------------------
   systemd.services.hive-sidecar = {
     description = "Hive Agent Sidecar";
-    after = [ "network.target" ];
+    after = [ "network.target" "agent.mount" ];
+    wants = [ "agent.mount" ];
     wantedBy = [ "multi-user.target" ];
+
+    # Read sidecar.conf from the agent drive to get per-agent configuration.
+    # The conf file contains KEY=VALUE pairs (AGENT_ID, TEAM_ID, NATS_URL,
+    # NATS_TOKEN, VSOCK_PORT).
+    script = ''
+      AGENT_ID="unknown"
+      TEAM_ID=""
+      NATS_URL="nats://127.0.0.1:4222"
+      NATS_TOKEN=""
+      VSOCK_PORT="4222"
+
+      if [ -f /agent/sidecar.conf ]; then
+        . /agent/sidecar.conf
+      fi
+
+      exec /opt/hive/sidecar \
+        --agent-id "$AGENT_ID" \
+        --team-id "$TEAM_ID" \
+        --nats-url "$NATS_URL" \
+        --nats-token "$NATS_TOKEN" \
+        --workspace /agent \
+        --vsock \
+        --vsock-port "$VSOCK_PORT"
+    '';
+
     serviceConfig = {
-      ExecStart = "/opt/hive/sidecar";
+      Type = "simple";
       Restart = "always";
       RestartSec = "5s";
       WorkingDirectory = "/opt/hive";
@@ -156,6 +246,7 @@ in
     util-linux   # for lsblk, mount, etc.
     procps       # for ps, top
     strace       # for debugging agent issues
+    sidecarBin   # Hive sidecar — installed to /opt/hive/sidecar via populateImageCommands
   ];
 
   # ---------------------------------------------------------------------------
@@ -181,6 +272,12 @@ in
       # Ensure the init symlink exists at /sbin/init for systemd.
       mkdir -p ./files/sbin
       ln -sf ${config.system.build.toplevel}/init ./files/sbin/init
+
+      # Install the sidecar binary at /opt/hive/sidecar.
+      # The systemd service (hive-sidecar.service) exec's this path directly.
+      # sidecarBin is either the real compiled binary or a stub that prints an
+      # error — see the sidecarBin derivation in the let block above.
+      install -Dm755 ${sidecarBin}/bin/hive-sidecar ./files/opt/hive/sidecar
     '';
   };
 

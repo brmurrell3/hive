@@ -325,6 +325,52 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 	)
 }
 
+// CallLocal invokes a locally registered handler directly, bypassing NATS.
+// This is used by the sidecar to execute capabilities without publishing back
+// to the same NATS subject (which would cause an infinite loop).
+// Returns an InvocationResponse with status, outputs, and timing information.
+func (r *Router) CallLocal(capability string, inputs map[string]interface{}) *InvocationResponse {
+	r.mu.RLock()
+	handler, ok := r.handlers[capability]
+	r.mu.RUnlock()
+
+	if !ok {
+		return &InvocationResponse{
+			Capability: capability,
+			Status:     "error",
+			Error: &InvocationError{
+				Code:      "NOT_FOUND",
+				Message:   fmt.Sprintf("no handler registered for capability %q", capability),
+				Retryable: false,
+			},
+		}
+	}
+
+	start := time.Now()
+	outputs, err := handler(inputs)
+	durationMs := time.Since(start).Milliseconds()
+
+	if err != nil {
+		return &InvocationResponse{
+			Capability: capability,
+			Status:     "error",
+			Error: &InvocationError{
+				Code:      "HANDLER_ERROR",
+				Message:   err.Error(),
+				Retryable: false,
+			},
+			DurationMs: durationMs,
+		}
+	}
+
+	return &InvocationResponse{
+		Capability: capability,
+		Status:     "success",
+		Outputs:    outputs,
+		DurationMs: durationMs,
+	}
+}
+
 // publishErrorResponse sends an error response envelope to the reply subject.
 func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message string, start time.Time) {
 	if msg.Reply == "" {

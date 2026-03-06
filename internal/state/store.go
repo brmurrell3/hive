@@ -87,7 +87,9 @@ type Store struct {
 }
 
 // NewStore creates a new Store backed by the given file path.
-// If the file exists it is loaded; otherwise an empty state is created.
+// If the file exists it is loaded; if it is corrupt, the backup
+// (state.json.bak) is tried; if both fail, an empty state is used so
+// that hived can always start.
 func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	s := &Store{
 		path:   path,
@@ -97,9 +99,19 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 
 	if _, err := os.Stat(path); err == nil {
 		if err := s.Load(); err != nil {
-			return nil, fmt.Errorf("loading state from %s: %w", path, err)
+			logger.Warn("state file corrupt, attempting backup recovery",
+				"path", path, "error", err)
+			if bakErr := s.loadFromBackup(); bakErr != nil {
+				logger.Warn("backup state also unusable, starting with empty state",
+					"backup_path", s.backupPath(), "error", bakErr)
+				s.state = newState()
+			} else {
+				logger.Info("recovered state from backup", "path", s.backupPath(),
+					"agents", len(s.state.Agents))
+			}
+		} else {
+			logger.Info("loaded existing state", "path", path, "agents", len(s.state.Agents))
 		}
-		logger.Info("loaded existing state", "path", path, "agents", len(s.state.Agents))
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("checking state file %s: %w", path, err)
 	} else {
@@ -144,6 +156,43 @@ func (s *Store) Load() error {
 	return nil
 }
 
+// loadFromBackup attempts to load state from the backup file (state.json.bak).
+// It is called when the primary state file is corrupt.
+func (s *Store) loadFromBackup() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bakPath := s.backupPath()
+	data, err := os.ReadFile(bakPath)
+	if err != nil {
+		return fmt.Errorf("reading backup state file: %w", err)
+	}
+
+	var st State
+	if err := json.Unmarshal(data, &st); err != nil {
+		return fmt.Errorf("parsing backup state file: %w", err)
+	}
+
+	if st.Agents == nil {
+		st.Agents = make(map[string]*AgentState)
+	}
+	if st.Nodes == nil {
+		st.Nodes = make(map[string]*types.NodeState)
+	}
+	if st.Capabilities == nil {
+		st.Capabilities = types.NewCapabilityRegistry()
+	}
+	if st.Tokens == nil {
+		st.Tokens = []*types.Token{}
+	}
+	if st.Users == nil {
+		st.Users = []*auth.User{}
+	}
+
+	s.state = &st
+	return nil
+}
+
 // Save writes the current state to disk atomically by writing to a temporary
 // file first then renaming it over the target path.
 func (s *Store) Save() error {
@@ -153,7 +202,14 @@ func (s *Store) Save() error {
 	return s.saveLocked()
 }
 
+// backupPath returns the path of the backup state file.
+func (s *Store) backupPath() string {
+	return s.path + ".bak"
+}
+
 // saveLocked performs the atomic save while the caller already holds the mutex.
+// Before overwriting state.json, it copies the current file to state.json.bak
+// so that a prior good state is always recoverable.
 func (s *Store) saveLocked() error {
 	data, err := json.MarshalIndent(s.state, "", "  ")
 	if err != nil {
@@ -163,6 +219,14 @@ func (s *Store) saveLocked() error {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating state directory: %w", err)
+	}
+
+	// Back up the current state file before overwriting. Errors here are
+	// logged but not fatal — the primary save must still proceed.
+	if existing, readErr := os.ReadFile(s.path); readErr == nil {
+		if writeErr := os.WriteFile(s.backupPath(), existing, 0644); writeErr != nil {
+			s.logger.Warn("failed to write state backup", "error", writeErr)
+		}
 	}
 
 	tmp, err := os.CreateTemp(dir, "state-*.json.tmp")
@@ -227,8 +291,9 @@ func (s *Store) SetAgent(agent *AgentState) error {
 }
 
 // ModifyAgent performs an atomic read-modify-write on agent state.
-// T2-02: The callback receives the current state, mutates it, and the store
-// persists atomically while holding the lock.
+// T2-02: The callback receives a deep copy of the current state, mutates it,
+// and only if the callback succeeds does the store update the real state and
+// persist atomically while holding the lock.
 func (s *Store) ModifyAgent(id string, fn func(*AgentState) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -238,15 +303,20 @@ func (s *Store) ModifyAgent(id string, fn func(*AgentState) error) error {
 		return fmt.Errorf("agent %q not found in state", id)
 	}
 
-	if err := fn(agent); err != nil {
+	// Work on a deep copy so the callback cannot mutate live state on error.
+	cp := *agent
+	if err := fn(&cp); err != nil {
 		return err
 	}
+
+	// Callback succeeded — commit the copy to live state.
+	s.state.Agents[id] = &cp
 
 	if err := s.saveLocked(); err != nil {
 		return fmt.Errorf("saving state after modifying agent %s: %w", id, err)
 	}
 
-	s.logger.Debug("agent state modified atomically", "agent_id", id, "status", agent.Status)
+	s.logger.Debug("agent state modified atomically", "agent_id", id, "status", cp.Status)
 	return nil
 }
 
@@ -357,6 +427,7 @@ func (s *Store) RemoveNode(id string) error {
 }
 
 // AllNodes returns all node states sorted alphabetically by ID.
+// Deep-copies Labels map and Agents slice for each node.
 func (s *Store) AllNodes() []*types.NodeState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -364,6 +435,16 @@ func (s *Store) AllNodes() []*types.NodeState {
 	nodes := make([]*types.NodeState, 0, len(s.state.Nodes))
 	for _, n := range s.state.Nodes {
 		cp := *n
+		if n.Labels != nil {
+			cp.Labels = make(map[string]string, len(n.Labels))
+			for k, v := range n.Labels {
+				cp.Labels[k] = v
+			}
+		}
+		if n.Agents != nil {
+			cp.Agents = make([]string, len(n.Agents))
+			copy(cp.Agents, n.Agents)
+		}
 		nodes = append(nodes, &cp)
 	}
 	sort.Slice(nodes, func(i, j int) bool {

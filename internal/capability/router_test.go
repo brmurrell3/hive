@@ -26,7 +26,7 @@ func testLogger() *slog.Logger {
 
 func testNATSConn(t *testing.T, srv *hivenats.Server) *nats.Conn {
 	t.Helper()
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatal(err)
 	}

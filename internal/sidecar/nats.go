@@ -3,6 +3,8 @@ package sidecar
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/hivehq/hive/internal/types"
@@ -26,6 +28,11 @@ func (s *Sidecar) connectNATS() error {
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			s.logger.Info("NATS connection closed")
 		}),
+	}
+
+	// Add authentication token if configured.
+	if s.config.NATSToken != "" {
+		opts = append(opts, nats.Token(s.config.NATSToken))
 	}
 
 	// T1-06: Retry with exponential backoff for up to 60s.
@@ -193,6 +200,95 @@ func (s *Sidecar) publishHeartbeat(subject string) {
 		"healthy", healthy,
 		"uptime_seconds", uptimeSeconds,
 	)
+}
+
+// subscribeMemoryUpdates subscribes to hive.agent.{agentID}.memory for
+// receiving MEMORY.md content pushed from hived when the file changes on the
+// host. When a message arrives, the sidecar writes the content to
+// {workspace}/MEMORY.md so the agent runtime can read it.
+func (s *Sidecar) subscribeMemoryUpdates() error {
+	subject := fmt.Sprintf("hive.agent.%s.memory", s.agentID)
+
+	_, err := s.natsConn.Subscribe(subject, func(msg *nats.Msg) {
+		s.logger.Debug("received memory update",
+			"subject", msg.Subject,
+			"size", len(msg.Data),
+		)
+
+		var env types.Envelope
+		if err := json.Unmarshal(msg.Data, &env); err != nil {
+			s.logger.Warn("failed to unmarshal memory update message",
+				"error", err,
+			)
+			return
+		}
+
+		// The payload is the MEMORY.md content as a string.
+		content, ok := env.Payload.(string)
+		if !ok {
+			s.logger.Warn("memory update payload is not a string",
+				"payload_type", fmt.Sprintf("%T", env.Payload),
+			)
+			return
+		}
+
+		// Write the content to the workspace.
+		workspace := s.config.WorkspacePath
+		if workspace == "" {
+			s.logger.Warn("no workspace path configured, cannot write MEMORY.md")
+			return
+		}
+
+		memoryPath := workspace + "/MEMORY.md"
+		if err := writeFileAtomic(memoryPath, []byte(content)); err != nil {
+			s.logger.Error("failed to write MEMORY.md",
+				"path", memoryPath,
+				"error", err,
+			)
+			return
+		}
+
+		s.logger.Info("MEMORY.md updated from NATS push",
+			"path", memoryPath,
+			"size_bytes", len(content),
+		)
+	})
+	if err != nil {
+		return fmt.Errorf("subscribing to %s: %w", subject, err)
+	}
+
+	s.logger.Info("subscribed to memory updates", "subject", subject)
+	return nil
+}
+
+// writeFileAtomic writes data to a file atomically by writing to a temporary
+// file first and then renaming it. This prevents partial reads by the agent
+// runtime if it reads the file while the sidecar is writing.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".memory-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("renaming temp file: %w", err)
+	}
+
+	return nil
 }
 
 // closeNATS drains and closes the NATS connection gracefully.

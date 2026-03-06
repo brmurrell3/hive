@@ -28,7 +28,8 @@ func NewMockHypervisor() *MockHypervisor {
 }
 
 // CreateVM simulates VM creation by recording the socket path.
-// Returns a synthetic PID for the created VM process.
+// Returns a synthetic PID for the created VM process. The same PID will be
+// used by StartVM so that callers see consistent PID values.
 func (m *MockHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -41,16 +42,16 @@ func (m *MockHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		return 0, fmt.Errorf("mock: VM already exists at socket %s", cfg.SocketPath)
 	}
 
-	// Assign a fake PID immediately so the manager can store it.
+	// Assign a fake PID and store it so StartVM will use the same value.
 	pid := m.nextPID
 	m.nextPID++
-	// Store with PID 0 to indicate created but not started; the real PID
-	// is returned to the caller (Manager stores it in state).
-	m.running[cfg.SocketPath] = 0
+	// Store the negative PID to indicate created-but-not-started.
+	// StartVM flips it to positive to indicate running.
+	m.running[cfg.SocketPath] = -pid
 	return pid, nil
 }
 
-// StartVM simulates VM boot by assigning a fake PID.
+// StartVM simulates VM boot by marking the stored PID as running.
 func (m *MockHypervisor) StartVM(socketPath string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -63,12 +64,12 @@ func (m *MockHypervisor) StartVM(socketPath string) error {
 	if !exists {
 		return fmt.Errorf("mock: no VM at socket %s", socketPath)
 	}
-	if pid != 0 {
+	if pid > 0 {
 		return fmt.Errorf("mock: VM at socket %s is already running with PID %d", socketPath, pid)
 	}
 
-	m.running[socketPath] = m.nextPID
-	m.nextPID++
+	// Flip negative PID to positive to mark as running.
+	m.running[socketPath] = -pid
 	return nil
 }
 
@@ -103,12 +104,13 @@ func (m *MockHypervisor) DestroyVM(socketPath string, pid int) error {
 }
 
 // IsRunning checks whether a fake PID is still tracked as running.
+// Only positive PIDs are considered running (negative means created-but-not-started).
 func (m *MockHypervisor) IsRunning(pid int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, p := range m.running {
-		if p == pid && p != 0 {
+		if p == pid && p > 0 {
 			return true
 		}
 	}
@@ -116,13 +118,14 @@ func (m *MockHypervisor) IsRunning(pid int) bool {
 }
 
 // RunningCount returns the number of currently running VMs. Useful for test assertions.
+// Only counts VMs with positive PIDs (started), not created-but-not-started (negative PIDs).
 func (m *MockHypervisor) RunningCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	count := 0
 	for _, pid := range m.running {
-		if pid != 0 {
+		if pid > 0 {
 			count++
 		}
 	}

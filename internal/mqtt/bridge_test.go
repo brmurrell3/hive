@@ -197,7 +197,7 @@ func TestBridge_StartsAndAcceptsTCP(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	store := testStateStore(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestBridge_ConnectWithValidAuth(t *testing.T) {
 	store := testStateStore(t)
 	rawToken := addTestToken(t, store)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestBridge_ConnectWithInvalidAuth(t *testing.T) {
 	store := testStateStore(t)
 	addTestToken(t, store)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestBridge_ConnectWithNoPassword(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	store := testStateStore(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestBridge_PublishBridgesToNATS(t *testing.T) {
 	store := testStateStore(t)
 	rawToken := addTestToken(t, store)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestBridge_StopIsClean(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	store := testStateStore(t)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestBridge_PingPong(t *testing.T) {
 	store := testStateStore(t)
 	rawToken := addTestToken(t, store)
 
-	nc, err := nats.Connect(srv.ClientURL())
+	nc, err := nats.Connect(srv.ClientURL(), nats.Token(srv.AuthToken()))
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
 	}
