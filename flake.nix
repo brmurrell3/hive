@@ -22,7 +22,7 @@
           inherit version;
           src = self;
 
-          vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+          vendorHash = "sha256-M1nl7m22tOyVtta/Y323/fxbv2ZLoc4kPKr4PBUxMcE=";
 
           env.CGO_ENABLED = 0;
           ldflags = [ "-s" "-w" "-X main.version=${version}" ];
