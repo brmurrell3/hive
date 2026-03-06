@@ -174,22 +174,41 @@ func scaffoldClusterInteractive(dir string) error {
 		f.Close()
 	}
 
-	fmt.Printf("\nCluster root created at %s\n", dir)
+	absDir, _ := filepath.Abs(dir)
+
+	fmt.Printf("\nCluster root created at %s\n", absDir)
 	fmt.Println()
 	fmt.Println("Generated files:")
-	fmt.Printf("  %s/cluster.yaml\n", dir)
-	fmt.Printf("  %s/agents/%s/manifest.yaml\n", dir, v.AgentID)
-	fmt.Printf("  %s/agents/%s/openclaw.json\n", dir, v.AgentID)
-	fmt.Printf("  %s/teams/default.yaml\n", dir)
-	fmt.Printf("  %s/setup-pi.sh\n", dir)
-	fmt.Printf("  %s/state.db  (pre-seeded with join token)\n", dir)
+	fmt.Printf("  cluster.yaml\n")
+	fmt.Printf("  agents/%s/manifest.yaml\n", v.AgentID)
+	fmt.Printf("  agents/%s/openclaw.json\n", v.AgentID)
+	fmt.Printf("  teams/default.yaml\n")
+	fmt.Printf("  setup-pi.sh\n")
+	fmt.Printf("  state.db  (pre-seeded with join token)\n")
 	fmt.Println()
-	fmt.Println("Next steps:")
-	fmt.Println("  1. Start hived:        hived --cluster-root " + dir)
-	fmt.Println("  2. Copy to Pi:         scp " + dir + "/setup-pi.sh pi@<PI_IP>:~/setup-pi.sh")
-	fmt.Println("  3. Run on Pi:          ssh pi@<PI_IP> 'bash ~/setup-pi.sh'")
+	fmt.Println("NixOS flake config (paste into /etc/nixos/flake.nix):")
 	fmt.Println()
-	fmt.Printf("Join token (first 8 chars): %s...\n", rawToken[:8])
+	fmt.Printf(`  services.hived = {
+    enable = true;
+    clusterRoot = "%s";
+    user = "%s";
+    group = "users";
+    openFirewall = true;
+    agent = {
+      enable = true;
+      id = "%s";
+      manifest = "%s/agents/%s/manifest.yaml";
+      openclawConfig = "%s/agents/%s/openclaw.json";
+      joinToken = "%s";
+    };
+  };
+`, absDir, currentUser(), v.AgentID, absDir, v.AgentID, absDir, v.AgentID, rawToken)
+	fmt.Println()
+	fmt.Println("Then: sudo nixos-rebuild switch")
+	fmt.Println()
+	fmt.Println("For Pi deployment instead:")
+	fmt.Println("  scp " + absDir + "/setup-pi.sh pi@<PI_IP>:~/setup-pi.sh")
+	fmt.Println("  ssh pi@<PI_IP> 'bash ~/setup-pi.sh'")
 
 	return nil
 }
@@ -219,6 +238,14 @@ func promptRequired(scanner *bufio.Scanner, prompt string) string {
 		}
 		fmt.Println("  (required)")
 	}
+}
+
+// currentUser returns the current OS username.
+func currentUser() string {
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	return "deploy"
 }
 
 // detectDesktopIP returns the local IP used for outbound connections.
