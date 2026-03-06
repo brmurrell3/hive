@@ -553,7 +553,7 @@ Create `~/.openclaw/openclaw.json` with your keys (see the generated
   --agent-id assistant \
   --manifest /home/pi/manifest.yaml \
   --runtime-cmd openclaw \
-  --runtime-args start \
+  --runtime-args gateway \
   --work-dir /home/pi/hive-workspace \
   --http-addr :9100
 ```

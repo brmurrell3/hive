@@ -168,6 +168,7 @@ in
           ${lib.optionalString (agentCfg.openclawConfig != "") ''
             mkdir -p "${userHome}/.openclaw"
             cp "${agentCfg.openclawConfig}" "${userHome}/.openclaw/openclaw.json"
+            chown ${cfg.user}:${cfg.group} "${userHome}/.openclaw/openclaw.json"
             chmod 600 "${userHome}/.openclaw/openclaw.json"
           ''}
 
@@ -194,7 +195,7 @@ in
             --agent-id ${agentCfg.id} \
             --manifest ${agentCfg.manifest} \
             --runtime-cmd ${userHome}/.local/bin/openclaw \
-            --runtime-args start \
+            --runtime-args gateway \
             --work-dir ${workDir} \
             --http-addr ${agentCfg.httpAddr} \
             ${lib.optionalString (agentCfg.joinToken != "") "--token ${agentCfg.joinToken}"} \

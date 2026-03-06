@@ -643,7 +643,7 @@ ExecStart=$AGENT_BIN join \\
     --agent-id $AGENT_ID \\
     --manifest $MANIFEST \\
     --runtime-cmd openclaw \\
-    --runtime-args start \\
+    --runtime-args gateway \\
     --work-dir $HOME/hive-workspace \\
     --http-addr :9100
 Restart=on-failure
