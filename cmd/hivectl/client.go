@@ -83,9 +83,10 @@ func natsAuthToken(root string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// newDaemonClient connects to hived's NATS server using the port from cluster.yaml
-// and authenticates with the token from .state/nats-auth-token (or cluster.yaml).
-func newDaemonClient() (*DaemonClient, error) {
+// connectNATS connects to hived's NATS server using cluster.yaml config and
+// the auth token from .state/nats-auth-token (or cluster.yaml). The name
+// parameter is used as the NATS client name for debugging.
+func connectNATS(name string) (*nats.Conn, error) {
 	natsURL, err := natsURLFromConfig(clusterRoot)
 	if err != nil {
 		return nil, fmt.Errorf("determining NATS URL: %w", err)
@@ -93,7 +94,7 @@ func newDaemonClient() (*DaemonClient, error) {
 
 	opts := []nats.Option{
 		nats.Timeout(5 * time.Second),
-		nats.Name("hivectl"),
+		nats.Name(name),
 	}
 
 	if token := natsAuthToken(clusterRoot); token != "" {
@@ -102,9 +103,19 @@ func newDaemonClient() (*DaemonClient, error) {
 
 	nc, err := nats.Connect(natsURL, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to hived NATS at %s: %w (is hived running?)", natsURL, err)
+		return nil, fmt.Errorf("connecting to NATS at %s: %w (is hived running?)", natsURL, err)
 	}
 
+	return nc, nil
+}
+
+// newDaemonClient connects to hived's NATS server using the port from cluster.yaml
+// and authenticates with the token from .state/nats-auth-token (or cluster.yaml).
+func newDaemonClient() (*DaemonClient, error) {
+	nc, err := connectNATS("hivectl")
+	if err != nil {
+		return nil, err
+	}
 	return &DaemonClient{nc: nc}, nil
 }
 
@@ -124,6 +135,7 @@ func (c *DaemonClient) request(subject string, req interface{}) (*CtlResponse, e
 		Type:      types.MessageTypeControl,
 		Timestamp: time.Now(),
 		Payload:   req,
+		UserToken: authToken,
 	}
 
 	data, err := json.Marshal(env)

@@ -6,18 +6,29 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/hivehq/hive/internal/auth"
 	"github.com/hivehq/hive/internal/capability"
+	"github.com/hivehq/hive/internal/cluster"
 	"github.com/hivehq/hive/internal/config"
+	"github.com/hivehq/hive/internal/dashboard"
+	"github.com/hivehq/hive/internal/director"
 	"github.com/hivehq/hive/internal/health"
+	"github.com/hivehq/hive/internal/logs"
+	"github.com/hivehq/hive/internal/metrics"
+	"github.com/hivehq/hive/internal/mqtt"
 	hivenats "github.com/hivehq/hive/internal/nats"
 	"github.com/hivehq/hive/internal/node"
+	"github.com/hivehq/hive/internal/firmware"
+	"github.com/hivehq/hive/internal/production"
 	"github.com/hivehq/hive/internal/reconciler"
+	"github.com/hivehq/hive/internal/scheduler"
 	"github.com/hivehq/hive/internal/state"
 	"github.com/hivehq/hive/internal/types"
 	"github.com/hivehq/hive/internal/vm"
@@ -76,11 +87,12 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	defer ns.Shutdown()
 
 	// T2-13: Initialize state store.
-	statePath := filepath.Join(absRoot, "state.json")
+	statePath := filepath.Join(absRoot, "state.db")
 	store, err := state.NewStore(statePath, logger)
 	if err != nil {
 		return fmt.Errorf("initializing state store: %w", err)
 	}
+	defer store.Close()
 
 	// Write the NATS auth token to .state/nats-auth-token so hivectl can read it.
 	stateDir := filepath.Join(absRoot, ".state")
@@ -94,11 +106,59 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	logger.Info("NATS auth token written", "path", tokenPath)
 
 	// Connect to the embedded NATS server as a client using the auth token.
-	nc, err := nats.Connect(ns.ClientURL(), nats.Token(ns.AuthToken()))
+	nc, err := nats.Connect(ns.ClientURL(),
+		nats.Token(ns.AuthToken()),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(1*time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			logger.Warn("NATS client disconnected", "error", err)
+		}),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			logger.Info("NATS client reconnected")
+		}),
+	)
 	if err != nil {
 		return fmt.Errorf("connecting to embedded NATS: %w", err)
 	}
 	defer nc.Drain()
+
+	// Start metrics collector (no deps).
+	collector := metrics.NewCollector()
+	logger.Info("metrics collector initialized")
+
+	// Start log aggregator.
+	logDir := filepath.Join(absRoot, ".state", "logs")
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		return fmt.Errorf("creating log directory: %w", err)
+	}
+	logAgg := logs.NewAggregator(logs.AggregatorConfig{
+		NATSConn:      nc,
+		LogDir:        logDir,
+		RetentionDays: cfg.Spec.Logging.EffectiveRetentionDays(),
+		Logger:        logger,
+	})
+	if cfg.Spec.Logging.Enabled {
+		if err := logAgg.Start(); err != nil {
+			return fmt.Errorf("starting log aggregator: %w", err)
+		}
+		defer logAgg.Stop()
+		logger.Info("log aggregator started", "log_dir", logDir)
+	}
+
+	// Start MQTT bridge (if enabled).
+	if cfg.Spec.MQTT.Enabled {
+		mqttBridge := mqtt.NewBridge(mqtt.Config{
+			Port:     cfg.Spec.MQTT.EffectivePort(),
+			NATSConn: nc,
+			Store:    store,
+			Logger:   logger,
+		})
+		if err := mqttBridge.Start(); err != nil {
+			return fmt.Errorf("starting MQTT bridge: %w", err)
+		}
+		defer mqttBridge.Stop()
+		logger.Info("MQTT bridge started", "port", mqttBridge.Port())
+	}
 
 	// Determine hypervisor (mock if no KVM or env override).
 	var hyp vm.Hypervisor
@@ -186,14 +246,32 @@ func run(clusterRoot string, logger *slog.Logger) error {
 		logger.Info("restart configs populated", "agent_count", len(desiredState.Agents))
 	}
 
+	// Initialize scheduler (stateless, no Start/Stop).
+	sched := scheduler.NewScheduler(store, logger)
+	logger.Info("scheduler initialized")
+
 	// T2-13: Start reconciler.
 	rec := reconciler.NewReconciler(store, absRoot, logger)
+	rec.SetScheduler(&schedulerAdapter{s: sched})
 	rec.SetActionHandler(func(action reconciler.Action) error {
 		switch action.Type {
 		case reconciler.ActionCreate:
 			return vmMgr.StartAgent(action.Manifest)
 		case reconciler.ActionDestroy:
-			return vmMgr.DestroyAgent(action.AgentID)
+			if err := vmMgr.DestroyAgent(action.AgentID); err != nil {
+				return err
+			}
+			// Release scheduler allocations so the in-memory resource tracking
+			// stays accurate. Log but don't fail the destroy on error.
+			if err := sched.ReleaseAgent(action.AgentID); err != nil {
+				logger.Warn("scheduler release failed after destroy",
+					"agent_id", action.AgentID,
+					"error", err,
+				)
+			}
+			// Remove agent from health monitor to prevent unbounded map growth.
+			monitor.RemoveAgent(action.AgentID)
+			return nil
 		case reconciler.ActionRestart:
 			return vmMgr.RestartAgent(action.AgentID, action.Manifest)
 		default:
@@ -250,13 +328,138 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	}
 	defer memWatcher.Stop()
 
+	// Build RBAC authorizer from stored users (if any).
+	// When no users are configured, the authorizer is nil and all operations
+	// are allowed (backward compatible single-user mode).
+	var authorizer *auth.Authorizer
+	storedUsers := store.AllUsers()
+	if len(storedUsers) > 0 {
+		users := make([]auth.User, len(storedUsers))
+		for i, u := range storedUsers {
+			users[i] = *u
+		}
+		authorizer = auth.NewAuthorizer(users, logger)
+		logger.Info("RBAC authorizer initialized", "user_count", len(users))
+	} else {
+		logger.Info("no RBAC users configured, authorization checks disabled")
+	}
+
 	// Register control message handler for hivectl commands.
 	// hivectl sends requests on hive.ctl.agents.* and hived responds via
 	// the NATS request/reply pattern, ensuring all state mutations go through
 	// hived's single VM manager and state store.
-	ctlHandler := newControlHandler(absRoot, store, vmMgr, logger)
+	ctlHandler := newControlHandler(absRoot, store, vmMgr, sched, monitor, authorizer, logger)
 	if err := ctlHandler.subscribe(nc); err != nil {
 		return fmt.Errorf("registering control handler: %w", err)
+	}
+
+	// Run crash recovery to reconcile stale state from a previous unclean shutdown.
+	crashRecovery := production.NewCrashRecovery(production.RecoveryConfig{
+		Store:  store,
+		Logger: logger,
+	})
+	if err := crashRecovery.Reconcile(); err != nil {
+		logger.Error("crash recovery reconciliation error", "error", err)
+	}
+
+	// Start resource monitor.
+	resMon := production.NewResourceMonitor(production.MonitorConfig{
+		Store:           store,
+		Metrics:         collector,
+		Logger:          logger,
+		CheckInterval:   30 * time.Second,
+		MemoryThreshold: 0.9,
+		CPUThreshold:    0.9,
+	})
+	if err := resMon.Start(); err != nil {
+		return fmt.Errorf("starting resource monitor: %w", err)
+	}
+	defer resMon.Stop()
+
+	// Start cluster manager.
+	clusterRole := cluster.Role("root")
+	clusterMgr := cluster.NewCluster(cluster.Config{
+		Role:        clusterRole,
+		NATSMode:    cfg.Spec.NATS.Mode,
+		NATSUrls:    cfg.Spec.NATS.URLs,
+		ClusterRoot: absRoot,
+	}, store, logger)
+	if err := clusterMgr.Start(); err != nil {
+		return fmt.Errorf("starting cluster manager: %w", err)
+	}
+	defer clusterMgr.Stop()
+
+	logger.Info("scheduler initialized")
+
+	// Start cross-team router and director (if teams exist).
+	if desiredState != nil && len(desiredState.Teams) > 0 {
+		ctRouter := capability.NewCrossTeamRouter(nc, store, logger)
+		if err := ctRouter.Start(desiredState.Teams); err != nil {
+			return fmt.Errorf("starting cross-team router: %w", err)
+		}
+		defer ctRouter.Stop()
+		logger.Info("cross-team router started", "team_count", len(desiredState.Teams))
+
+		// Build a director auth function from the RBAC authorizer when available.
+		// The director's AuthFunc takes a senderID (envelope From field) and
+		// verifies the sender is a known user in the RBAC system.
+		var directorAuth director.AuthFunc
+		if authorizer != nil {
+			directorAuth = func(senderID string) error {
+				user := authorizer.GetUser(senderID)
+				if user == nil {
+					return fmt.Errorf("unknown sender %q", senderID)
+				}
+				return nil
+			}
+		}
+		dir := director.NewDirector("director", nc, store, logger, directorAuth)
+		if err := dir.Start(); err != nil {
+			return fmt.Errorf("starting director: %w", err)
+		}
+		defer dir.Stop()
+		logger.Info("director started")
+	}
+
+	// Initialize OTA updater (stateless, no Start/Stop).
+	_ = firmware.NewUpdater(nc, logger)
+	logger.Info("OTA updater initialized")
+
+	// Start dashboard (if enabled).
+	if cfg.Spec.Dashboard.Enabled {
+		dashSrv := dashboard.NewServer(dashboard.Config{
+			Store:      store,
+			NATSConn:   nc,
+			Logs:       logAgg,
+			Logger:     logger,
+			Addr:       cfg.Spec.Dashboard.EffectiveAddr(),
+			CORSOrigin: cfg.Spec.Dashboard.CORSOrigin,
+			AuthToken:  cfg.Spec.Dashboard.AuthToken,
+		})
+		go func() {
+			if err := dashSrv.Start(); err != nil {
+				logger.Error("dashboard server error", "error", err)
+			}
+		}()
+		defer dashSrv.Stop(context.Background())
+		logger.Info("dashboard started", "addr", cfg.Spec.Dashboard.EffectiveAddr())
+	}
+
+	// Start metrics HTTP server (if enabled).
+	if cfg.Spec.Metrics.Enabled {
+		metricsAddr := cfg.Spec.Metrics.EffectiveAddr()
+		metricsSrv := &http.Server{
+			Addr:              metricsAddr,
+			Handler:           collector.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			logger.Info("metrics server starting", "addr", metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("metrics server error", "error", err)
+			}
+		}()
+		defer metricsSrv.Close()
 	}
 
 	logger.Info("hived is ready",
@@ -264,14 +467,32 @@ func run(clusterRoot string, logger *slog.Logger) error {
 		"state_path", statePath,
 	)
 
-	// Wait for shutdown signal
+	// Wait for shutdown signal, then execute graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	<-ctx.Done()
 	logger.Info("received shutdown signal")
 
+	vmShutdown := &vmAdapter{mgr: vmMgr}
+	graceful := production.NewGracefulShutdown(production.ShutdownConfig{
+		Store:     store,
+		VMManager: vmShutdown,
+		Logger:    logger,
+		Timeout:   30 * time.Second,
+	})
+	if err := graceful.Execute(context.Background()); err != nil {
+		logger.Error("graceful shutdown error", "error", err)
+	}
+
 	return nil
+}
+
+// vmAdapter adapts vm.Manager to the production.VMAccess interface.
+type vmAdapter struct{ mgr *vm.Manager }
+
+func (a *vmAdapter) StopVM(_ context.Context, agentID string) error {
+	return a.mgr.StopAgent(agentID)
 }
 
 // ctlRequest is the payload sent from hivectl to hived on control subjects.
@@ -292,14 +513,20 @@ type controlHandler struct {
 	clusterRoot string
 	store       *state.Store
 	vmMgr       *vm.Manager
+	scheduler   *scheduler.Scheduler
+	monitor     *health.Monitor
+	authorizer  *auth.Authorizer // nil means RBAC disabled (backward compatible)
 	logger      *slog.Logger
 }
 
-func newControlHandler(clusterRoot string, store *state.Store, vmMgr *vm.Manager, logger *slog.Logger) *controlHandler {
+func newControlHandler(clusterRoot string, store *state.Store, vmMgr *vm.Manager, sched *scheduler.Scheduler, mon *health.Monitor, authorizer *auth.Authorizer, logger *slog.Logger) *controlHandler {
 	return &controlHandler{
 		clusterRoot: clusterRoot,
 		store:       store,
 		vmMgr:       vmMgr,
+		scheduler:   sched,
+		monitor:     mon,
+		authorizer:  authorizer,
 		logger:      logger,
 	}
 }
@@ -325,25 +552,65 @@ func (h *controlHandler) subscribe(nc *nats.Conn) error {
 	return nil
 }
 
-// parseRequest extracts the ctlRequest from a NATS envelope message.
-func (h *controlHandler) parseRequest(msg *nats.Msg) (*ctlRequest, error) {
+// parseRequest extracts the ctlRequest and envelope from a NATS message.
+func (h *controlHandler) parseRequest(msg *nats.Msg) (*ctlRequest, *types.Envelope, error) {
 	var env types.Envelope
 	if err := json.Unmarshal(msg.Data, &env); err != nil {
-		return nil, fmt.Errorf("parsing envelope: %w", err)
+		return nil, nil, fmt.Errorf("parsing envelope: %w", err)
 	}
 
 	// The Payload field is interface{}, re-marshal and unmarshal to get the typed request.
 	payloadBytes, err := json.Marshal(env.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("re-marshaling payload: %w", err)
+		return nil, nil, fmt.Errorf("re-marshaling payload: %w", err)
 	}
 
 	var req ctlRequest
 	if err := json.Unmarshal(payloadBytes, &req); err != nil {
-		return nil, fmt.Errorf("parsing control request: %w", err)
+		return nil, nil, fmt.Errorf("parsing control request: %w", err)
 	}
 
-	return &req, nil
+	return &req, &env, nil
+}
+
+// authorize checks RBAC permissions for the request. It returns nil if
+// the operation is allowed. If no authorizer is configured (single-user mode),
+// all operations are allowed for backward compatibility. When RBAC is enabled,
+// requests must include a valid UserToken or they will be rejected.
+func (h *controlHandler) authorize(env *types.Envelope, action string, resource string) error {
+	if h.authorizer == nil {
+		// RBAC not configured; allow all operations.
+		return nil
+	}
+
+	if env.UserToken == "" {
+		// RBAC is enabled (authorizer is non-nil) but no credentials were
+		// provided. Reject the request to prevent authorization bypass.
+		return fmt.Errorf("authentication required: no token provided")
+	}
+
+	user, err := h.authorizer.Authenticate(env.UserToken)
+	if err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	if err := h.authorizer.Authorize(user, action, resource); err != nil {
+		h.logger.Warn("authorization denied",
+			"user_id", user.ID,
+			"role", user.Role,
+			"action", action,
+			"resource", resource,
+		)
+		return err
+	}
+
+	h.logger.Debug("authorization granted",
+		"user_id", user.ID,
+		"role", user.Role,
+		"action", action,
+		"resource", resource,
+	)
+	return nil
 }
 
 // respond sends a ctlResponse back on the reply subject.
@@ -364,9 +631,14 @@ func (h *controlHandler) respondError(msg *nats.Msg, errMsg string) {
 }
 
 func (h *controlHandler) handleStart(msg *nats.Msg) {
-	req, err := h.parseRequest(msg)
+	req, env, err := h.parseRequest(msg)
 	if err != nil {
 		h.respondError(msg, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	if err := h.authorize(env, "start", req.AgentID); err != nil {
+		h.respondError(msg, fmt.Sprintf("unauthorized: %v", err))
 		return
 	}
 
@@ -394,9 +666,14 @@ func (h *controlHandler) handleStart(msg *nats.Msg) {
 }
 
 func (h *controlHandler) handleStop(msg *nats.Msg) {
-	req, err := h.parseRequest(msg)
+	req, env, err := h.parseRequest(msg)
 	if err != nil {
 		h.respondError(msg, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	if err := h.authorize(env, "stop", req.AgentID); err != nil {
+		h.respondError(msg, fmt.Sprintf("unauthorized: %v", err))
 		return
 	}
 
@@ -411,9 +688,14 @@ func (h *controlHandler) handleStop(msg *nats.Msg) {
 }
 
 func (h *controlHandler) handleRestart(msg *nats.Msg) {
-	req, err := h.parseRequest(msg)
+	req, env, err := h.parseRequest(msg)
 	if err != nil {
 		h.respondError(msg, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	if err := h.authorize(env, "restart", req.AgentID); err != nil {
+		h.respondError(msg, fmt.Sprintf("unauthorized: %v", err))
 		return
 	}
 
@@ -441,9 +723,14 @@ func (h *controlHandler) handleRestart(msg *nats.Msg) {
 }
 
 func (h *controlHandler) handleDestroy(msg *nats.Msg) {
-	req, err := h.parseRequest(msg)
+	req, env, err := h.parseRequest(msg)
 	if err != nil {
 		h.respondError(msg, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	if err := h.authorize(env, "destroy", req.AgentID); err != nil {
+		h.respondError(msg, fmt.Sprintf("unauthorized: %v", err))
 		return
 	}
 
@@ -454,13 +741,29 @@ func (h *controlHandler) handleDestroy(msg *nats.Msg) {
 		return
 	}
 
+	// Release scheduler allocations so the in-memory resource tracking
+	// stays accurate. Log but don't fail the destroy on error.
+	if err := h.scheduler.ReleaseAgent(req.AgentID); err != nil {
+		h.logger.Warn("scheduler release failed after destroy",
+			"agent_id", req.AgentID,
+			"error", err,
+		)
+	}
+	// Remove agent from health monitor to prevent unbounded map growth.
+	h.monitor.RemoveAgent(req.AgentID)
+
 	h.respond(msg, &ctlResponse{Success: true})
 }
 
 func (h *controlHandler) handleStatus(msg *nats.Msg) {
-	req, err := h.parseRequest(msg)
+	req, env, err := h.parseRequest(msg)
 	if err != nil {
 		h.respondError(msg, fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	if err := h.authorize(env, "status", req.AgentID); err != nil {
+		h.respondError(msg, fmt.Sprintf("unauthorized: %v", err))
 		return
 	}
 
@@ -474,12 +777,32 @@ func (h *controlHandler) handleStatus(msg *nats.Msg) {
 }
 
 func (h *controlHandler) handleList(msg *nats.Msg) {
-	_, err := h.parseRequest(msg)
+	_, env, err := h.parseRequest(msg)
 	if err != nil {
 		h.respondError(msg, fmt.Sprintf("invalid request: %v", err))
 		return
 	}
 
+	if err := h.authorize(env, "list", ""); err != nil {
+		h.respondError(msg, fmt.Sprintf("unauthorized: %v", err))
+		return
+	}
+
 	agents := h.store.AllAgents()
 	h.respond(msg, &ctlResponse{Success: true, Agents: agents})
+}
+
+// schedulerAdapter wraps *scheduler.Scheduler to satisfy the
+// reconciler.AgentScheduler interface, which expects (string, error)
+// instead of (*Assignment, error).
+type schedulerAdapter struct {
+	s *scheduler.Scheduler
+}
+
+func (a *schedulerAdapter) Schedule(manifest *types.AgentManifest) (string, error) {
+	assignment, err := a.s.Schedule(manifest)
+	if err != nil {
+		return "", err
+	}
+	return assignment.NodeID, nil
 }

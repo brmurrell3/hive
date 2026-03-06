@@ -1,4 +1,4 @@
-package crossteam
+package capability
 
 import (
 	"encoding/json"
@@ -12,53 +12,31 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// InvocationRequest is the payload for a cross-team capability request.
-type InvocationRequest struct {
-	Capability string                 `json:"capability"`
-	Inputs     map[string]interface{} `json:"inputs"`
-	Timeout    string                 `json:"timeout,omitempty"`
-}
-
-// InvocationResponse is the payload for a cross-team capability response.
-type InvocationResponse struct {
-	Capability string                 `json:"capability"`
-	Status     string                 `json:"status"` // success, error, timeout
-	Outputs    map[string]interface{} `json:"outputs,omitempty"`
-	Error      *InvocationError       `json:"error,omitempty"`
-	DurationMs int64                  `json:"duration_ms"`
-}
-
-// InvocationError describes an error during cross-team capability invocation.
-type InvocationError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable"`
-}
-
 // exposedCapability tracks a capability exposed cross-team by a specific team.
 type exposedCapability struct {
-	teamID     string
-	agentID    string
-	capability string
+	teamID         string
+	agentID        string
+	capability     string
+	allowedCallers []string // team IDs allowed to invoke; empty means all teams
 }
 
-// Router manages cross-team capability exposure and invocation.
+// CrossTeamRouter manages cross-team capability exposure and invocation.
 // It reads each team's crossTeamCapabilities configuration and sets up
 // NATS subscriptions on org-level capability subjects, forwarding requests
 // to the appropriate agent's capability handler.
-type Router struct {
+type CrossTeamRouter struct {
 	natsConn *nats.Conn
 	store    *state.Store
 	logger   *slog.Logger
 
-	mu       sync.Mutex
-	subs     []*nats.Subscription
-	exposed  map[string]*exposedCapability // "agentID.capability" -> exposed info
+	mu      sync.Mutex
+	subs    []*nats.Subscription
+	exposed map[string]*exposedCapability // "agentID.capability" -> exposed info
 }
 
-// NewRouter creates a new cross-team capability Router.
-func NewRouter(nc *nats.Conn, store *state.Store, logger *slog.Logger) *Router {
-	return &Router{
+// NewCrossTeamRouter creates a new cross-team capability router.
+func NewCrossTeamRouter(nc *nats.Conn, store *state.Store, logger *slog.Logger) *CrossTeamRouter {
+	return &CrossTeamRouter{
 		natsConn: nc,
 		store:    store,
 		logger:   logger,
@@ -76,7 +54,7 @@ func NewRouter(nc *nats.Conn, store *state.Store, logger *slog.Logger) *Router {
 // The router forwards requests to the agent's internal capability subject:
 //
 //	hive.capabilities.{AGENT_ID}.{CAPABILITY}.request
-func (r *Router) Start(teams map[string]*types.TeamManifest) error {
+func (r *CrossTeamRouter) Start(teams map[string]*types.TeamManifest) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -102,9 +80,10 @@ func (r *Router) Start(teams map[string]*types.TeamManifest) error {
 
 				key := fmt.Sprintf("%s.%s", agentID, agentCap.Name)
 				r.exposed[key] = &exposedCapability{
-					teamID:     teamID,
-					agentID:    agentID,
-					capability: agentCap.Name,
+					teamID:         teamID,
+					agentID:        agentID,
+					capability:     agentCap.Name,
+					allowedCallers: team.Spec.Communication.AllowedCallers,
 				}
 
 				subject := fmt.Sprintf("hive.org.capabilities.%s.%s.request", agentID, agentCap.Name)
@@ -135,7 +114,7 @@ func (r *Router) Start(teams map[string]*types.TeamManifest) error {
 }
 
 // Stop unsubscribes from all cross-team capability subjects.
-func (r *Router) Stop() {
+func (r *CrossTeamRouter) Stop() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -144,7 +123,7 @@ func (r *Router) Stop() {
 }
 
 // cleanup unsubscribes all subscriptions (caller must hold mu).
-func (r *Router) cleanup() {
+func (r *CrossTeamRouter) cleanup() {
 	for _, sub := range r.subs {
 		if err := sub.Unsubscribe(); err != nil {
 			r.logger.Warn("error unsubscribing cross-team subject",
@@ -158,7 +137,7 @@ func (r *Router) cleanup() {
 }
 
 // IsExposed returns whether a specific agent capability is exposed cross-team.
-func (r *Router) IsExposed(agentID, capability string) bool {
+func (r *CrossTeamRouter) IsExposed(agentID, capability string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -169,25 +148,57 @@ func (r *Router) IsExposed(agentID, capability string) bool {
 
 // handleCrossTeamRequest forwards a cross-team request to the agent's internal
 // capability handler subject.
-func (r *Router) handleCrossTeamRequest(msg *nats.Msg, agentID, capName string) {
+func (r *CrossTeamRouter) handleCrossTeamRequest(msg *nats.Msg, agentID, capName string) {
 	start := time.Now()
+
+	// Parse the envelope to validate caller identity.
+	var env types.Envelope
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		r.publishErrorResponse(msg, "unknown", capName, "INVALID_REQUEST",
+			"failed to parse request envelope", start)
+		return
+	}
+
+	if env.From == "" {
+		r.publishErrorResponse(msg, "unknown", capName, "UNAUTHORIZED",
+			"missing sender identity (From field) in cross-team request", start)
+		return
+	}
 
 	r.logger.Info("received cross-team capability request",
 		"agent_id", agentID,
 		"capability", capName,
 		"subject", msg.Subject,
+		"from", env.From,
 	)
 
 	// Verify the capability is still exposed.
 	key := fmt.Sprintf("%s.%s", agentID, capName)
 	r.mu.Lock()
-	_, exposed := r.exposed[key]
+	cap, exposed := r.exposed[key]
 	r.mu.Unlock()
 
 	if !exposed {
-		r.publishErrorResponse(msg, capName, "PERMISSION_DENIED",
+		r.publishErrorResponse(msg, env.From, capName, "PERMISSION_DENIED",
 			fmt.Sprintf("capability %q on agent %q is not exposed cross-team", capName, agentID), start)
 		return
+	}
+
+	// Check allowed callers if configured.
+	if len(cap.allowedCallers) > 0 {
+		callerTeam := r.resolveCallerTeam(env.From)
+		if !isCallerAllowed(callerTeam, cap.allowedCallers) {
+			r.logger.Warn("cross-team request denied: caller not in allowedCallers",
+				"from", env.From,
+				"caller_team", callerTeam,
+				"allowed_callers", cap.allowedCallers,
+				"capability", capName,
+				"agent_id", agentID,
+			)
+			r.publishErrorResponse(msg, env.From, capName, "PERMISSION_DENIED",
+				fmt.Sprintf("team %q is not authorized to invoke capability %q on agent %q", callerTeam, capName, agentID), start)
+			return
+		}
 	}
 
 	// Forward to the agent's internal capability subject.
@@ -196,18 +207,16 @@ func (r *Router) handleCrossTeamRequest(msg *nats.Msg, agentID, capName string) 
 	resp, err := r.natsConn.Request(internalSubject, msg.Data, 30*time.Second)
 	if err != nil {
 		if err == nats.ErrTimeout {
-			r.publishErrorResponse(msg, capName, "TIMEOUT",
+			r.publishErrorResponse(msg, env.From, capName, "TIMEOUT",
 				fmt.Sprintf("capability %q on agent %q timed out", capName, agentID), start)
 			return
 		}
-		r.publishErrorResponse(msg, capName, "FORWARD_ERROR",
+		r.publishErrorResponse(msg, env.From, capName, "FORWARD_ERROR",
 			fmt.Sprintf("failed to forward to agent %q: %s", agentID, err.Error()), start)
 		return
 	}
 
 	// Forward the raw response bytes back to the original caller.
-	// The agent's response is already a marshaled types.Envelope, so we
-	// publish it as-is. Error responses use the same format (see publishErrorResponse).
 	if msg.Reply != "" {
 		if err := r.natsConn.Publish(msg.Reply, resp.Data); err != nil {
 			r.logger.Error("failed to publish cross-team response",
@@ -225,10 +234,32 @@ func (r *Router) handleCrossTeamRequest(msg *nats.Msg, agentID, capName string) 
 	)
 }
 
+// resolveCallerTeam looks up the team ID of a caller agent from the capability
+// registry. Returns the team ID if found, or an empty string if unknown.
+func (r *CrossTeamRouter) resolveCallerTeam(agentID string) string {
+	registry := r.store.GetCapabilityRegistry()
+	if entry, ok := registry.Agents[agentID]; ok {
+		return entry.TeamID
+	}
+	return ""
+}
+
+// isCallerAllowed checks whether a caller's team is in the allowed callers list.
+// An empty callerTeam is never allowed when allowedCallers is configured.
+func isCallerAllowed(callerTeam string, allowedCallers []string) bool {
+	if callerTeam == "" {
+		return false
+	}
+	for _, allowed := range allowedCallers {
+		if allowed == "*" || allowed == callerTeam {
+			return true
+		}
+	}
+	return false
+}
+
 // publishErrorResponse sends an error response to the reply subject.
-// The response is marshaled as a types.Envelope (raw bytes), matching the
-// format used by the success path which forwards the agent's raw envelope bytes.
-func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message string, start time.Time) {
+func (r *CrossTeamRouter) publishErrorResponse(msg *nats.Msg, replyTo, capName, code, message string, start time.Time) {
 	if msg.Reply == "" {
 		return
 	}
@@ -236,6 +267,7 @@ func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message stri
 	env := types.Envelope{
 		ID:        types.NewUUID(),
 		From:      "crossteam-router",
+		To:        replyTo,
 		Type:      types.MessageTypeCapabilityResponse,
 		Timestamp: time.Now().UTC(),
 		Payload: InvocationResponse{
@@ -248,6 +280,13 @@ func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message stri
 			},
 			DurationMs: time.Since(start).Milliseconds(),
 		},
+	}
+
+	if err := env.Validate(); err != nil {
+		r.logger.Warn("envelope validation failed before publishing error response",
+			"capability", capName,
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)
@@ -304,9 +343,8 @@ func isCapabilityExposed(name string, exposed []string) bool {
 	return false
 }
 
-// ToolName returns the cross-team tool name for a capability.
+// CrossTeamToolName returns the cross-team tool name for a capability.
 // Format: {CAPABILITY}-{TEAM_ID}
-func ToolName(capability, teamID string) string {
+func CrossTeamToolName(capability, teamID string) string {
 	return fmt.Sprintf("%s-%s", capability, teamID)
 }
-

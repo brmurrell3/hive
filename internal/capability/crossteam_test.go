@@ -1,6 +1,6 @@
 //go:build integration
 
-package crossteam
+package capability
 
 import (
 	"encoding/json"
@@ -15,15 +15,15 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-func testLogger() *slog.Logger {
+func crossteamTestLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
 func setupStore(t *testing.T) *state.Store {
 	t.Helper()
 	tmpDir := t.TempDir()
-	logger := testLogger()
-	store, err := state.NewStore(tmpDir+"/state.json", logger)
+	logger := crossteamTestLogger()
+	store, err := state.NewStore(tmpDir+"/state.db", logger)
 	if err != nil {
 		t.Fatalf("creating store: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestExposedCapabilityIsInvocableCrossTeam(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	nc := testutil.NATSConnect(t, srv)
 	store := setupStore(t)
-	logger := testLogger()
+	logger := crossteamTestLogger()
 
 	// Register an agent with a capability in the store.
 	caps := []types.AgentCapability{
@@ -88,7 +88,7 @@ func TestExposedCapabilityIsInvocableCrossTeam(t *testing.T) {
 		},
 	}
 
-	router := NewRouter(nc, store, logger)
+	router := NewCrossTeamRouter(nc, store, logger)
 	if err := router.Start(teams); err != nil {
 		t.Fatalf("starting cross-team router: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestUnexposedCapabilityReturnsPermissionError(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	nc := testutil.NATSConnect(t, srv)
 	store := setupStore(t)
-	logger := testLogger()
+	logger := crossteamTestLogger()
 
 	// Register agent with capabilities.
 	caps := []types.AgentCapability{
@@ -166,7 +166,7 @@ func TestUnexposedCapabilityReturnsPermissionError(t *testing.T) {
 		},
 	}
 
-	router := NewRouter(nc, store, logger)
+	router := NewCrossTeamRouter(nc, store, logger)
 	if err := router.Start(teams); err != nil {
 		t.Fatalf("starting cross-team router: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestAllExposureMode(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	nc := testutil.NATSConnect(t, srv)
 	store := setupStore(t)
-	logger := testLogger()
+	logger := crossteamTestLogger()
 
 	// Register agent with multiple capabilities.
 	caps := []types.AgentCapability{
@@ -237,7 +237,7 @@ func TestAllExposureMode(t *testing.T) {
 		},
 	}
 
-	router := NewRouter(nc, store, logger)
+	router := NewCrossTeamRouter(nc, store, logger)
 	if err := router.Start(teams); err != nil {
 		t.Fatalf("starting cross-team router: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestAllExposureMode(t *testing.T) {
 	}
 }
 
-func TestToolName(t *testing.T) {
+func TestCrossTeamToolName(t *testing.T) {
 	tests := []struct {
 		capability string
 		teamID     string
@@ -296,9 +296,9 @@ func TestToolName(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := ToolName(tt.capability, tt.teamID)
+		got := CrossTeamToolName(tt.capability, tt.teamID)
 		if got != tt.want {
-			t.Errorf("ToolName(%q, %q) = %q, want %q", tt.capability, tt.teamID, got, tt.want)
+			t.Errorf("CrossTeamToolName(%q, %q) = %q, want %q", tt.capability, tt.teamID, got, tt.want)
 		}
 	}
 }

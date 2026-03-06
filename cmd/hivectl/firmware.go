@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 
 	"github.com/hivehq/hive/internal/config"
@@ -49,13 +51,11 @@ func firmwareBuildCmd() *cobra.Command {
 
 			agent, ok := agents[agentID]
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
+				return fmt.Errorf("agent %q not found in manifests", agentID)
 			}
 
 			if agent.Spec.Firmware.Platform == "" {
-				fmt.Fprintf(os.Stderr, "Error: agent %q has no firmware platform specified\n", agentID)
-				os.Exit(1)
+				return fmt.Errorf("agent %q has no firmware platform specified", agentID)
 			}
 
 			platform := firmware.Platform(agent.Spec.Firmware.Platform)
@@ -71,8 +71,7 @@ func firmwareBuildCmd() *cobra.Command {
 				Logger:      logger,
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("building firmware: %w", err)
 			}
 
 			fmt.Printf("Firmware built successfully\n")
@@ -114,8 +113,7 @@ func firmwareFlashCmd() *cobra.Command {
 
 			agent, ok := agents[agentID]
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
+				return fmt.Errorf("agent %q not found in manifests", agentID)
 			}
 
 			platform := firmware.Platform(agent.Spec.Firmware.Platform)
@@ -126,9 +124,7 @@ func firmwareFlashCmd() *cobra.Command {
 				outputDir := filepath.Join(absRoot, "agents", agentID, "firmware", "build")
 				binaryPath, err = firmware.DefaultBinaryPath(platform, outputDir)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					fmt.Fprintf(os.Stderr, "Hint: use --binary to specify the firmware binary path explicitly.\n")
-					os.Exit(1)
+					return fmt.Errorf("resolving firmware binary path (hint: use --binary to specify explicitly): %w", err)
 				}
 			}
 
@@ -140,8 +136,7 @@ func firmwareFlashCmd() *cobra.Command {
 				Baud:       baud,
 				Logger:     logger,
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("flashing firmware: %w", err)
 			}
 
 			fmt.Printf("Firmware flashed to %s\n", port)
@@ -182,8 +177,7 @@ func firmwareMonitorCmd() *cobra.Command {
 
 			agent, ok := agents[agentID]
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
+				return fmt.Errorf("agent %q not found in manifests", agentID)
 			}
 
 			platform := firmware.Platform(agent.Spec.Firmware.Platform)
@@ -195,8 +189,7 @@ func firmwareMonitorCmd() *cobra.Command {
 				Platform: platform,
 				Logger:   logger,
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("monitoring firmware: %w", err)
 			}
 
 			return nil
@@ -210,7 +203,11 @@ func firmwareMonitorCmd() *cobra.Command {
 }
 
 func firmwareUpdateCmd() *cobra.Command {
-	var binaryPath string
+	var (
+		binaryPath string
+		version    string
+		chunkSize  int
+	)
 
 	cmd := &cobra.Command{
 		Use:   "update AGENT_ID",
@@ -218,6 +215,7 @@ func firmwareUpdateCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			agentID := args[0]
+			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			absRoot, err := filepath.Abs(clusterRoot)
 			if err != nil {
@@ -230,16 +228,65 @@ func firmwareUpdateCmd() *cobra.Command {
 			}
 
 			if _, ok := agents[agentID]; !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
+				return fmt.Errorf("agent %q not found in manifests", agentID)
 			}
 
-			fmt.Printf("OTA update initiated for %s from %s\n", agentID, binaryPath)
+			// Verify the binary file exists before connecting to NATS.
+			if _, err := os.Stat(binaryPath); err != nil {
+				return fmt.Errorf("firmware binary %q: %w", binaryPath, err)
+			}
+
+			// Connect to hived's NATS server.
+			nc, err := connectNATS("hivectl-firmware-update")
+			if err != nil {
+				return err
+			}
+			defer func() {
+				_ = nc.Drain()
+			}()
+
+			// Use the OTA updater to push the firmware.
+			updater := firmware.NewUpdater(nc, logger)
+
+			// Handle Ctrl+C for graceful cancellation.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt)
+			go func() {
+				<-sigCh
+				fmt.Fprintf(os.Stderr, "\nCancelling OTA update...\n")
+				cancel()
+			}()
+
+			fmt.Printf("Starting OTA update for agent %s from %s\n", agentID, binaryPath)
+
+			update := firmware.Update{
+				AgentID:         agentID,
+				BinaryPath:      binaryPath,
+				FirmwareVersion: version,
+				ChunkSize:       chunkSize,
+			}
+
+			status, err := updater.Push(ctx, update)
+			if err != nil {
+				return fmt.Errorf("OTA update failed: %w", err)
+			}
+
+			if status.Status == firmware.StatusComplete {
+				fmt.Printf("OTA update completed successfully for agent %s\n", agentID)
+			} else {
+				return fmt.Errorf("OTA update finished with status %q: %s", status.Status, status.Error)
+			}
+
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&binaryPath, "binary", "", "Path to firmware binary (required)")
+	cmd.Flags().StringVar(&version, "version", "0.0.0", "Firmware version string")
+	cmd.Flags().IntVar(&chunkSize, "chunk-size", firmware.DefaultChunkSize, "OTA chunk size in bytes")
 	_ = cmd.MarkFlagRequired("binary")
 
 	return cmd
@@ -253,28 +300,10 @@ func firmwareSignCmd() *cobra.Command {
 		Short: "Sign firmware for an agent",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			agentID := args[0]
-
-			absRoot, err := filepath.Abs(clusterRoot)
-			if err != nil {
-				return fmt.Errorf("resolving cluster root: %w", err)
-			}
-
-			agents, err := config.LoadAgents(absRoot)
-			if err != nil {
-				return fmt.Errorf("loading agents: %w", err)
-			}
-
-			if _, ok := agents[agentID]; !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
-			}
-
-			// keyPath is required by the flag but not used yet.
+			_ = args[0]
 			_ = keyPath
 
-			fmt.Println("Firmware signing not yet available (requires key management infrastructure)")
-			return nil
+			return fmt.Errorf("firmware signing is not yet implemented: requires key management infrastructure (PKI) which has not been built")
 		},
 	}
 

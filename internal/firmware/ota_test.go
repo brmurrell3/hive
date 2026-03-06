@@ -1,6 +1,6 @@
 //go:build unit
 
-package ota
+package firmware
 
 import (
 	"crypto/sha256"

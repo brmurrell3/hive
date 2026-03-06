@@ -12,21 +12,11 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// ToolDefinition describes a tool available to the director agent.
-type ToolDefinition struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Inputs      []ToolParam     `json:"inputs,omitempty"`
-	Outputs     []ToolParam     `json:"outputs,omitempty"`
-}
+// ToolDefinition is an alias for types.ToolDefinition.
+type ToolDefinition = types.ToolDefinition
 
-// ToolParam describes a parameter for a tool.
-type ToolParam struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Description string `json:"description"`
-	Required    bool   `json:"required"`
-}
+// ToolParam is an alias for types.ToolParam.
+type ToolParam = types.ToolParam
 
 // AuthFunc validates that a given sender (from the envelope's From field)
 // is authorized to invoke director tools. Return nil to allow, or an error
@@ -48,8 +38,9 @@ type Director struct {
 }
 
 // NewDirector creates a new Director instance. The optional authFn callback
-// validates incoming requests by sender ID. If authFn is nil, all requests
-// are allowed (no authentication).
+// validates incoming requests by sender ID. If authFn is nil, requests are
+// still validated for a non-empty sender identity (From field) but no
+// additional authorization is performed.
 func NewDirector(agentID string, nc *nats.Conn, store *state.Store, logger *slog.Logger, authFn AuthFunc) *Director {
 	return &Director{
 		agentID:  agentID,
@@ -61,25 +52,25 @@ func NewDirector(agentID string, nc *nats.Conn, store *state.Store, logger *slog
 }
 
 // Start subscribes to NATS subjects for director tool invocations.
-// Each tool is exposed on: hive.director.{tool_name}.request
+// Each tool is exposed on: hive.org.capabilities.director.{tool_name}.request
 func (d *Director) Start() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	tools := map[string]func(*nats.Msg){
-		"hive_list_teams":       d.handleListTeams,
-		"hive_list_all_agents":  d.handleListAllAgents,
-		"hive_message_lead":     d.handleMessageLead,
-		"hive_message_agent":    d.handleMessageAgent,
-		"hive_broadcast_leads":  d.handleBroadcastLeads,
-		"hive_broadcast_all":    d.handleBroadcastAll,
+		"hive_list_teams":        d.handleListTeams,
+		"hive_list_all_agents":   d.handleListAllAgents,
+		"hive_message_lead":      d.handleMessageLead,
+		"hive_message_agent":     d.handleMessageAgent,
+		"hive_broadcast_leads":   d.handleBroadcastLeads,
+		"hive_broadcast_all":     d.handleBroadcastAll,
 		"hive_invoke_capability": d.handleInvokeCapability,
-		"hive_team_status":      d.handleTeamStatus,
-		"hive_cluster_status":   d.handleClusterStatus,
+		"hive_team_status":       d.handleTeamStatus,
+		"hive_cluster_status":    d.handleClusterStatus,
 	}
 
 	for name, handler := range tools {
-		subject := fmt.Sprintf("hive.director.%s.request", name)
+		subject := fmt.Sprintf("hive.org.capabilities.director.%s.request", name)
 		h := handler // capture for closure
 
 		sub, err := d.natsConn.Subscribe(subject, d.withAuth(h))
@@ -281,7 +272,7 @@ func (d *Director) handleMessageLead(msg *nats.Msg) {
 	// Find the team's lead agent by looking for agents in the team.
 	// In a full implementation, this would check the team manifest's lead field.
 	// For now, publish to the team's lead subject.
-	subject := fmt.Sprintf("hive.team.%s.lead", req.TeamID)
+	subject := fmt.Sprintf("hive.org.leads.%s", req.TeamID)
 
 	env := types.Envelope{
 		ID:        types.NewUUID(),
@@ -290,6 +281,13 @@ func (d *Director) handleMessageLead(msg *nats.Msg) {
 		Type:      types.MessageTypeTask,
 		Timestamp: time.Now().UTC(),
 		Payload:   map[string]string{"message": req.Message},
+	}
+
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing message to lead",
+			"team_id", req.TeamID,
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)
@@ -334,6 +332,13 @@ func (d *Director) handleMessageAgent(msg *nats.Msg) {
 		Payload:   map[string]string{"message": req.Message},
 	}
 
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing message to agent",
+			"agent_id", req.AgentID,
+			"error", err,
+		)
+	}
+
 	data, err := json.Marshal(env)
 	if err != nil {
 		d.respondError(msg, "INTERNAL_ERROR", fmt.Sprintf("marshal error: %s", err))
@@ -364,14 +369,21 @@ func (d *Director) handleBroadcastLeads(msg *nats.Msg) {
 		return
 	}
 
-	subject := "hive.broadcast.leads"
+	subject := "hive.org.broadcast"
 
 	env := types.Envelope{
 		ID:        types.NewUUID(),
 		From:      d.agentID,
+		To:        "broadcast",
 		Type:      types.MessageTypeBroadcast,
 		Timestamp: time.Now().UTC(),
 		Payload:   map[string]string{"message": req.Message},
+	}
+
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing broadcast to leads",
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)
@@ -404,14 +416,19 @@ func (d *Director) handleBroadcastAll(msg *nats.Msg) {
 		return
 	}
 
-	subject := "hive.broadcast.all"
-
 	env := types.Envelope{
 		ID:        types.NewUUID(),
 		From:      d.agentID,
+		To:        "broadcast",
 		Type:      types.MessageTypeBroadcast,
 		Timestamp: time.Now().UTC(),
 		Payload:   map[string]string{"message": req.Message},
+	}
+
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing broadcast to all",
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)
@@ -420,13 +437,43 @@ func (d *Director) handleBroadcastAll(msg *nats.Msg) {
 		return
 	}
 
-	if err := d.natsConn.Publish(subject, data); err != nil {
-		d.respondError(msg, "PUBLISH_ERROR", fmt.Sprintf("failed to broadcast: %s", err))
+	// Collect all unique teams from the agent store and publish to each
+	// team's broadcast subject: hive.team.{TEAM_ID}.broadcast
+	agents := d.store.AllAgents()
+	teamSet := make(map[string]struct{})
+	for _, a := range agents {
+		if a.Team != "" {
+			teamSet[a.Team] = struct{}{}
+		}
+	}
+
+	if len(teamSet) == 0 {
+		d.respondError(msg, "NO_TEAMS", "no teams found to broadcast to")
+		return
+	}
+
+	var failed []string
+	for teamID := range teamSet {
+		subject := fmt.Sprintf("hive.team.%s.broadcast", teamID)
+		if err := d.natsConn.Publish(subject, data); err != nil {
+			d.logger.Error("failed to broadcast to team",
+				"team_id", teamID,
+				"subject", subject,
+				"error", err,
+			)
+			failed = append(failed, teamID)
+		}
+	}
+
+	if len(failed) > 0 {
+		d.respondError(msg, "PARTIAL_BROADCAST",
+			fmt.Sprintf("failed to broadcast to teams: %v", failed))
 		return
 	}
 
 	d.respondJSON(msg, map[string]interface{}{
-		"status": "broadcast_sent",
+		"status":     "broadcast_sent",
+		"team_count": len(teamSet),
 	})
 }
 
@@ -463,6 +510,14 @@ func (d *Director) handleInvokeCapability(msg *nats.Msg) {
 		Payload:   invokeReq,
 	}
 
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing capability request",
+			"agent_id", req.AgentID,
+			"capability", req.Capability,
+			"error", err,
+		)
+	}
+
 	data, err := json.Marshal(env)
 	if err != nil {
 		d.respondError(msg, "INTERNAL_ERROR", fmt.Sprintf("marshal error: %s", err))
@@ -479,12 +534,16 @@ func (d *Director) handleInvokeCapability(msg *nats.Msg) {
 		return
 	}
 
-	// Forward the response directly.
-	if msg.Reply != "" {
-		if err := d.natsConn.Publish(msg.Reply, resp.Data); err != nil {
-			d.logger.Error("failed to publish invoke response", "error", err)
-		}
+	// Unmarshal the agent's response envelope to extract the capability
+	// InvocationResponse payload. The agent's envelope has To: director-id,
+	// so we cannot forward it raw — we must re-wrap it with correct From/To.
+	var respEnv types.Envelope
+	if err := json.Unmarshal(resp.Data, &respEnv); err != nil {
+		d.respondError(msg, "INTERNAL_ERROR", fmt.Sprintf("failed to parse agent response: %s", err))
+		return
 	}
+
+	d.respondJSON(msg, respEnv.Payload)
 }
 
 func (d *Director) handleTeamStatus(msg *nats.Msg) {
@@ -570,13 +629,12 @@ func (d *Director) handleClusterStatus(msg *nats.Msg) {
 
 // --- Auth ---
 
-// withAuth wraps a NATS message handler with authentication. If authFunc is
-// configured, it extracts the From field from the envelope and validates it.
-// Unauthorized requests receive an error response.
+// withAuth wraps a NATS message handler with authentication. It always
+// validates that the envelope can be parsed and contains a non-empty From
+// field (baseline sender identity check). If authFunc is additionally
+// configured, it is called to perform authorization. Unauthorized requests
+// receive an error response.
 func (d *Director) withAuth(handler func(*nats.Msg)) func(*nats.Msg) {
-	if d.authFunc == nil {
-		return handler
-	}
 	return func(msg *nats.Msg) {
 		var env types.Envelope
 		if err := json.Unmarshal(msg.Data, &env); err != nil {
@@ -587,20 +645,49 @@ func (d *Director) withAuth(handler func(*nats.Msg)) func(*nats.Msg) {
 			d.respondError(msg, "UNAUTHORIZED", "missing sender identity (From field)")
 			return
 		}
-		if err := d.authFunc(env.From); err != nil {
-			d.logger.Warn("unauthorized director tool invocation",
-				"from", env.From,
-				"subject", msg.Subject,
-				"error", err,
-			)
-			d.respondError(msg, "UNAUTHORIZED", fmt.Sprintf("not authorized: %s", err))
-			return
+		if d.authFunc != nil {
+			if err := d.authFunc(env.From); err != nil {
+				d.logger.Warn("unauthorized director tool invocation",
+					"from", env.From,
+					"subject", msg.Subject,
+					"error", err,
+				)
+				d.respondError(msg, "UNAUTHORIZED", fmt.Sprintf("not authorized: %s", err))
+				return
+			}
 		}
 		handler(msg)
 	}
 }
 
 // --- Helper methods ---
+
+// extractSender attempts to extract the From field from an incoming NATS message
+// envelope. This is used to populate the To field in response envelopes. If the
+// envelope cannot be parsed, it returns "unknown".
+func (d *Director) extractSender(msg *nats.Msg) string {
+	var env struct {
+		From string `json:"from"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err == nil && env.From != "" {
+		return env.From
+	}
+	return "unknown"
+}
+
+// extractRequestID attempts to extract the ID field from an incoming NATS
+// message envelope. This is used to set CorrelationID on response envelopes
+// so callers can correlate responses with their original requests. If the
+// envelope cannot be parsed, it returns an empty string.
+func (d *Director) extractRequestID(msg *nats.Msg) string {
+	var env struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err == nil {
+		return env.ID
+	}
+	return ""
+}
 
 // parseRequest extracts the payload from a NATS message envelope into the target struct.
 func (d *Director) parseRequest(msg *nats.Msg, target interface{}) error {
@@ -627,12 +714,25 @@ func (d *Director) respondJSON(msg *nats.Msg, payload interface{}) {
 		return
 	}
 
+	// Extract the sender and request ID from the incoming envelope.
+	to := d.extractSender(msg)
+	requestID := d.extractRequestID(msg)
+
 	env := types.Envelope{
-		ID:        types.NewUUID(),
-		From:      d.agentID,
-		Type:      types.MessageTypeResult,
-		Timestamp: time.Now().UTC(),
-		Payload:   payload,
+		ID:            types.NewUUID(),
+		From:          d.agentID,
+		To:            to,
+		Type:          types.MessageTypeResult,
+		Timestamp:     time.Now().UTC(),
+		Payload:       payload,
+		CorrelationID: requestID,
+	}
+
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing response",
+			"to", to,
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)
@@ -652,15 +752,28 @@ func (d *Director) respondError(msg *nats.Msg, code, message string) {
 		return
 	}
 
+	// Extract the sender and request ID from the incoming envelope.
+	to := d.extractSender(msg)
+	requestID := d.extractRequestID(msg)
+
 	env := types.Envelope{
-		ID:        types.NewUUID(),
-		From:      d.agentID,
-		Type:      types.MessageTypeError,
-		Timestamp: time.Now().UTC(),
+		ID:            types.NewUUID(),
+		From:          d.agentID,
+		To:            to,
+		Type:          types.MessageTypeError,
+		Timestamp:     time.Now().UTC(),
+		CorrelationID: requestID,
 		Payload: map[string]string{
 			"code":    code,
 			"message": message,
 		},
+	}
+
+	if err := env.Validate(); err != nil {
+		d.logger.Warn("envelope validation failed before publishing error response",
+			"to", to,
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)

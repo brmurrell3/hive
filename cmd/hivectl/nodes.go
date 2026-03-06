@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/hivehq/hive/internal/types"
 	"github.com/spf13/cobra"
@@ -80,8 +79,7 @@ func nodesStatusCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			data, err := json.MarshalIndent(n, "", "  ")
@@ -108,8 +106,7 @@ func nodesDrainCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			if n.Status == types.NodeStatusDraining {
@@ -142,8 +139,7 @@ func nodesCordonCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			if n.Status == types.NodeStatusCordoned {
@@ -176,8 +172,7 @@ func nodesUncordonCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			if n.Status != types.NodeStatusCordoned && n.Status != types.NodeStatusDraining {
@@ -210,8 +205,7 @@ func nodesLabelCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			if n.Labels == nil {
@@ -254,8 +248,7 @@ func nodesUnlabelCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			for _, key := range args[1:] {
@@ -286,8 +279,7 @@ func nodesApproveCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			n.Status = types.NodeStatusOnline
@@ -315,8 +307,7 @@ func nodesRemoveCmd() *cobra.Command {
 			nodeID := args[0]
 			n := store.GetNode(nodeID)
 			if n == nil {
-				fmt.Fprintf(os.Stderr, "Error: node %q not found\n", nodeID)
-				os.Exit(1)
+				return fmt.Errorf("node %q not found", nodeID)
 			}
 
 			if err := store.RemoveNode(nodeID); err != nil {
@@ -350,18 +341,4 @@ func formatBytes(b int64) string {
 	default:
 		return fmt.Sprintf("%dB", b)
 	}
-}
-
-// formatDurationShort formats a duration into a human-readable short form.
-func formatDurationShort(d time.Duration) string {
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	}
-	if d < 24*time.Hour {
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	}
-	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }

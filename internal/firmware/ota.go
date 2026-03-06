@@ -1,4 +1,4 @@
-package ota
+package firmware
 
 import (
 	"context"
