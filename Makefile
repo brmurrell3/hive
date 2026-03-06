@@ -1,4 +1,4 @@
-.PHONY: build build-linux-amd64 build-linux-arm64 build-all test test-unit test-integration test-vm rootfs clean
+.PHONY: build build-linux-amd64 build-linux-arm64 build-all test test-unit test-integration test-vm test-e2e rootfs clean
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS = -X main.version=$(VERSION)
@@ -37,6 +37,9 @@ test-integration:
 
 test-vm:
 	go test -tags vm -count=1 -timeout 10m ./...
+
+test-e2e:
+	go test -tags e2e -count=1 -timeout 2m -v ./test/e2e/
 
 rootfs:
 	$(MAKE) -C rootfs rootfs

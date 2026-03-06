@@ -16,6 +16,7 @@ import (
 	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 var version = "dev"
@@ -54,6 +55,7 @@ func joinCmd() *cobra.Command {
 		workDir      string
 		httpAddr     string
 		natsToken    string
+		manifestPath string
 	)
 
 	cmd := &cobra.Command{
@@ -74,7 +76,7 @@ func joinCmd() *cobra.Command {
 				return fmt.Errorf("--agent-id is required")
 			}
 
-			return runJoin(logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr, natsToken)
+			return runJoin(logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr, natsToken, manifestPath)
 		},
 	}
 
@@ -86,11 +88,12 @@ func joinCmd() *cobra.Command {
 	cmd.Flags().StringVar(&workDir, "work-dir", "/var/lib/hive/workspace", "Working directory for the runtime")
 	cmd.Flags().StringVar(&httpAddr, "http-addr", ":9100", "HTTP API listen address")
 	cmd.Flags().StringVar(&natsToken, "nats-token", "", "NATS authentication token")
+	cmd.Flags().StringVar(&manifestPath, "manifest", "", "Path to agent manifest YAML (provides capabilities and team)")
 
 	return cmd
 }
 
-func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr, natsToken string) error {
+func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runtimeArgs, workDir, httpAddr, natsToken, manifestPath string) error {
 	logger.Info("joining cluster",
 		"control_plane", controlPlane,
 		"agent_id", agentID,
@@ -158,11 +161,30 @@ func runJoin(logger *slog.Logger, token, controlPlane, agentID, runtimeCmd, runt
 		rtArgs = strings.Split(runtimeArgs, ",")
 	}
 
+	// Load capabilities and team from manifest if provided.
+	var capabilities []sidecar.Capability
+	var teamID string
+	if manifestPath != "" {
+		manifest, err := loadManifest(manifestPath)
+		if err != nil {
+			return fmt.Errorf("loading manifest: %w", err)
+		}
+		teamID = manifest.Metadata.Team
+		capabilities = convertCapabilities(manifest.Spec.Capabilities)
+		logger.Info("loaded manifest",
+			"manifest", manifestPath,
+			"team", teamID,
+			"capabilities", len(capabilities),
+		)
+	}
+
 	cfg := sidecar.Config{
 		AgentID:        agentID,
+		TeamID:         teamID,
 		NATSUrl:        natsURL,
 		NATSToken:      natsToken,
 		HTTPAddr:       httpAddr,
+		Capabilities:   capabilities,
 		RuntimeCmd:     runtimeCmd,
 		RuntimeArgs:    rtArgs,
 		WorkspacePath:  workDir,
@@ -230,4 +252,48 @@ func getHostname() string {
 		h = "unknown"
 	}
 	return h
+}
+
+// loadManifest reads and parses an agent manifest YAML file.
+func loadManifest(path string) (*types.AgentManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	var manifest types.AgentManifest
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	return &manifest, nil
+}
+
+// convertCapabilities converts manifest capabilities to sidecar capabilities.
+func convertCapabilities(agentCaps []types.AgentCapability) []sidecar.Capability {
+	caps := make([]sidecar.Capability, len(agentCaps))
+	for i, ac := range agentCaps {
+		caps[i] = sidecar.Capability{
+			Name:        ac.Name,
+			Description: ac.Description,
+			Inputs:      convertParams(ac.Inputs),
+			Outputs:     convertParams(ac.Outputs),
+			Async:       ac.Async,
+		}
+	}
+	return caps
+}
+
+func convertParams(params []types.CapabilityParam) []sidecar.CapabilityParam {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make([]sidecar.CapabilityParam, len(params))
+	for i, p := range params {
+		out[i] = sidecar.CapabilityParam{
+			Name:        p.Name,
+			Type:        p.Type,
+			Description: p.Description,
+			Required:    p.IsRequired(),
+		}
+	}
+	return out
 }
