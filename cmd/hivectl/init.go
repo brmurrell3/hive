@@ -447,6 +447,9 @@ const wizardOpenClawTmpl = `{
   "env": {
     "OPENROUTER_API_KEY": "{{.OpenRouterKey}}"
   },
+  "gateway": {
+    "mode": "headless"
+  },
   "agents": {
     "defaults": {
       "model": {
@@ -528,6 +531,9 @@ else
 {
   "env": {
     "OPENROUTER_API_KEY": "OPENROUTER_API_KEY_PLACEHOLDER"
+  },
+  "gateway": {
+    "mode": "headless"
   },
   "agents": {
     "defaults": {
