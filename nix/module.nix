@@ -40,7 +40,7 @@ in
     };
 
     clusterRoot = lib.mkOption {
-      type = lib.types.path;
+      type = lib.types.str;
       description = "Path to the cluster root directory containing cluster.yaml.";
     };
 
@@ -92,9 +92,8 @@ in
 
         # Hardening.
         NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ProtectHome = "read-only";
-        ReadWritePaths = [ cfg.clusterRoot "/var/lib/hive" ];
+        ProtectSystem = "full";
+        ReadWritePaths = [ cfg.clusterRoot ];
         PrivateTmp = true;
       };
     };
