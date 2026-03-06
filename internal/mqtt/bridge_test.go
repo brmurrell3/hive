@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/testutil"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/testutil"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
@@ -30,7 +30,7 @@ func testLogger(t *testing.T) *slog.Logger {
 func testStateStore(t *testing.T) *state.Store {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	store, err := state.NewStore(path, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -384,6 +384,51 @@ func TestTopicToSubjectMapping(t *testing.T) {
 			gotReverse := natsSubjectToMQTTTopic(tt.natsSubject)
 			if gotReverse != tt.mqttTopic {
 				t.Errorf("natsSubjectToMQTTTopic(%q) = %q, want %q", tt.natsSubject, gotReverse, tt.mqttTopic)
+			}
+		})
+	}
+}
+
+func TestFilterToSubjectMapping(t *testing.T) {
+	tests := []struct {
+		name        string
+		mqttFilter  string
+		natsSubject string
+	}{
+		{"single level wildcard", "hive/+/inbox", "hive.*.inbox"},
+		{"multi level wildcard", "hive/#", "hive.>"},
+		{"both wildcards", "+/health/#", "*.health.>"},
+		{"no wildcards", "hive/health/agent-1", "hive.health.agent-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mqttFilterToNATSSubject(tt.mqttFilter)
+			if got != tt.natsSubject {
+				t.Errorf("mqttFilterToNATSSubject(%q) = %q, want %q", tt.mqttFilter, got, tt.natsSubject)
+			}
+		})
+	}
+}
+
+func TestPublishTopicNoWildcardConversion(t *testing.T) {
+	// Verify that mqttTopicToNATSSubject (used for publish) does NOT convert
+	// wildcard characters. Published messages should never contain wildcards,
+	// but if they do, they must not be silently converted to NATS wildcards.
+	tests := []struct {
+		name  string
+		topic string
+		want  string
+	}{
+		{"plus stays literal", "hive/+/inbox", "hive.+.inbox"},
+		{"hash stays literal", "hive/#", "hive.#"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mqttTopicToNATSSubject(tt.topic)
+			if got != tt.want {
+				t.Errorf("mqttTopicToNATSSubject(%q) = %q, want %q", tt.topic, got, tt.want)
 			}
 		})
 	}

@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/testutil"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/testutil"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
@@ -28,7 +28,7 @@ func testLogger(t *testing.T) *slog.Logger {
 func testStateStore(t *testing.T) *state.Store {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	store, err := state.NewStore(path, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)

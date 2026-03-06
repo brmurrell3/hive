@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/testutil"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/testutil"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 func TestTracker_ReceivesFirmwareHeartbeat(t *testing.T) {
@@ -19,7 +19,7 @@ func TestTracker_ReceivesFirmwareHeartbeat(t *testing.T) {
 	nc := testutil.NATSConnect(t, ns)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(t.TempDir()+"/state.json", logger)
+	store, err := state.NewStore(t.TempDir()+"/state.db", logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestTracker_IgnoresNonFirmwareHeartbeats(t *testing.T) {
 	nc := testutil.NATSConnect(t, ns)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(t.TempDir()+"/state.json", logger)
+	store, err := state.NewStore(t.TempDir()+"/state.db", logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestTracker_MarksDeviceOffline(t *testing.T) {
 	nc := testutil.NATSConnect(t, ns)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(t.TempDir()+"/state.json", logger)
+	store, err := state.NewStore(t.TempDir()+"/state.db", logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestTracker_AllDevices(t *testing.T) {
 	nc := testutil.NATSConnect(t, ns)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(t.TempDir()+"/state.json", logger)
+	store, err := state.NewStore(t.TempDir()+"/state.db", logger)
 	if err != nil {
 		t.Fatal(err)
 	}

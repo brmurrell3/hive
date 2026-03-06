@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/listeners"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -212,9 +212,22 @@ func (b *Bridge) subscribeNATS() error {
 	return nil
 }
 
-// mqttTopicToNATSSubject converts an MQTT topic to a NATS subject.
+// mqttTopicToNATSSubject converts an MQTT topic to a NATS subject for
+// publish paths. Only the separator is converted (/ -> .); MQTT wildcard
+// characters are left as-is because published messages should never contain
+// wildcards, and converting them would create literal NATS subjects with
+// wildcard characters.
 func mqttTopicToNATSSubject(topic string) string {
-	subject := strings.ReplaceAll(topic, "/", ".")
+	return strings.ReplaceAll(topic, "/", ".")
+}
+
+// mqttFilterToNATSSubject converts an MQTT subscription filter to a NATS
+// subject pattern, translating both separators and wildcards:
+//   - / -> .   (separator)
+//   - + -> *   (single-level wildcard)
+//   - # -> >   (multi-level wildcard)
+func mqttFilterToNATSSubject(filter string) string {
+	subject := strings.ReplaceAll(filter, "/", ".")
 	subject = strings.ReplaceAll(subject, "+", "*")
 	subject = strings.ReplaceAll(subject, "#", ">")
 	return subject
@@ -313,7 +326,7 @@ func (h *bridgeHook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
 func (h *bridgeHook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
 	for _, sub := range pk.Filters {
 		topic := sub.Filter
-		natsSubject := mqttTopicToNATSSubject(topic)
+		natsSubject := mqttFilterToNATSSubject(topic)
 		if natsSubject == "" {
 			continue
 		}

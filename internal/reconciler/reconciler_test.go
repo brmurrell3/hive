@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/hivehq/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/state"
 )
 
 func newTestStore(t *testing.T, clusterRoot string) *state.Store {
 	t.Helper()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(filepath.Join(clusterRoot, "state.json"), logger)
+	store, err := state.NewStore(filepath.Join(clusterRoot, "state.db"), logger)
 	if err != nil {
 		t.Fatalf("creating store: %v", err)
 	}

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/hivehq/hive/internal/auth"
+	"github.com/brmurrell3/hive/internal/auth"
 	"github.com/spf13/cobra"
 )
 
@@ -42,8 +42,7 @@ func usersCreateCmd() *cobra.Command {
 			userID := args[0]
 
 			if err := auth.ValidateRole(auth.Role(role)); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("validating role: %w", err)
 			}
 
 			store, err := newStoreOnly()
@@ -73,8 +72,7 @@ func usersCreateCmd() *cobra.Command {
 			}
 
 			if err := store.AddUser(user); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("adding user: %w", err)
 			}
 
 			fmt.Printf("User %s created with role %s\n", userID, role)
@@ -146,14 +144,12 @@ func usersUpdateCmd() *cobra.Command {
 
 			user := store.GetUser(userID)
 			if user == nil {
-				fmt.Fprintf(os.Stderr, "Error: user %q not found\n", userID)
-				os.Exit(1)
+				return fmt.Errorf("user %q not found", userID)
 			}
 
 			if role != "" {
 				if err := auth.ValidateRole(auth.Role(role)); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					return fmt.Errorf("validating role: %w", err)
 				}
 				user.Role = auth.Role(role)
 			}
@@ -175,8 +171,7 @@ func usersUpdateCmd() *cobra.Command {
 			}
 
 			if err := store.UpdateUser(user); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("updating user: %w", err)
 			}
 
 			fmt.Printf("User %s updated\n", userID)
@@ -205,8 +200,7 @@ func usersRevokeCmd() *cobra.Command {
 			}
 
 			if err := store.RemoveUser(userID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("revoking user: %w", err)
 			}
 
 			fmt.Printf("User %s revoked\n", userID)
@@ -239,8 +233,7 @@ func usersRotateCmd() *cobra.Command {
 
 			user := store.GetUser(userID)
 			if user == nil {
-				fmt.Fprintf(os.Stderr, "Error: user %q not found\n", userID)
-				os.Exit(1)
+				return fmt.Errorf("user %q not found", userID)
 			}
 
 			rawToken, err := generateUserToken()
@@ -251,8 +244,7 @@ func usersRotateCmd() *cobra.Command {
 			user.TokenHash = auth.HashToken(rawToken)
 
 			if err := store.UpdateUser(user); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("updating user token: %w", err)
 			}
 
 			fmt.Printf("Token rotated for user %s\n", userID)

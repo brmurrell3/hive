@@ -110,7 +110,7 @@ type AgentPlacement struct {
 }
 
 // AgentFirmware defines firmware-specific build and flash configuration.
-// T4-05: All fields from 02-SCHEMAS.md lines 163-168.
+// All fields from 02-SCHEMAS.md.
 type AgentFirmware struct {
 	Platform       string   `yaml:"platform,omitempty" json:"platform,omitempty"`
 	Board          string   `yaml:"board,omitempty" json:"board,omitempty"`

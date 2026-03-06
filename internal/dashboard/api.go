@@ -8,13 +8,15 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/auth"
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/auth"
+	"github.com/brmurrell3/hive/internal/logs"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 	"nhooyr.io/websocket"
 )
@@ -35,13 +37,19 @@ type NATSConn interface {
 	Publish(subject string, data []byte) error
 }
 
+// LogQuerier is the interface for querying aggregated logs.
+type LogQuerier interface {
+	Query(agentID string, opts logs.QueryOpts) ([]logs.LogEntry, error)
+}
+
 // Config holds the configuration for the dashboard API server.
 type Config struct {
 	Store      StoreReader
 	NATSConn   NATSConn
+	Logs       LogQuerier // optional; if nil, log queries return empty results
 	Logger     *slog.Logger
 	Addr       string // e.g. ":8080"
-	CORSOrigin string // Allowed CORS origin; defaults to "http://localhost:8080"
+	CORSOrigin string // Allowed CORS origin; defaults to "*"
 	AuthToken  string // If set, WebSocket connections must provide this token via ?token= query param
 }
 
@@ -49,6 +57,7 @@ type Config struct {
 type Server struct {
 	store      StoreReader
 	natsConn   NATSConn
+	logs       LogQuerier
 	logger     *slog.Logger
 	httpServer *http.Server
 	hub        *wsHub
@@ -67,12 +76,13 @@ func NewServer(cfg Config) *Server {
 		cfg.Addr = ":8080"
 	}
 	if cfg.CORSOrigin == "" {
-		cfg.CORSOrigin = "http://localhost:8080"
+		cfg.CORSOrigin = "*"
 	}
 
 	s := &Server{
 		store:      cfg.Store,
 		natsConn:   cfg.NATSConn,
+		logs:       cfg.Logs,
 		logger:     cfg.Logger,
 		hub:        newWSHub(cfg.Logger),
 		startTime:  time.Now(),
@@ -340,7 +350,7 @@ func (s *Server) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 		ID:        types.NewUUID(),
 		From:      "dashboard",
 		To:        id,
-		Type:      types.MessageTypeCapabilityRequest,
+		Type:      types.MessageTypeTask,
 		Timestamp: time.Now().UTC(),
 		Payload:   map[string]string{"message": req.Message},
 		ReplyTo:   replySubject,
@@ -421,16 +431,60 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse query parameters.
-	_ = r.URL.Query().Get("since")
-	_ = r.URL.Query().Get("until")
-	_ = r.URL.Query().Get("limit")
+	// If no log aggregator is configured, return empty results.
+	if s.logs == nil {
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"agent_id": agentID,
+			"entries":  []interface{}{},
+		})
+		return
+	}
 
-	// Log retrieval would typically query a log store or JetStream.
-	// For now, return an empty list to indicate the endpoint is functional.
+	// Parse query parameters into QueryOpts.
+	var opts logs.QueryOpts
+
+	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
+		if t, err := time.Parse(time.RFC3339, sinceStr); err == nil {
+			opts.Since = t
+		} else {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid 'since' parameter: %s", err))
+			return
+		}
+	}
+
+	if untilStr := r.URL.Query().Get("until"); untilStr != "" {
+		if t, err := time.Parse(time.RFC3339, untilStr); err == nil {
+			opts.Until = t
+		} else {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid 'until' parameter: %s", err))
+			return
+		}
+	}
+
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			opts.Limit = n
+		} else {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid 'limit' parameter: must be a positive integer"))
+			return
+		}
+	}
+
+	entries, err := s.logs.Query(agentID, opts)
+	if err != nil {
+		s.logger.Error("failed to query logs", "agent_id", agentID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to query logs")
+		return
+	}
+
+	// Ensure we return an empty array rather than null when there are no entries.
+	if entries == nil {
+		entries = []logs.LogEntry{}
+	}
+
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"agent_id": agentID,
-		"entries":  []interface{}{},
+		"entries":  entries,
 	})
 }
 
@@ -577,8 +631,33 @@ type wsHub struct {
 
 // wsClient represents a connected WebSocket client.
 type wsClient struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn      *websocket.Conn
+	send      chan []byte
+	closeOnce sync.Once
+}
+
+// closeSend safely closes the send channel exactly once, preventing double-close panics.
+func (c *wsClient) closeSend() {
+	c.closeOnce.Do(func() {
+		close(c.send)
+	})
+}
+
+// trySend attempts to send a message on the client's send channel.
+// Returns false if the channel is full or closed.
+func (c *wsClient) trySend(msg []byte) (sent bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			// send channel was closed between the map lookup and the send.
+			sent = false
+		}
+	}()
+	select {
+	case c.send <- msg:
+		return true
+	default:
+		return false
+	}
 }
 
 // wsEvent is the JSON structure broadcast over WebSocket.
@@ -608,7 +687,7 @@ func (h *wsHub) unregister(c *wsClient) {
 	defer h.mu.Unlock()
 	if _, ok := h.clients[c]; ok {
 		delete(h.clients, c)
-		close(c.send)
+		c.closeSend()
 		h.logger.Debug("WebSocket client unregistered", "total_clients", len(h.clients))
 	}
 }
@@ -630,10 +709,8 @@ func (h *wsHub) Broadcast(eventType string, data interface{}) {
 	defer h.mu.RUnlock()
 
 	for client := range h.clients {
-		select {
-		case client.send <- msg:
-		default:
-			// Client send buffer is full; skip to avoid blocking.
+		if !client.trySend(msg) {
+			// Client send buffer is full or channel was closed; skip to avoid blocking.
 			h.logger.Warn("WebSocket client send buffer full, dropping message")
 		}
 	}
@@ -645,7 +722,7 @@ func (h *wsHub) closeAll() {
 	defer h.mu.Unlock()
 
 	for client := range h.clients {
-		close(client.send)
+		client.closeSend()
 		client.conn.Close(websocket.StatusGoingAway, "server shutting down")
 		delete(h.clients, client)
 	}

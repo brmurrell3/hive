@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/auth"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/auth"
+	"github.com/brmurrell3/hive/internal/types"
 	_ "modernc.org/sqlite"
 )
 
@@ -33,13 +33,13 @@ const (
 
 // validTransitions defines the allowed state machine transitions.
 var validTransitions = map[AgentStatus][]AgentStatus{
-	AgentStatusPending:  {AgentStatusCreating},
+	AgentStatusPending:  {AgentStatusCreating, AgentStatusFailed},
 	AgentStatusCreating: {AgentStatusStarting, AgentStatusFailed},
 	AgentStatusStarting: {AgentStatusRunning, AgentStatusFailed, AgentStatusStopping},
 	AgentStatusRunning:  {AgentStatusStopping, AgentStatusFailed},
 	AgentStatusStopping: {AgentStatusStopped, AgentStatusFailed},
-	AgentStatusStopped:  {AgentStatusCreating},
-	AgentStatusFailed:   {AgentStatusCreating},
+	AgentStatusStopped:  {AgentStatusCreating, AgentStatusPending},
+	AgentStatusFailed:   {AgentStatusCreating, AgentStatusStopped, AgentStatusPending},
 }
 
 // AgentState holds the runtime state for a single agent.
@@ -451,9 +451,21 @@ func (s *Store) GetAgent(id string) *AgentState {
 }
 
 // SetAgent updates or inserts the agent state and persists to SQLite.
+// If the agent already exists and the status is changing, the transition
+// is validated against the agent lifecycle state machine. New agents
+// (not yet in state) are accepted with any initial status.
 func (s *Store) SetAgent(agent *AgentState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Validate state transition when the agent already exists and status changes.
+	if existing, ok := s.state.Agents[agent.ID]; ok {
+		if existing.Status != agent.Status {
+			if err := ValidateTransition(existing.Status, agent.Status); err != nil {
+				return fmt.Errorf("setting agent %s: %w", agent.ID, err)
+			}
+		}
+	}
 
 	// Store a copy so external mutations don't affect persisted state.
 	cp := *agent
@@ -479,8 +491,16 @@ func (s *Store) ModifyAgent(id string, fn func(*AgentState) error) error {
 
 	// Work on a deep copy so the callback cannot mutate live state on error.
 	cp := *agent
+	oldStatus := cp.Status
 	if err := fn(&cp); err != nil {
 		return err
+	}
+
+	// Validate state transition if the callback changed the status.
+	if cp.Status != oldStatus {
+		if err := ValidateTransition(oldStatus, cp.Status); err != nil {
+			return fmt.Errorf("modifying agent %s: %w", id, err)
+		}
 	}
 
 	// Callback succeeded — commit the copy to live state.

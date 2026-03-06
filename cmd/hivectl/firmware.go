@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"path/filepath"
 
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/firmware"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/firmware"
 	"github.com/spf13/cobra"
 )
 

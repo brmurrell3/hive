@@ -26,6 +26,7 @@ type Watcher struct {
 	// successive writes coalesce into a single onChange invocation.
 	mu       sync.Mutex
 	debounce map[string]*time.Timer
+	stopped  bool
 }
 
 const debounceDelay = 500 * time.Millisecond
@@ -106,6 +107,7 @@ func (w *Watcher) Stop() error {
 
 		// Cancel any pending debounce timers.
 		w.mu.Lock()
+		w.stopped = true
 		for _, t := range w.debounce {
 			t.Stop()
 		}
@@ -173,6 +175,12 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 
 	filePath := event.Name
 	w.debounce[agentID] = time.AfterFunc(debounceDelay, func() {
+		w.mu.Lock()
+		if w.stopped {
+			w.mu.Unlock()
+			return
+		}
+		w.mu.Unlock()
 		w.fireOnChange(agentID, filePath)
 	})
 }

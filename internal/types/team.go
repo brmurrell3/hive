@@ -30,6 +30,7 @@ type TeamCommunication struct {
 	Persistent             bool        `yaml:"persistent,omitempty" json:"persistent,omitempty"`
 	HistoryDepth           int         `yaml:"historyDepth,omitempty" json:"historyDepth,omitempty"`
 	CrossTeamCapabilities  interface{} `yaml:"crossTeamCapabilities,omitempty" json:"crossTeamCapabilities,omitempty"`
+	AllowedCallers         []string    `yaml:"allowedCallers,omitempty" json:"allowedCallers,omitempty"`
 }
 
 type SharedVolume struct {

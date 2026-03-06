@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	hivenats "github.com/hivehq/hive/internal/nats"
-	"github.com/hivehq/hive/internal/testutil"
-	"github.com/hivehq/hive/internal/types"
+	hivenats "github.com/brmurrell3/hive/internal/nats"
+	"github.com/brmurrell3/hive/internal/testutil"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hivehq/hive/internal/capability"
+	"github.com/brmurrell3/hive/internal/capability"
 )
 
 // healthResponse is the JSON structure returned by GET /health.
@@ -33,7 +33,7 @@ func setupHTTPRoutes(mux *http.ServeMux, s *Sidecar) {
 
 // startHTTPServer creates and starts the HTTP server for health and capability
 // endpoints. The server listens on the address specified in the sidecar config.
-// T1-07: Verifies the listener actually binds before returning.
+// Verifies the listener actually binds before returning.
 func (s *Sidecar) startHTTPServer() error {
 	addr := s.config.HTTPAddr
 	if addr == "" {
@@ -43,7 +43,7 @@ func (s *Sidecar) startHTTPServer() error {
 	mux := http.NewServeMux()
 	setupHTTPRoutes(mux, s)
 
-	// T1-07: Bind the listener first so we fail fast if the port is taken.
+	// Bind the listener first so we fail fast if the port is taken.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -72,7 +72,7 @@ func (s *Sidecar) startHTTPServer() error {
 func handleHealth(s *Sidecar) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		runtimeStatus := "unhealthy"
-		if s.runtime.IsRunning() {
+		if s.runtime != nil && s.runtime.IsRunning() {
 			runtimeStatus = "healthy"
 		}
 

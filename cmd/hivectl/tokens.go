@@ -8,8 +8,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/token"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/token"
 	"github.com/spf13/cobra"
 )
 
@@ -122,8 +122,7 @@ func tokensRevokeCmd() *cobra.Command {
 
 			prefix := args[0]
 			if err := store.RevokeToken(prefix); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("revoking token: %w", err)
 			}
 
 			fmt.Printf("Token %s revoked\n", prefix)
@@ -139,6 +138,6 @@ func newStoreOnly() (*state.Store, error) {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	statePath := filepath.Join(absRoot, "state.json")
+	statePath := filepath.Join(absRoot, "state.db")
 	return state.NewStore(statePath, logger)
 }

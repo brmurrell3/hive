@@ -8,8 +8,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/spf13/cobra"
 )
 
@@ -91,8 +91,7 @@ func teamsStatusCmd() *cobra.Command {
 
 			team, ok := teams[teamID]
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: team %q not found\n", teamID)
-				os.Exit(1)
+				return fmt.Errorf("team %q not found", teamID)
 			}
 
 			data, err := json.MarshalIndent(team, "", "  ")
@@ -124,8 +123,7 @@ func teamsCapabilitiesCmd() *cobra.Command {
 			}
 
 			if _, ok := teams[teamID]; !ok {
-				fmt.Fprintf(os.Stderr, "Error: team %q not found\n", teamID)
-				os.Exit(1)
+				return fmt.Errorf("team %q not found", teamID)
 			}
 
 			agents, err := config.LoadAgents(absRoot)

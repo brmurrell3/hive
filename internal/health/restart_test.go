@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ func testLoggerUnit() *slog.Logger {
 func testStoreUnit(t *testing.T) *state.Store {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	store, err := state.NewStore(path, testLoggerUnit())
 	if err != nil {
 		t.Fatalf("creating test store: %v", err)

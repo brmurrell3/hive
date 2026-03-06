@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )

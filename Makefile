@@ -1,25 +1,28 @@
 .PHONY: build build-linux-amd64 build-linux-arm64 build-all test test-unit test-integration test-vm rootfs clean
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+LDFLAGS = -X main.version=$(VERSION)
+
 # Native platform build
 build:
 	@mkdir -p bin
-	go build -o bin/hived ./cmd/hived
-	go build -o bin/hivectl ./cmd/hivectl
-	go build -o bin/hive-agent ./cmd/hive-agent
+	go build -ldflags "$(LDFLAGS)" -o bin/hived ./cmd/hived
+	go build -ldflags "$(LDFLAGS)" -o bin/hivectl ./cmd/hivectl
+	go build -ldflags "$(LDFLAGS)" -o bin/hive-agent ./cmd/hive-agent
 
 # Cross-compile for linux/amd64 (Firecracker VMs, x86 servers)
 build-linux-amd64:
 	@mkdir -p bin/linux-amd64
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hived ./cmd/hived
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hivectl ./cmd/hivectl
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-agent ./cmd/hive-agent
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/linux-amd64/hived ./cmd/hived
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/linux-amd64/hivectl ./cmd/hivectl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/linux-amd64/hive-agent ./cmd/hive-agent
 
 # Cross-compile for linux/arm64 (Raspberry Pi)
 build-linux-arm64:
 	@mkdir -p bin/linux-arm64
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/linux-arm64/hive-agent ./cmd/hive-agent
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/linux-arm64/hivectl ./cmd/hivectl
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/linux-arm64/hive-agent ./cmd/hive-agent
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/linux-arm64/hivectl ./cmd/hivectl
 
 # Build all targets
 build-all: build build-linux-amd64 build-linux-arm64

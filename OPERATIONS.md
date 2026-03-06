@@ -50,7 +50,7 @@ Complete guide to building, running, and testing every feature of Hive end-to-en
 
 ```bash
 # From the project root:
-cd /Users/brendan/Developer/hive
+cd path/to/hive
 
 # Build all three binaries
 make build
@@ -243,10 +243,10 @@ EOF
 
 ### State File
 
-All runtime state is persisted atomically to `my-cluster/state.json`:
+All runtime state is persisted atomically to `my-cluster/state.db`:
 
 ```bash
-cat my-cluster/state.json | python3 -m json.tool
+cat my-cluster/state.db | python3 -m json.tool
 ```
 
 ```json
@@ -546,12 +546,12 @@ Currently the dashboard server is a library — you wire it into hived or run it
 package main
 
 import (
-    "github.com/hivehq/hive/internal/dashboard"
-    "github.com/hivehq/hive/internal/state"
+    "github.com/brmurrell3/hive/internal/dashboard"
+    "github.com/brmurrell3/hive/internal/state"
 )
 
 func main() {
-    store, _ := state.NewStore("my-cluster/state.json", logger)
+    store, _ := state.NewStore("my-cluster/state.db", logger)
     nc, _ := nats.Connect("nats://127.0.0.1:4222")
     srv := dashboard.NewServer(dashboard.Config{
         Store:    store,
@@ -904,7 +904,7 @@ kill -9 $(pgrep hived)
 ```
 
 On next startup, crash recovery runs automatically:
-1. Reads `state.json` to find agents marked as RUNNING/STARTING
+1. Reads `state.db` to find agents marked as RUNNING/STARTING
 2. For each, checks if the VM PID is still alive (`kill -0 PID`)
 3. If the process is dead, marks the agent as FAILED with error "process not found after crash recovery"
 4. Agents can then be restarted normally
@@ -1031,8 +1031,8 @@ kill $SUB_PID 2>/dev/null
 ./hivectl agents destroy summarizer --cluster-root demo-cluster
 
 # ── Step 18: Node management (simulate) ──
-# Nodes appear via hive-agent join; for testing, inspect state.json directly
-cat demo-cluster/state.json | python3 -m json.tool
+# Nodes appear via hive-agent join; for testing, inspect state.db directly
+cat demo-cluster/state.db | python3 -m json.tool
 
 # ── Step 19: Revoke the token ──
 PREFIX=$(./hivectl tokens list --cluster-root demo-cluster 2>/dev/null | tail -1 | awk '{print $1}')
@@ -1052,7 +1052,7 @@ kill -TERM $HIVED_PID
 wait $HIVED_PID 2>/dev/null
 
 # ── Step 23: Verify state persisted ──
-cat demo-cluster/state.json | python3 -m json.tool
+cat demo-cluster/state.db | python3 -m json.tool
 
 # ── Step 24: Run the full test suite ──
 make test
@@ -1104,11 +1104,11 @@ sudo chmod 666 /dev/kvm
 
 ### State file corruption
 
-If `state.json` becomes corrupted:
+If `state.db` becomes corrupted:
 
 ```bash
 # Delete it and start fresh (loses runtime state, not config)
-rm demo-cluster/state.json
+rm demo-cluster/state.db
 ```
 
 ### Tests fail with "timeout"
@@ -1172,6 +1172,6 @@ cmake --version
 | `cluster.yaml` | Operator | Cluster configuration (read by hived and hivectl) |
 | `agents/*/manifest.yaml` | Operator | Agent definitions |
 | `teams/*.yaml` | Operator | Team definitions |
-| `state.json` | hived | Runtime state (do not edit manually while hived runs) |
+| `state.db` | hived | Runtime state (do not edit manually while hived runs) |
 | `.state/jetstream/` | NATS | JetStream persistence |
 | `.state/agents/*/` | hived | Per-agent VM artifacts (sockets, rootfs copies) |

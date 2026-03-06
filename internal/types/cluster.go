@@ -15,8 +15,112 @@ type ClusterMetadata struct {
 }
 
 type ClusterSpec struct {
-	NATS     NATSConfig     `yaml:"nats" json:"nats"`
-	Defaults DefaultsConfig `yaml:"defaults" json:"defaults"`
+	NATS          NATSConfig          `yaml:"nats" json:"nats"`
+	Defaults      DefaultsConfig      `yaml:"defaults" json:"defaults"`
+	MQTT          MQTTConfig          `yaml:"mqtt,omitempty" json:"mqtt,omitempty"`
+	Dashboard     DashboardConfig     `yaml:"dashboard,omitempty" json:"dashboard,omitempty"`
+	Metrics       MetricsConfig       `yaml:"metrics,omitempty" json:"metrics,omitempty"`
+	Logging       LoggingConfig       `yaml:"logging,omitempty" json:"logging,omitempty"`
+	Secrets       map[string]string   `yaml:"secrets,omitempty" json:"secrets,omitempty"`
+	Models        []ModelConfig       `yaml:"models,omitempty" json:"models,omitempty"`
+	Nodes         NodeConfig          `yaml:"nodes,omitempty" json:"nodes,omitempty"`
+	VM            VMConfig            `yaml:"vm,omitempty" json:"vm,omitempty"`
+	Director      DirectorConfig      `yaml:"director,omitempty" json:"director,omitempty"`
+	Users         []UserConfig        `yaml:"users,omitempty" json:"users,omitempty"`
+	Communication CommunicationConfig `yaml:"communication,omitempty" json:"communication,omitempty"`
+}
+
+// ModelConfig defines a model entry in the cluster model registry.
+type ModelConfig struct {
+	Name     string `yaml:"name" json:"name"`
+	Provider string `yaml:"provider" json:"provider"`
+	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
+}
+
+// NodeConfig defines cluster-level node settings.
+type NodeConfig struct {
+	AutoApprove bool `yaml:"autoApprove" json:"autoApprove"`
+}
+
+// VMConfig defines cluster-level VM settings.
+type VMConfig struct {
+	KernelPath string `yaml:"kernelPath,omitempty" json:"kernelPath,omitempty"`
+	RootfsPath string `yaml:"rootfsPath,omitempty" json:"rootfsPath,omitempty"`
+}
+
+// DirectorConfig defines the top-level director agent reference.
+type DirectorConfig struct {
+	AgentID string `yaml:"agentId,omitempty" json:"agentId,omitempty"`
+}
+
+// UserConfig defines a user entry for multi-user mode.
+type UserConfig struct {
+	ID     string   `yaml:"id" json:"id"`
+	Name   string   `yaml:"name,omitempty" json:"name,omitempty"`
+	Role   string   `yaml:"role" json:"role"`
+	Token  string   `yaml:"token,omitempty" json:"token,omitempty"`
+	Teams  []string `yaml:"teams,omitempty" json:"teams,omitempty"`
+	Agents []string `yaml:"agents,omitempty" json:"agents,omitempty"`
+}
+
+// CommunicationConfig defines cluster-level communication settings.
+type CommunicationConfig struct {
+	CrossTeam CrossTeamConfig `yaml:"crossTeamCapabilities,omitempty" json:"crossTeamCapabilities,omitempty"`
+}
+
+// CrossTeamConfig defines cross-team capability settings.
+type CrossTeamConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+type MQTTConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	Port    int  `yaml:"port" json:"port"`
+}
+
+func (m MQTTConfig) EffectivePort() int {
+	if m.Port == 0 {
+		return 1883
+	}
+	return m.Port
+}
+
+type DashboardConfig struct {
+	Enabled    bool   `yaml:"enabled" json:"enabled"`
+	Addr       string `yaml:"addr" json:"addr"`
+	CORSOrigin string `yaml:"corsOrigin,omitempty" json:"corsOrigin,omitempty"`
+	AuthToken  string `yaml:"authToken,omitempty" json:"authToken,omitempty"`
+}
+
+func (d DashboardConfig) EffectiveAddr() string {
+	if d.Addr == "" {
+		return ":8080"
+	}
+	return d.Addr
+}
+
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Addr    string `yaml:"addr" json:"addr"`
+}
+
+func (m MetricsConfig) EffectiveAddr() string {
+	if m.Addr == "" {
+		return ":9090"
+	}
+	return m.Addr
+}
+
+type LoggingConfig struct {
+	Enabled       bool `yaml:"enabled" json:"enabled"`
+	RetentionDays int  `yaml:"retentionDays" json:"retentionDays"`
+}
+
+func (l LoggingConfig) EffectiveRetentionDays() int {
+	if l.RetentionDays == 0 {
+		return 30
+	}
+	return l.RetentionDays
 }
 
 type NATSConfig struct {

@@ -3,9 +3,12 @@ package cluster
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
+	"time"
 
-	"github.com/hivehq/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/nats-io/nats.go"
 )
 
 // Role defines whether this node is the root (control plane) or a worker.
@@ -30,6 +33,7 @@ type Cluster struct {
 	mu      sync.Mutex
 	cfg     Config
 	store   *state.Store
+	nc      *nats.Conn
 	logger  *slog.Logger
 	running bool
 	stopCh  chan struct{}
@@ -67,6 +71,28 @@ func (c *Cluster) Start() error {
 		return fmt.Errorf("external NATS mode requires at least one URL")
 	}
 
+	if c.cfg.NATSMode == "external" {
+		opts := []nats.Option{
+			nats.Name("hive-cluster-" + string(c.cfg.Role)),
+			nats.MaxReconnects(-1),
+			nats.ReconnectWait(2 * time.Second),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				c.logger.Warn("NATS disconnected", "error", err)
+			}),
+			nats.ReconnectHandler(func(_ *nats.Conn) {
+				c.logger.Info("NATS reconnected")
+			}),
+		}
+		nc, err := nats.Connect(strings.Join(c.cfg.NATSUrls, ","), opts...)
+		if err != nil {
+			return fmt.Errorf("connecting to external NATS: %w", err)
+		}
+		c.nc = nc
+		c.logger.Info("connected to external NATS",
+			"urls", c.cfg.NATSUrls,
+		)
+	}
+
 	c.running = true
 
 	go func() {
@@ -87,6 +113,13 @@ func (c *Cluster) Stop() {
 	}
 	c.running = false
 	c.mu.Unlock()
+
+	if c.nc != nil {
+		if err := c.nc.Drain(); err != nil {
+			c.logger.Warn("error draining NATS connection", "error", err)
+		}
+		c.nc = nil
+	}
 
 	close(c.stopCh)
 	<-c.stopped
@@ -117,16 +150,55 @@ func (c *Cluster) ReplicateState(subject string, data []byte) error {
 		return nil
 	}
 
-	// In external mode, we would publish to the NATS cluster.
-	// This is a placeholder for the actual NATS publish implementation
-	// which will be wired up when the NATS client is connected to
-	// external servers.
-	c.logger.Info("replicating state",
+	// In external mode, publish to the NATS cluster.
+	if c.nc == nil {
+		return fmt.Errorf("NATS connection not established")
+	}
+
+	if err := c.nc.Publish(subject, data); err != nil {
+		return fmt.Errorf("publishing state replication: %w", err)
+	}
+
+	c.logger.Debug("replicated state",
 		"subject", subject,
 		"bytes", len(data),
 	)
 
 	return nil
+}
+
+// Subscribe subscribes to a NATS subject for receiving state replication
+// updates from other nodes. This is used by worker nodes to receive state
+// published by the root node. Returns an error if not in external mode
+// or if the cluster is not running.
+func (c *Cluster) Subscribe(subject string, handler func(data []byte)) (*nats.Subscription, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.running {
+		return nil, fmt.Errorf("cluster not running")
+	}
+
+	if c.cfg.NATSMode == "embedded" {
+		return nil, fmt.Errorf("subscribe not supported in embedded mode")
+	}
+
+	if c.nc == nil {
+		return nil, fmt.Errorf("NATS connection not established")
+	}
+
+	sub, err := c.nc.Subscribe(subject, func(msg *nats.Msg) {
+		handler(msg.Data)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("subscribing to %s: %w", subject, err)
+	}
+
+	c.logger.Info("subscribed to state replication",
+		"subject", subject,
+	)
+
+	return sub, nil
 }
 
 // NATSMode returns the configured NATS mode ("embedded" or "external").

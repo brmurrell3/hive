@@ -8,7 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
+	"time"
 )
 
 // VsockForwarder listens on the Firecracker vsock UDS path and forwards
@@ -90,6 +92,11 @@ func (f *VsockForwarder) Stop() {
 	}
 
 	f.wg.Wait()
+
+	// Clean up the Unix domain socket file to prevent "address already in use"
+	// errors on agent restart.
+	os.Remove(f.udsPath)
+
 	f.logger.Info("vsock forwarder stopped")
 }
 
@@ -108,8 +115,14 @@ func (f *VsockForwarder) acceptLoop(ctx context.Context) {
 				return
 			default:
 			}
-			f.logger.Warn("accept error on vsock UDS", "error", err)
-			return
+			f.logger.Warn("accept error on vsock UDS, retrying", "error", err)
+			// Brief backoff before retrying to avoid tight error loops.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
 		}
 
 		f.wg.Add(1)

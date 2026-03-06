@@ -2,10 +2,11 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // ValidationError collects multiple validation errors.
@@ -37,6 +38,17 @@ func (v *ValidationError) errorOrNil() error {
 }
 
 var agentIDRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+var secretRefRegex = regexp.MustCompile(`\$\{([A-Z_][A-Z0-9_]*)\}`)
+
+// reservedProviderNames lists provider names that cannot be used as model registry names.
+var reservedProviderNames = map[string]bool{
+	"anthropic": true,
+	"openai":    true,
+	"ollama":    true,
+	"google":    true,
+	"mistral":   true,
+	"cohere":    true,
+}
 
 func validateCluster(cfg *types.ClusterConfig) error {
 	ve := &ValidationError{}
@@ -83,7 +95,7 @@ func ValidateDesiredState(ds *types.DesiredState) error {
 
 	// Validate each agent
 	for id, agent := range agentsByID {
-		validateAgent(ve, id, agent, teamsByID)
+		validateAgent(ve, id, agent, teamsByID, ds.Cluster)
 	}
 
 	// Validate each team
@@ -91,10 +103,78 @@ func ValidateDesiredState(ds *types.DesiredState) error {
 		validateTeam(ve, id, team, agentsByID)
 	}
 
+	// Rule 11: Director agentId must reference existing agent with no team.
+	// Rule 12: Director agent must have tier vm or native.
+	if ds.Cluster != nil && ds.Cluster.Spec.Director.AgentID != "" {
+		dirAgentID := ds.Cluster.Spec.Director.AgentID
+		dirAgent, ok := agentsByID[dirAgentID]
+		if !ok {
+			ve.addf("spec.director.agentId %q references nonexistent agent", dirAgentID)
+		} else {
+			if dirAgent.Metadata.Team != "" {
+				ve.addf("spec.director.agentId %q must not have metadata.team set (got %q)", dirAgentID, dirAgent.Metadata.Team)
+			}
+			if dirAgent.Spec.Tier != "" && dirAgent.Spec.Tier != "vm" && dirAgent.Spec.Tier != "native" {
+				ve.addf("spec.director.agentId %q must have tier vm or native, got %q", dirAgentID, dirAgent.Spec.Tier)
+			}
+		}
+	}
+
+	// Rule 13: Model provider names must not shadow reserved provider names.
+	if ds.Cluster != nil {
+		for _, model := range ds.Cluster.Spec.Models {
+			if reservedProviderNames[model.Name] {
+				ve.addf("spec.models entry name %q shadows reserved provider name", model.Name)
+			}
+		}
+	}
+
+	// Rule 17: User IDs must be unique.
+	// Rule 18: User team references must be valid team IDs or "all".
+	// Rule 19: User agent references must be valid agent IDs.
+	if ds.Cluster != nil {
+		seenUserIDs := make(map[string]bool)
+		for _, user := range ds.Cluster.Spec.Users {
+			if user.ID == "" {
+				ve.add("spec.users: user id is required")
+				continue
+			}
+			if seenUserIDs[user.ID] {
+				ve.addf("spec.users: duplicate user id %q", user.ID)
+			}
+			seenUserIDs[user.ID] = true
+
+			// Validate user role is one of the allowed values.
+			validRoles := map[string]bool{"admin": true, "operator": true, "viewer": true}
+			if user.Role == "" {
+				ve.addf("spec.users: user %q role is required", user.ID)
+			} else if !validRoles[user.Role] {
+				ve.addf("spec.users: user %q role must be one of [admin, operator, viewer], got %q", user.ID, user.Role)
+			}
+
+			// Rule 18: Validate team references.
+			for _, teamRef := range user.Teams {
+				if teamRef == "all" {
+					continue
+				}
+				if _, ok := teamsByID[teamRef]; !ok {
+					ve.addf("spec.users: user %q references nonexistent team %q", user.ID, teamRef)
+				}
+			}
+
+			// Rule 19: Validate agent references.
+			for _, agentRef := range user.Agents {
+				if _, ok := agentsByID[agentRef]; !ok {
+					ve.addf("spec.users: user %q references nonexistent agent %q", user.ID, agentRef)
+				}
+			}
+		}
+	}
+
 	return ve.errorOrNil()
 }
 
-func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, teams map[string]*types.TeamManifest) {
+func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, teams map[string]*types.TeamManifest, cluster *types.ClusterConfig) {
 	prefix := fmt.Sprintf("agent %q", id)
 
 	// Validate apiVersion and kind
@@ -245,6 +325,30 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		if !validPolicies[agent.Spec.Restart.Policy] {
 			ve.addf("%s: spec.restart.policy must be one of [always, on-failure, never], got %q", prefix, agent.Spec.Restart.Policy)
 		}
+	}
+
+	// Rule 6: Validate secret references (${SECRET_NAME}) in runtime.model.env
+	// resolve against spec.secrets in cluster config.
+	if cluster != nil && len(agent.Spec.Runtime.Model.Env) > 0 {
+		secrets := cluster.Spec.Secrets
+		for envKey, envVal := range agent.Spec.Runtime.Model.Env {
+			matches := secretRefRegex.FindAllStringSubmatch(envVal, -1)
+			for _, match := range matches {
+				secretName := match[1]
+				if secrets == nil {
+					ve.addf("%s: env %q references secret ${%s} but spec.secrets is not defined", prefix, envKey, secretName)
+				} else if _, ok := secrets[secretName]; !ok {
+					ve.addf("%s: env %q references secret ${%s} which is not in spec.secrets", prefix, envKey, secretName)
+				}
+			}
+		}
+	}
+
+	// Rule 16: Placement nodeId warning if set (node may not be registered at
+	// parse time, so this is a warning, not an error).
+	if agent.Spec.Placement.NodeID != "" {
+		slog.Warn("agent placement.nodeId is set; node registration cannot be verified at parse time",
+			"agent_id", id, "node_id", agent.Spec.Placement.NodeID)
 	}
 }
 

@@ -2,13 +2,17 @@ package sidecar
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/capability"
+	"github.com/brmurrell3/hive/internal/capability"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
@@ -31,6 +35,8 @@ type Sidecar struct {
 	healthy      bool
 	stopCh       chan struct{}
 	stopOnce     sync.Once
+	controlSub   *nats.Subscription
+	memorySub    *nats.Subscription
 	broadcastSub *nats.Subscription
 }
 
@@ -273,11 +279,11 @@ func (s *Sidecar) monitorRuntime() {
 
 // Stop performs a graceful shutdown of all sidecar subsystems in reverse
 // start order: heartbeat, HTTP server, runtime, NATS.
-// T3-01: Safe to call multiple times.
+// Safe to call multiple times.
 func (s *Sidecar) Stop() error {
 	s.logger.Info("stopping sidecar")
 
-	// T3-01: Use sync.Once to prevent double-close panic.
+	// Use sync.Once to prevent double-close panic.
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
@@ -295,6 +301,18 @@ func (s *Sidecar) Stop() error {
 	if s.runtime != nil {
 		if err := s.runtime.Stop(); err != nil {
 			s.logger.Error("error stopping runtime", "error", err)
+		}
+	}
+
+	// Unsubscribe from control and memory NATS subjects.
+	if s.controlSub != nil {
+		if err := s.controlSub.Unsubscribe(); err != nil {
+			s.logger.Warn("error unsubscribing from control subject", "error", err)
+		}
+	}
+	if s.memorySub != nil {
+		if err := s.memorySub.Unsubscribe(); err != nil {
+			s.logger.Warn("error unsubscribing from memory subject", "error", err)
 		}
 	}
 
@@ -319,14 +337,36 @@ func (s *Sidecar) Stop() error {
 	return nil
 }
 
+// capabilityRequestTimeout is how long executeCapabilityLocally waits for the
+// runtime process to produce a response file before returning an async ack.
+const capabilityRequestTimeout = 10 * time.Second
+
+// capabilityPollInterval is how frequently we check for a response file.
+const capabilityPollInterval = 50 * time.Millisecond
+
+// capabilityRequest is the JSON structure written to the requests directory
+// for the runtime process to pick up and execute.
+type capabilityRequest struct {
+	ID         string                 `json:"id"`
+	Capability string                 `json:"capability"`
+	AgentID    string                 `json:"agent_id"`
+	Inputs     map[string]interface{} `json:"inputs"`
+	Timestamp  string                 `json:"timestamp"`
+}
+
 // executeCapabilityLocally processes a capability request without going through
 // NATS. This avoids the infinite loop that would occur if the handler published
 // back to the same NATS subject the router subscribes to.
 //
-// If a runtime command is configured, the handler returns an acknowledgment
-// that the request was received along with the inputs (the runtime process is
-// the actual executor). If no runtime command is configured (no-op mode), the
-// handler returns an acknowledgment with the inputs echoed back.
+// If no runtime command is configured (no-op mode), the handler returns an
+// acknowledgment with the inputs echoed back -- there is no process to forward
+// to.
+//
+// If a runtime IS configured and running, the sidecar writes the request as a
+// JSON file to {workspace}/.hive/requests/{uuid}.json and waits (with timeout)
+// for the runtime to produce a response at {uuid}.response.json. This
+// file-based protocol lets any runtime process (Python, Node, shell script,
+// etc.) handle capability requests without requiring a specific IPC mechanism.
 func (s *Sidecar) executeCapabilityLocally(capName string, inputs map[string]interface{}) (map[string]interface{}, error) {
 	s.logger.Info("executing capability locally",
 		"capability", capName,
@@ -338,29 +378,126 @@ func (s *Sidecar) executeCapabilityLocally(capName string, inputs map[string]int
 		return nil, fmt.Errorf("runtime is not running, cannot execute capability %s", capName)
 	}
 
-	// Return an acknowledgment with the capability name and the inputs.
-	// In a production deployment, this is where the sidecar would forward the
-	// request to the agent runtime process (e.g., via stdin/stdout, a Unix
-	// socket, or a local HTTP call). For now, the sidecar acknowledges receipt
-	// and echoes the inputs, which is sufficient for capability routing to work
-	// end-to-end without the infinite loop.
-	result := map[string]interface{}{
-		"capability": capName,
-		"agent_id":   s.agentID,
-		"status":     "executed",
+	// No-op mode: no runtime command configured. Echo the inputs back as an
+	// acknowledgment. This is the correct behavior for agents that don't have
+	// a runtime process (e.g., pure capability placeholders or test agents).
+	if s.config.RuntimeCmd == "" {
+		result := map[string]interface{}{
+			"capability": capName,
+			"agent_id":   s.agentID,
+			"status":     "executed",
+		}
+		if inputs != nil {
+			result["inputs_received"] = inputs
+		}
+		return result, nil
 	}
 
-	// Echo inputs back so callers can verify the request was received correctly.
-	if inputs != nil {
-		result["inputs_received"] = inputs
+	// Runtime is configured -- forward the request via the filesystem.
+	return s.forwardToRuntime(capName, inputs)
+}
+
+// forwardToRuntime writes a capability request to the workspace requests
+// directory and waits for the runtime process to produce a response file.
+func (s *Sidecar) forwardToRuntime(capName string, inputs map[string]interface{}) (map[string]interface{}, error) {
+	workspace := s.config.WorkspacePath
+	if workspace == "" {
+		workspace = "."
 	}
 
-	return result, nil
+	requestsDir := filepath.Join(workspace, ".hive", "requests")
+	if err := os.MkdirAll(requestsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating requests directory: %w", err)
+	}
+
+	reqID := types.NewUUID()
+	reqPath := filepath.Join(requestsDir, reqID+".json")
+	respPath := filepath.Join(requestsDir, reqID+".response.json")
+
+	// Build and marshal the request.
+	req := capabilityRequest{
+		ID:         reqID,
+		Capability: capName,
+		AgentID:    s.agentID,
+		Inputs:     inputs,
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling capability request: %w", err)
+	}
+
+	// Write the request file atomically so the runtime never sees a partial file.
+	if err := writeFileAtomic(reqPath, data); err != nil {
+		return nil, fmt.Errorf("writing capability request file: %w", err)
+	}
+
+	s.logger.Info("capability request written, waiting for response",
+		"capability", capName,
+		"request_id", reqID,
+		"request_path", reqPath,
+	)
+
+	// Poll for the response file with a timeout.
+	deadline := time.After(capabilityRequestTimeout)
+	ticker := time.NewTicker(capabilityPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			// Timeout -- the runtime has not responded yet. Return an async
+			// acknowledgment so the caller knows the request was submitted.
+			s.logger.Warn("capability request timed out waiting for response",
+				"capability", capName,
+				"request_id", reqID,
+			)
+			return map[string]interface{}{
+				"capability": capName,
+				"agent_id":   s.agentID,
+				"request_id": reqID,
+				"status":     "submitted",
+				"message":    "request submitted to runtime, response pending",
+			}, nil
+
+		case <-ticker.C:
+			respData, err := os.ReadFile(respPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue // Not ready yet, keep polling.
+				}
+				return nil, fmt.Errorf("reading capability response file: %w", err)
+			}
+
+			// Response file exists -- parse it and return.
+			var result map[string]interface{}
+			if err := json.Unmarshal(respData, &result); err != nil {
+				return nil, fmt.Errorf("unmarshalling capability response: %w", err)
+			}
+
+			s.logger.Info("capability response received from runtime",
+				"capability", capName,
+				"request_id", reqID,
+			)
+
+			// Clean up the request and response files. Best-effort; errors
+			// are logged but do not fail the operation.
+			if rmErr := os.Remove(reqPath); rmErr != nil {
+				s.logger.Warn("failed to clean up request file", "path", reqPath, "error", rmErr)
+			}
+			if rmErr := os.Remove(respPath); rmErr != nil {
+				s.logger.Warn("failed to clean up response file", "path", respPath, "error", rmErr)
+			}
+
+			return result, nil
+		}
+	}
 }
 
 // IsHealthy returns whether the sidecar and its runtime are both healthy.
 func (s *Sidecar) IsHealthy() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.healthy && s.runtime.IsRunning()
+	return s.healthy && s.runtime != nil && s.runtime.IsRunning()
 }

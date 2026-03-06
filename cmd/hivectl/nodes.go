@@ -7,7 +7,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/spf13/cobra"
 )
 

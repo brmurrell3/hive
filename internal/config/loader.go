@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -36,8 +36,13 @@ func ParseCluster(data []byte) (*types.ClusterConfig, error) {
 
 	// Apply spec
 	cfg.Spec.NATS = types.NATSConfig{
-		Port:        raw.Spec.NATS.Port,
-		ClusterPort: raw.Spec.NATS.ClusterPort,
+		Port:         raw.Spec.NATS.Port,
+		ClusterPort:  raw.Spec.NATS.ClusterPort,
+		Mode:         raw.Spec.NATS.Mode,
+		URLs:         raw.Spec.NATS.URLs,
+		ClusterPeers: raw.Spec.NATS.ClusterPeers,
+		AuthToken:    raw.Spec.NATS.AuthToken,
+		Host:         raw.Spec.NATS.Host,
 		JetStream: types.JetStreamConfig{
 			Enabled:    raw.Spec.NATS.JetStream.Enabled,
 			StorePath:  raw.Spec.NATS.JetStream.StorePath,
@@ -75,6 +80,19 @@ func ParseCluster(data []byte) (*types.ClusterConfig, error) {
 		},
 	}
 
+	// Parse new spec fields
+	cfg.Spec.MQTT = raw.Spec.MQTT
+	cfg.Spec.Dashboard = raw.Spec.Dashboard
+	cfg.Spec.Metrics = raw.Spec.Metrics
+	cfg.Spec.Logging = raw.Spec.Logging
+	cfg.Spec.Secrets = raw.Spec.Secrets
+	cfg.Spec.Models = raw.Spec.Models
+	cfg.Spec.Nodes = raw.Spec.Nodes
+	cfg.Spec.VM = raw.Spec.VM
+	cfg.Spec.Director = raw.Spec.Director
+	cfg.Spec.Users = raw.Spec.Users
+	cfg.Spec.Communication = raw.Spec.Communication
+
 	applyDefaults(cfg)
 
 	if err := validateCluster(cfg); err != nil {
@@ -93,14 +111,30 @@ type rawClusterConfig struct {
 }
 
 type rawClusterSpec struct {
-	NATS     rawNATSConfig     `yaml:"nats"`
-	Defaults rawDefaultsConfig `yaml:"defaults"`
+	NATS          rawNATSConfig            `yaml:"nats"`
+	Defaults      rawDefaultsConfig        `yaml:"defaults"`
+	MQTT          types.MQTTConfig         `yaml:"mqtt"`
+	Dashboard     types.DashboardConfig    `yaml:"dashboard"`
+	Metrics       types.MetricsConfig      `yaml:"metrics"`
+	Logging       types.LoggingConfig      `yaml:"logging"`
+	Secrets       map[string]string        `yaml:"secrets"`
+	Models        []types.ModelConfig      `yaml:"models"`
+	Nodes         types.NodeConfig         `yaml:"nodes"`
+	VM            types.VMConfig           `yaml:"vm"`
+	Director      types.DirectorConfig     `yaml:"director"`
+	Users         []types.UserConfig       `yaml:"users"`
+	Communication types.CommunicationConfig `yaml:"communication"`
 }
 
 type rawNATSConfig struct {
-	Port        int                `yaml:"port"`
-	ClusterPort int                `yaml:"clusterPort"`
-	JetStream   rawJetStreamConfig `yaml:"jetstream"`
+	Port         int                `yaml:"port"`
+	ClusterPort  int                `yaml:"clusterPort"`
+	JetStream    rawJetStreamConfig `yaml:"jetstream"`
+	Mode         string             `yaml:"mode"`
+	URLs         []string           `yaml:"urls"`
+	ClusterPeers []string           `yaml:"clusterPeers"`
+	AuthToken    string             `yaml:"authToken"`
+	Host         string             `yaml:"host"`
 }
 
 type rawJetStreamConfig struct {
@@ -157,7 +191,7 @@ func LoadAgents(clusterRoot string) (map[string]*types.AgentManifest, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		// T4-01: Support both .yaml and .yml extensions for agent manifests.
+		// Support both .yaml and .yml extensions for agent manifests.
 		manifestPath := filepath.Join(agentsDir, entry.Name(), "manifest.yaml")
 		data, err := os.ReadFile(manifestPath)
 		if err != nil {
@@ -181,7 +215,7 @@ func LoadAgents(clusterRoot string) (map[string]*types.AgentManifest, error) {
 			return nil, fmt.Errorf("parsing agent manifest %s: %w", entry.Name(), err)
 		}
 
-		// T2-12: Detect duplicate agent IDs.
+		// Detect duplicate agent IDs.
 		if existing, dup := agents[agent.Metadata.ID]; dup {
 			_ = existing
 			return nil, fmt.Errorf("duplicate agent ID %q: found in %s and another directory", agent.Metadata.ID, entry.Name())
@@ -316,7 +350,7 @@ func LoadTeams(clusterRoot string) (map[string]*types.TeamManifest, error) {
 			return nil, fmt.Errorf("parsing team manifest %s: %w", entry.Name(), err)
 		}
 
-		// T2-12: Detect duplicate team IDs.
+		// Detect duplicate team IDs.
 		if _, dup := teams[team.Metadata.ID]; dup {
 			return nil, fmt.Errorf("duplicate team ID %q: found in %s and another file", team.Metadata.ID, entry.Name())
 		}
@@ -337,7 +371,7 @@ func ParseTeam(data []byte) (*types.TeamManifest, error) {
 
 // LoadDesiredState loads the complete desired state from a cluster root directory.
 // It reads cluster.yaml, all agent manifests, and all team manifests.
-// T2-11: Merges cluster defaults into agents that omit health/restart fields.
+// Merges cluster defaults into agents that omit health/restart fields.
 func LoadDesiredState(clusterRoot string) (*types.DesiredState, error) {
 	cluster, err := LoadCluster(clusterRoot)
 	if err != nil {
@@ -354,7 +388,7 @@ func LoadDesiredState(clusterRoot string) (*types.DesiredState, error) {
 		return nil, fmt.Errorf("loading team manifests: %w", err)
 	}
 
-	// T2-11: Merge cluster-level defaults into agents that don't set these fields.
+	// Merge cluster-level defaults into agents that don't set these fields.
 	for _, agent := range agents {
 		mergeAgentDefaults(agent, cluster)
 	}
@@ -368,7 +402,7 @@ func LoadDesiredState(clusterRoot string) (*types.DesiredState, error) {
 
 // mergeAgentDefaults populates agent-level health/restart fields from cluster
 // defaults when the agent manifest does not explicitly set them.
-// T2-11: Agents that omit health/restart sections inherit cluster defaults.
+// Agents that omit health/restart sections inherit cluster defaults.
 func mergeAgentDefaults(agent *types.AgentManifest, cluster *types.ClusterConfig) {
 	defaults := cluster.Spec.Defaults
 

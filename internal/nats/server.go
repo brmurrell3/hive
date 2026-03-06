@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 )
 

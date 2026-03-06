@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
@@ -39,6 +39,7 @@ type Tracker struct {
 	mu             sync.RWMutex
 	sub            *nats.Subscription
 	stopCh         chan struct{}
+	stopOnce       sync.Once
 	checkInterval  time.Duration
 	offlineTimeout time.Duration
 }
@@ -91,13 +92,16 @@ func (t *Tracker) Start() error {
 	return nil
 }
 
-// Stop stops the tracker.
+// Stop stops the tracker. It is safe to call Stop multiple times; only the
+// first call takes effect.
 func (t *Tracker) Stop() {
-	close(t.stopCh)
-	if t.sub != nil {
-		t.sub.Unsubscribe()
-	}
-	t.logger.Info("firmware tracker stopped")
+	t.stopOnce.Do(func() {
+		close(t.stopCh)
+		if t.sub != nil {
+			t.sub.Unsubscribe()
+		}
+		t.logger.Info("firmware tracker stopped")
+	})
 }
 
 // handleHeartbeat processes a health heartbeat message.

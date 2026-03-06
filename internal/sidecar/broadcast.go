@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 

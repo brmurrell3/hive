@@ -9,9 +9,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/spf13/cobra"
 )
 
@@ -86,8 +86,7 @@ func agentsStatusCmd() *cobra.Command {
 			agentID := args[0]
 			a, err := client.AgentStatus(agentID)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("getting agent status: %w", err)
 			}
 
 			data, err := json.MarshalIndent(a, "", "  ")
@@ -115,8 +114,7 @@ func agentsStartCmd() *cobra.Command {
 			defer client.Close()
 
 			if err := client.StartAgent(agentID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("starting agent: %w", err)
 			}
 
 			fmt.Printf("Agent %s started\n", agentID)
@@ -140,8 +138,7 @@ func agentsStopCmd() *cobra.Command {
 			defer client.Close()
 
 			if err := client.StopAgent(agentID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("stopping agent: %w", err)
 			}
 
 			fmt.Printf("Agent %s stopped\n", agentID)
@@ -165,8 +162,7 @@ func agentsDestroyCmd() *cobra.Command {
 			defer client.Close()
 
 			if err := client.DestroyAgent(agentID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("destroying agent: %w", err)
 			}
 
 			fmt.Printf("Agent %s destroyed\n", agentID)
@@ -190,8 +186,7 @@ func agentsRestartCmd() *cobra.Command {
 			defer client.Close()
 
 			if err := client.RestartAgent(agentID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("restarting agent: %w", err)
 			}
 
 			fmt.Printf("Agent %s restarted\n", agentID)
@@ -394,8 +389,8 @@ func agentsExecCmd() *cobra.Command {
 		Short: "Execute a command inside an agent's runtime",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("exec not available: requires running hived with VM access")
-			return nil
+			agentID := args[0]
+			return fmt.Errorf("exec requires VM network access from this host: agent %q runs inside a Firecracker VM with virtio-vsock connectivity, which is not accessible from hivectl", agentID)
 		},
 	}
 }
@@ -420,8 +415,7 @@ func agentsCapabilitiesCmd() *cobra.Command {
 
 			agent, ok := agents[agentID]
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: agent %q not found in manifests\n", agentID)
-				os.Exit(1)
+				return fmt.Errorf("agent %q not found in manifests", agentID)
 			}
 
 			if len(agent.Spec.Capabilities) == 0 {

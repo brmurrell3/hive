@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // Hypervisor is the interface for VM operations. Implementations include
@@ -48,7 +48,7 @@ type VMConfig struct {
 	MemoryMB       int
 	VCPUs          int
 	CID            uint32
-	AgentDrivePath string // path to ext4 disk image for agent files (T1-02)
+	AgentDrivePath string // path to ext4 disk image for agent files
 }
 
 // MaxSocketPathLen is the maximum length (in bytes) allowed for derived Unix
@@ -212,16 +212,17 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 		confContent += fmt.Sprintf("CAPABILITIES=%s\n", string(capsJSON))
 	}
 
-	if err := os.WriteFile(sidecarConf, []byte(confContent), 0644); err != nil {
+	if err := os.WriteFile(sidecarConf, []byte(confContent), 0600); err != nil {
 		os.Remove(rootfsCopy)
 		return m.failAgent(agentState, fmt.Errorf("writing sidecar.conf for %s: %w", agentID, err))
 	}
 
-	// T1-02: Create ext4 disk image from agent directory for Firecracker drive API.
+	// Create ext4 disk image from agent directory for Firecracker drive API.
 	var agentDrivePath string
 	if _, err := os.Stat(agentDir); err == nil {
 		if err := createAgentDriveImage(agentDir, agentDriveImg); err != nil {
 			os.Remove(rootfsCopy)
+			os.Remove(agentDriveImg)
 			return m.failAgent(agentState, fmt.Errorf("creating agent drive image for %s: %w", agentID, err))
 		}
 		agentDrivePath = agentDriveImg
@@ -244,7 +245,7 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 	// Create the VM via the hypervisor.
 	vmPID, err := m.hypervisor.CreateVM(vmCfg)
 	if err != nil {
-		os.Remove(rootfsCopy) // T1-05: clean up rootfs copy on failure
+		os.Remove(rootfsCopy) // clean up rootfs copy on failure
 		return m.failAgent(agentState, fmt.Errorf("creating VM for agent %s: %w", agentID, err))
 	}
 
@@ -293,7 +294,8 @@ func (m *Manager) StartAgent(agent *types.AgentManifest) error {
 	if err := m.hypervisor.StartVM(socketPath); err != nil {
 		// Clean up the vsock forwarder if we started one.
 		m.stopForwarder(agentID)
-		os.Remove(rootfsCopy) // T1-05: clean up rootfs copy on failure
+		os.Remove(rootfsCopy)    // clean up rootfs copy on failure
+		os.Remove(agentDriveImg) // clean up agent drive image on failure
 		return m.failAgent(agentState, fmt.Errorf("starting VM for agent %s: %w", agentID, err))
 	}
 
@@ -473,7 +475,7 @@ func (m *Manager) ReconcileOnStartup() error {
 
 	agents := m.store.AllAgents()
 
-	// T1-04: Restore nextCID from existing agent CIDs to prevent reuse.
+	// Restore nextCID from existing agent CIDs to prevent reuse.
 	m.mu.Lock()
 	for _, agent := range agents {
 		if agent.VMCID >= m.nextCID {
@@ -615,7 +617,7 @@ func (m *Manager) failAgent(agentState *state.AgentState, cause error) error {
 
 // createAgentDriveImage creates an ext4 disk image from an agent's directory
 // contents. The image can be attached as a secondary Firecracker drive.
-// T1-02: Firecracker requires block device images, not directories.
+// Firecracker requires block device images, not directories.
 //
 // This implementation uses mkfs.ext4 -d to populate the filesystem directly
 // from the source directory without requiring mount/umount (which need root or

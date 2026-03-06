@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -21,7 +21,7 @@ func testManager(t *testing.T) (*Manager, *MockHypervisor, *state.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(filepath.Join(dir, "state.json"), logger)
+	store, err := state.NewStore(filepath.Join(dir, "state.db"), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestStartAgent_Success(t *testing.T) {
 	if agentState.VMCID == 0 {
 		t.Error("VMCID should be non-zero")
 	}
-	// T1-01: Verify VMPID is set after start.
+	// Verify VMPID is set after start.
 	if agentState.VMPID == 0 {
 		t.Error("VMPID should be non-zero after start")
 	}
@@ -772,7 +772,7 @@ func TestStartAgent_SocketPathTooLong(t *testing.T) {
 	// by leaving skipSocketPathValidation as false.
 	dir := t.TempDir()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	store, err := state.NewStore(filepath.Join(dir, "state.json"), logger)
+	store, err := state.NewStore(filepath.Join(dir, "state.db"), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,7 +832,7 @@ func TestStartAgent_SocketPathShortEnough(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	statePath := filepath.Join(dir, "state.json")
+	statePath := filepath.Join(dir, "state.db")
 	store, err := state.NewStore(statePath, logger)
 	if err != nil {
 		t.Fatal(err)

@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/hivehq/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -15,6 +15,7 @@ var (
 	controlPlane string
 	authUser     string
 	authToken    string
+	version      = "dev"
 )
 
 func main() {
@@ -81,7 +82,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the version of hivectl",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("hivectl v0.1.0")
+			fmt.Printf("hivectl %s\n", version)
 		},
 	}
 }
@@ -98,13 +99,11 @@ func validateCmd() *cobra.Command {
 
 			ds, err := config.LoadDesiredState(absRoot)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("loading desired state: %w", err)
 			}
 
 			if err := config.ValidateDesiredState(ds); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("validating desired state: %w", err)
 			}
 
 			fmt.Println("Validation passed.")
@@ -144,7 +143,7 @@ func scaffoldCluster(dir string) error {
 		filepath.Join(dir, "teams", "default.yaml"):                    teamTemplate,
 	}
 
-	// T4-04: Skip existing files to make init idempotent.
+	// Skip existing files to make init idempotent.
 	for path, content := range files {
 		if _, err := os.Stat(path); err == nil {
 			fmt.Printf("  skipping %s (already exists)\n", path)

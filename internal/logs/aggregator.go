@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 	_ "modernc.org/sqlite"
 )
@@ -106,6 +106,22 @@ func (a *Aggregator) Start() error {
 	if err := a.cleanRetention(); err != nil {
 		a.logger.Warn("error during retention cleanup", "error", err)
 	}
+
+	// Start periodic retention cleanup in the background.
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-a.done:
+				return
+			case <-ticker.C:
+				if err := a.cleanRetention(); err != nil {
+					a.logger.Warn("periodic retention cleanup error", "error", err)
+				}
+			}
+		}
+	}()
 
 	sub, err := a.conn.Subscribe(logSubject, a.handleMessage)
 	if err != nil {
@@ -350,10 +366,10 @@ func (a *Aggregator) Follow(agentID string) (<-chan LogEntry, func()) {
 			for i, c := range channels {
 				if c == ch {
 					a.followers[agentID] = append(channels[:i], channels[i+1:]...)
+					close(ch)
 					break
 				}
 			}
-			close(ch)
 		})
 	}
 

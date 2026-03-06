@@ -1,7 +1,7 @@
 package capability
 
 import (
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // ToolDefinition is an alias for types.ToolDefinition used in tool generation.

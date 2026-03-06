@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
@@ -152,6 +152,14 @@ func (r *Router) Invoke(targetAgentID, capability string, inputs map[string]inte
 		Payload:   req,
 	}
 
+	if err := env.Validate(); err != nil {
+		r.logger.Warn("envelope validation failed before publishing capability request",
+			"target", targetAgentID,
+			"capability", capability,
+			"error", err,
+		)
+	}
+
 	data, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling invocation request: %w", err)
@@ -227,7 +235,7 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 			"capability", capName,
 			"error", err,
 		)
-		r.publishErrorResponse(msg, capName, "INVALID_REQUEST", "failed to unmarshal request envelope", start)
+		r.publishErrorResponse(msg, "unknown", capName, "INVALID_REQUEST", "failed to unmarshal request envelope", start)
 		return
 	}
 
@@ -238,7 +246,7 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 			"capability", capName,
 			"error", err,
 		)
-		r.publishErrorResponse(msg, capName, "INVALID_PAYLOAD", "failed to process request payload", start)
+		r.publishErrorResponse(msg, env.From, capName, "INVALID_PAYLOAD", "failed to process request payload", start)
 		return
 	}
 
@@ -248,7 +256,7 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 			"capability", capName,
 			"error", err,
 		)
-		r.publishErrorResponse(msg, capName, "INVALID_PAYLOAD", "failed to unmarshal invocation request", start)
+		r.publishErrorResponse(msg, env.From, capName, "INVALID_PAYLOAD", "failed to unmarshal invocation request", start)
 		return
 	}
 
@@ -291,6 +299,13 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 		Timestamp:     time.Now().UTC(),
 		Payload:       resp,
 		CorrelationID: env.ID,
+	}
+
+	if err := respEnv.Validate(); err != nil {
+		r.logger.Warn("envelope validation failed before publishing capability response",
+			"capability", capName,
+			"error", err,
+		)
 	}
 
 	respData, err := json.Marshal(respEnv)
@@ -372,7 +387,9 @@ func (r *Router) CallLocal(capability string, inputs map[string]interface{}) *In
 }
 
 // publishErrorResponse sends an error response envelope to the reply subject.
-func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message string, start time.Time) {
+// replyTo is the identity of the original sender (used as the To field in the
+// response envelope). Pass "unknown" if the sender could not be determined.
+func (r *Router) publishErrorResponse(msg *nats.Msg, replyTo, capName, code, message string, start time.Time) {
 	if msg.Reply == "" {
 		return
 	}
@@ -391,9 +408,17 @@ func (r *Router) publishErrorResponse(msg *nats.Msg, capName, code, message stri
 	env := types.Envelope{
 		ID:        types.NewUUID(),
 		From:      r.agentID,
+		To:        replyTo,
 		Type:      types.MessageTypeCapabilityResponse,
 		Timestamp: time.Now().UTC(),
 		Payload:   resp,
+	}
+
+	if err := env.Validate(); err != nil {
+		r.logger.Warn("envelope validation failed before publishing error response",
+			"capability", capName,
+			"error", err,
+		)
 	}
 
 	data, err := json.Marshal(env)

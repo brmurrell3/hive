@@ -252,7 +252,7 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 	}
 
 	// If an agent drive image is provided, attach it as a secondary drive.
-	// T1-02: This must be a block device image (.img), not a directory.
+	// This must be a block device image (.img), not a directory.
 	if cfg.AgentDrivePath != "" {
 		if _, err := os.Stat(cfg.AgentDrivePath); err == nil {
 			agentDrive := firecrackerDrive{
@@ -547,4 +547,10 @@ func isProcessGone(err error) bool {
 func cleanupSocket(socketPath string) {
 	os.Remove(socketPath)
 	os.Remove(socketPath + ".vsock")
+	// Clean up port-specific vsock UDS files (e.g., firecracker.sock.vsock_4222)
+	// that Firecracker creates when guests connect via AF_VSOCK.
+	matches, _ := filepath.Glob(socketPath + ".vsock_*")
+	for _, m := range matches {
+		os.Remove(m)
+	}
 }

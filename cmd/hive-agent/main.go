@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hivehq/hive/internal/sidecar"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/sidecar"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )

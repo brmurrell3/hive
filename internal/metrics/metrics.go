@@ -4,10 +4,9 @@ package metrics
 
 import (
 	"net/http"
-	"sync"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -21,7 +20,6 @@ type StateReader interface {
 
 // Collector tracks Hive metrics using Prometheus client_golang. All methods are thread-safe.
 type Collector struct {
-	mu       sync.Mutex
 	registry *prometheus.Registry
 
 	agentsTotal    *prometheus.GaugeVec

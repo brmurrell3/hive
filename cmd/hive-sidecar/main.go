@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hivehq/hive/internal/sidecar"
+	"github.com/brmurrell3/hive/internal/sidecar"
 )
 
 func main() {

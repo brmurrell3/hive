@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/testutil"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/testutil"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"text/tabwriter"
 
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/state"
 	"github.com/spf13/cobra"
 )
 

@@ -9,10 +9,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 )
+
+// AgentScheduler is the interface the reconciler uses to obtain node
+// assignments for new agents.  Implementations should return the target
+// node ID for the given agent manifest, or an error if no suitable node
+// is available.
+type AgentScheduler interface {
+	Schedule(manifest *types.AgentManifest) (nodeID string, err error)
+}
 
 // ActionType describes the kind of reconciliation action to take.
 type ActionType string
@@ -39,16 +47,17 @@ type Action struct {
 // triggered by fsnotify events.
 type Reconciler struct {
 	mu            sync.Mutex
-	runMu         sync.Mutex // T2-07: serializes runOnce calls
+	runMu         sync.Mutex // serializes runOnce calls
 	store         *state.Store
 	clusterRoot   string
 	logger        *slog.Logger
 	handler       func(Action) error
+	scheduler     AgentScheduler
 	interval      time.Duration
 	stopCh        chan struct{}
 	stopped       chan struct{}
-	stopOnce      sync.Once // T3-01: prevent double-close panic
-	started       bool      // T3-02: prevent double-start
+	stopOnce      sync.Once // prevent double-close panic
+	started       bool      // prevent double-start
 	triggerCh     chan struct{}
 }
 
@@ -61,7 +70,7 @@ func NewReconciler(store *state.Store, clusterRoot string, logger *slog.Logger) 
 		interval:    5 * time.Second,
 		stopCh:      make(chan struct{}),
 		stopped:     make(chan struct{}),
-		triggerCh:   make(chan struct{}, 1), // T2-07: buffered for coalesced triggers
+		triggerCh:   make(chan struct{}, 1), // buffered for coalesced triggers
 	}
 }
 
@@ -69,6 +78,16 @@ func NewReconciler(store *state.Store, clusterRoot string, logger *slog.Logger) 
 // Must be called before Start.
 func (r *Reconciler) SetInterval(d time.Duration) {
 	r.interval = d
+}
+
+// SetScheduler configures the scheduler used to assign nodes when creating
+// new agents.  If no scheduler is set (or set to nil), agents are created
+// without a node assignment, which is the correct behavior for single-node
+// deployments.
+func (r *Reconciler) SetScheduler(s AgentScheduler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scheduler = s
 }
 
 // SetActionHandler sets the callback invoked for each reconciliation action.
@@ -82,7 +101,7 @@ func (r *Reconciler) SetActionHandler(handler func(Action) error) {
 
 // Start begins the periodic reconciliation loop. It runs in a goroutine
 // and returns immediately. Call Stop to halt it.
-// T3-02: Returns error if already started.
+// Returns error if already started.
 func (r *Reconciler) Start() error {
 	r.mu.Lock()
 	if r.started {
@@ -120,7 +139,7 @@ func (r *Reconciler) Start() error {
 }
 
 // Stop halts the reconciliation loop and waits for it to finish.
-// T3-01: Safe to call multiple times.
+// Safe to call multiple times.
 func (r *Reconciler) Stop() {
 	r.stopOnce.Do(func() {
 		close(r.stopCh)
@@ -129,7 +148,7 @@ func (r *Reconciler) Stop() {
 }
 
 // Trigger forces an immediate reconciliation pass outside the timer.
-// T2-07: Sends to a buffered channel, coalescing multiple triggers.
+// Sends to a buffered channel, coalescing multiple triggers.
 func (r *Reconciler) Trigger() {
 	select {
 	case r.triggerCh <- struct{}{}:
@@ -139,7 +158,7 @@ func (r *Reconciler) Trigger() {
 }
 
 // runOnce performs a single reconciliation pass: compute actions and
-// dispatch them to the handler. T2-07: Protected by runMu to prevent concurrent runs.
+// dispatch them to the handler. Protected by runMu to prevent concurrent runs.
 func (r *Reconciler) runOnce() {
 	r.runMu.Lock()
 	defer r.runMu.Unlock()
@@ -158,7 +177,31 @@ func (r *Reconciler) runOnce() {
 		return
 	}
 
+	r.mu.Lock()
+	sched := r.scheduler
+	r.mu.Unlock()
+
 	for _, action := range actions {
+		// For create actions, consult the scheduler to pick a target node.
+		// If no scheduler is configured (single-node mode) or the scheduler
+		// returns an error (e.g. no eligible nodes), we log and proceed
+		// without a NodeID so single-node operation is unaffected.
+		if action.Type == ActionCreate && sched != nil && action.Manifest != nil {
+			nodeID, err := sched.Schedule(action.Manifest)
+			if err != nil {
+				r.logger.Warn("scheduler could not assign node, proceeding without assignment",
+					"agent_id", action.AgentID,
+					"error", err,
+				)
+			} else if nodeID != "" {
+				action.NodeID = nodeID
+				r.logger.Info("scheduler assigned node",
+					"agent_id", action.AgentID,
+					"node_id", nodeID,
+				)
+			}
+		}
+
 		r.logger.Info("reconciler action",
 			"type", action.Type,
 			"agent_id", action.AgentID,
@@ -240,7 +283,14 @@ func (r *Reconciler) Reconcile() []Action {
 		if !exists {
 			continue
 		}
-		newHash, _ := manifestHash(manifest)
+		newHash, err := manifestHash(manifest)
+		if err != nil {
+			r.logger.Warn("reconciler: failed to hash manifest, skipping drift check",
+				"agent_id", id,
+				"error", err,
+			)
+			continue
+		}
 		if agentState.ManifestHash != "" && agentState.ManifestHash != newHash {
 			restartActions = append(restartActions, Action{
 				Type:     ActionRestart,
@@ -273,7 +323,7 @@ func sortActions(actions []Action) {
 }
 
 // manifestHash computes a stable SHA-256 hash of the manifest.
-// T2-08: Uses sorted map keys for deterministic output regardless of iteration order.
+// Uses sorted map keys for deterministic output regardless of iteration order.
 func manifestHash(manifest *types.AgentManifest) (string, error) {
 	// Create a stable representation by sorting map keys.
 	// We hash a canonical form: sort the struct's map fields.

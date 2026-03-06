@@ -1,4 +1,4 @@
-module github.com/hivehq/hive
+module github.com/brmurrell3/hive
 
 go 1.25.6
 

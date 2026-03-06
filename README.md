@@ -1,13 +1,24 @@
 # Hive
 
-Declarative framework for orchestrating LLM agent teams. Define agents in YAML, deploy to Firecracker VMs, route capabilities over NATS.
+Declarative framework for orchestrating LLM agent teams across heterogeneous hardware. Define agents in YAML, deploy to Firecracker microVMs, Raspberry Pis, or microcontrollers, and route capabilities over NATS.
 
-**Current state:** MVP complete (M1–M5). Single-node, single-team deployment with capability routing, auto-restart, and MEMORY.md hot-reload.
+## Features
+
+- **Declarative YAML manifests** for agents, teams, and clusters
+- **Three-tier execution model:** Firecracker VMs (Tier 1), native processes (Tier 2), firmware devices (Tier 3)
+- **Capability routing** over NATS with auto-generated tool definitions
+- **Health monitoring** with configurable heartbeats and auto-restart policies
+- **Multi-node clustering** with bin-packing scheduler
+- **Cross-team routing** and a director agent for organization-wide orchestration
+- **RBAC** with admin, operator, and viewer roles
+- **Firmware SDKs** for C and MicroPython with OTA updates
+- **Dashboard API** with REST and WebSocket endpoints
+- **Prometheus metrics** and log aggregation
 
 ## Requirements
 
-- Go 1.21+
-- Linux with KVM for running VMs (macOS works for building and testing with mocks)
+- Go 1.23+
+- Linux with KVM for Firecracker VMs (macOS works for building and testing with mocks)
 
 ## Quick Start
 
@@ -16,13 +27,13 @@ Declarative framework for orchestrating LLM agent teams. Define agents in YAML, 
 make build
 
 # Scaffold a cluster
-./hivectl init my-cluster
-
-# Inspect what was created
-tree my-cluster/
+./bin/hivectl init my-cluster
 
 # Validate the config
-./hivectl validate --cluster-root my-cluster
+./bin/hivectl validate --cluster-root my-cluster
+
+# Start the control plane
+./bin/hived --cluster-root my-cluster
 ```
 
 ## What's in a Cluster
@@ -32,89 +43,82 @@ my-cluster/
 ├── cluster.yaml                    # NATS config, defaults, cluster settings
 ├── agents/
 │   └── example-agent/
-│       └── manifest.yaml           # Agent definition: runtime, capabilities, resources
+│       └── manifest.yaml           # Agent: runtime, capabilities, resources
 └── teams/
-    └── default.yaml                # Team definition: lead agent, shared volumes
+    └── default.yaml                # Team: lead agent, shared config
 ```
-
-## Running hived
-
-```bash
-# Start the control plane (embeds NATS, watches for config changes)
-./hived --cluster-root my-cluster
-```
-
-hived will:
-- Parse and validate all manifests
-- Start an embedded NATS server (default port 4222)
-- Enable JetStream for message persistence
-- Watch `MEMORY.md` files for hot-reload
 
 ## Managing Agents
 
-Requires a Linux host with KVM for real VMs. Use `HIVE_TEST_FIRECRACKER=mock` for mock mode on any platform.
-
 ```bash
+# Use mock mode on macOS or without KVM
 export HIVE_TEST_FIRECRACKER=mock
 
-# Start an agent
-./hivectl agents start example-agent --cluster-root my-cluster
-
-# List agents
-./hivectl agents list --cluster-root my-cluster
-
-# Check status
-./hivectl agents status example-agent --cluster-root my-cluster
-
-# Restart (resets restart counter)
-./hivectl agents restart example-agent --cluster-root my-cluster
-
-# Stop
-./hivectl agents stop example-agent --cluster-root my-cluster
-
-# Destroy (removes all VM artifacts)
-./hivectl agents destroy example-agent --cluster-root my-cluster
+./bin/hivectl agents start example-agent --cluster-root my-cluster
+./bin/hivectl agents list --cluster-root my-cluster
+./bin/hivectl agents status example-agent --cluster-root my-cluster
+./bin/hivectl agents restart example-agent --cluster-root my-cluster
+./bin/hivectl agents stop example-agent --cluster-root my-cluster
 ```
 
 ## Tests
 
 ```bash
-# Unit tests (fast, no dependencies)
-make test-unit
-
-# Integration tests (spins up embedded NATS)
-make test-integration
-
-# Both
-make test
+make test-unit          # Fast, no dependencies
+make test-integration   # Spins up embedded NATS
+make test               # Both
 ```
-
-144 tests across 8 packages covering: config parsing, validation, NATS pub/sub, JetStream, state persistence, VM lifecycle, sidecar HTTP API, heartbeat monitoring, capability routing, tool generation, auto-restart logic, and filesystem watching.
 
 ## Project Layout
 
 ```
-cmd/hived/           Control plane daemon
-cmd/hivectl/         CLI tool
+cmd/
+  hived/           Control plane daemon
+  hivectl/         CLI tool
+  hive-agent/      Tier 2 native agent binary
 internal/
-  config/            YAML parsing + validation
-  nats/              Embedded NATS server
-  state/             state.json persistence
-  vm/                Firecracker VM lifecycle (+ mock)
-  sidecar/           Agent runtime, HTTP API, heartbeats
-  capability/        NATS capability routing + tool generation
-  health/            Heartbeat monitor + auto-restart
-  watcher/           MEMORY.md hot-reload (fsnotify)
-  types/             Shared types
-  testutil/          Test helpers
-rootfs/              Alpine rootfs build scripts
+  config/          YAML parsing + validation
+  nats/            Embedded NATS server
+  state/           State persistence (SQLite)
+  vm/              Firecracker VM lifecycle (+ mock)
+  sidecar/         Agent runtime, HTTP API, heartbeats
+  capability/      Capability routing + tool generation
+  health/          Heartbeat monitor + auto-restart
+  watcher/         MEMORY.md hot-reload (fsnotify)
+  token/           Join token generation + validation
+  node/            Node registry + discovery
+  mqtt/            MQTT-NATS bridge for firmware devices
+  firmware/        Device tracking + OTA updates
+  scheduler/       Bin-packing scheduler
+  reconciler/      Reconciliation loop
+  cluster/         Multi-node clustering
+  auth/            RBAC
+  director/        Director agent
+  metrics/         Prometheus metrics
+  logs/            Log aggregation
+  dashboard/       REST + WebSocket API
+  types/           Shared type definitions
+  testutil/        Test helpers
+docs/              Specification documents
+rootfs/            Firecracker VM rootfs build scripts
+sdk/
+  firmware-c/          C SDK for microcontrollers
+  firmware-micropython/ MicroPython SDK
 ```
 
-## Key Concepts
+## Documentation
 
-- **Agents** are defined in YAML manifests and run inside Firecracker VMs
-- **Teams** group agents; a lead agent gets auto-generated tools to invoke team members' capabilities
-- **Capabilities** are typed functions (inputs/outputs) exposed over NATS subjects
-- **Sidecar** runs inside each VM, manages the agent runtime, publishes heartbeats, serves the HTTP API at `:9100`
-- **Health** — hived monitors heartbeats; missed heartbeats trigger auto-restart per the agent's restart policy
-- **MEMORY.md** is hot-reloaded into VMs when edited on the host (no restart needed)
+- [Architecture](docs/01-ARCHITECTURE.md) — Agent tiers, node types, components
+- [Schemas](docs/02-SCHEMAS.md) — YAML manifest specification
+- [Communication](docs/03-COMMUNICATION.md) — NATS subjects, message envelope format
+- [Control Plane](docs/04-CONTROL-PLANE.md) — hived internals
+- [Execution](docs/05-EXECUTION.md) — Sidecar, runtime lifecycle, boot sequences
+- [Firmware](docs/06-FIRMWARE.md) — C and MicroPython SDKs, OTA protocol
+- [CLI Reference](docs/07-CLI-AND-INTERACTION.md) — All hivectl commands
+- [Deployment](docs/08-DEPLOYMENT.md) — NixOS modules, node joining, images
+- [Operations Guide](OPERATIONS.md) — Full end-to-end walkthrough
+- [Testing Guide](TESTING.md) — Test strategy and setup
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for details.

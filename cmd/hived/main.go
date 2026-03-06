@@ -13,32 +13,40 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hivehq/hive/internal/auth"
-	"github.com/hivehq/hive/internal/capability"
-	"github.com/hivehq/hive/internal/cluster"
-	"github.com/hivehq/hive/internal/config"
-	"github.com/hivehq/hive/internal/dashboard"
-	"github.com/hivehq/hive/internal/director"
-	"github.com/hivehq/hive/internal/health"
-	"github.com/hivehq/hive/internal/logs"
-	"github.com/hivehq/hive/internal/metrics"
-	"github.com/hivehq/hive/internal/mqtt"
-	hivenats "github.com/hivehq/hive/internal/nats"
-	"github.com/hivehq/hive/internal/node"
-	"github.com/hivehq/hive/internal/firmware"
-	"github.com/hivehq/hive/internal/production"
-	"github.com/hivehq/hive/internal/reconciler"
-	"github.com/hivehq/hive/internal/scheduler"
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
-	"github.com/hivehq/hive/internal/vm"
-	"github.com/hivehq/hive/internal/watcher"
+	"github.com/brmurrell3/hive/internal/auth"
+	"github.com/brmurrell3/hive/internal/capability"
+	"github.com/brmurrell3/hive/internal/cluster"
+	"github.com/brmurrell3/hive/internal/config"
+	"github.com/brmurrell3/hive/internal/dashboard"
+	"github.com/brmurrell3/hive/internal/director"
+	"github.com/brmurrell3/hive/internal/health"
+	"github.com/brmurrell3/hive/internal/logs"
+	"github.com/brmurrell3/hive/internal/metrics"
+	"github.com/brmurrell3/hive/internal/mqtt"
+	hivenats "github.com/brmurrell3/hive/internal/nats"
+	"github.com/brmurrell3/hive/internal/node"
+	"github.com/brmurrell3/hive/internal/firmware"
+	"github.com/brmurrell3/hive/internal/production"
+	"github.com/brmurrell3/hive/internal/reconciler"
+	"github.com/brmurrell3/hive/internal/scheduler"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/vm"
+	"github.com/brmurrell3/hive/internal/watcher"
 	"github.com/nats-io/nats.go"
 )
 
+var version = "dev"
+
 func main() {
 	clusterRoot := flag.String("cluster-root", ".", "Path to the cluster root directory")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("hived %s\n", version)
+		os.Exit(0)
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -86,7 +94,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	}
 	defer ns.Shutdown()
 
-	// T2-13: Initialize state store.
+	// Initialize state store.
 	statePath := filepath.Join(absRoot, "state.db")
 	store, err := state.NewStore(statePath, logger)
 	if err != nil {
@@ -173,7 +181,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 		hyp = fcHyp
 	}
 
-	// T2-13: Initialize VM manager.
+	// Initialize VM manager.
 	// Pass the NATS port and auth token so the manager can set up vsock
 	// forwarding for VMs and write the token into sidecar.conf.
 	natsPort := cfg.Spec.NATS.Port
@@ -185,7 +193,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 		logger.Error("startup reconciliation error", "error", err)
 	}
 
-	// T2-13: Start health monitor.
+	// Start health monitor.
 	monitor := health.NewMonitor(
 		store, nc,
 		cfg.Spec.Defaults.Health.Interval,
@@ -193,7 +201,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 		logger,
 	)
 
-	// T2-01: Connect restart manager to health monitor.
+	// Connect restart manager to health monitor.
 	restartMgr := health.NewRestartManager(store, vmMgr, logger)
 	monitor.SetRestartManager(restartMgr)
 
@@ -202,7 +210,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	}
 	defer monitor.Stop()
 
-	// T2-13: Start capability router for hived's own capabilities.
+	// Start capability router for hived's own capabilities.
 	capRouter := capability.NewRouter("hived", nc, logger)
 	if err := capRouter.Start(); err != nil {
 		return fmt.Errorf("starting capability router: %w", err)
@@ -250,7 +258,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	sched := scheduler.NewScheduler(store, logger)
 	logger.Info("scheduler initialized")
 
-	// T2-13: Start reconciler.
+	// Start reconciler.
 	rec := reconciler.NewReconciler(store, absRoot, logger)
 	rec.SetScheduler(&schedulerAdapter{s: sched})
 	rec.SetActionHandler(func(action reconciler.Action) error {

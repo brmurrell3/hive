@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
@@ -19,15 +19,15 @@ type Monitor struct {
 	logger         *slog.Logger
 	interval       time.Duration
 	maxFailures    int
-	restartManager *RestartManager // T2-01: integration with RestartManager
+	restartManager *RestartManager
 
 	mu          sync.Mutex
 	lastSeen    map[string]time.Time // agentID → last heartbeat time
 	inRestart   map[string]struct{}  // agentIDs currently being restarted
 	sub         *nats.Subscription
 	stopCh      chan struct{}
-	stopOnce    sync.Once // T3-01: prevent double-close panic
-	started     bool      // T3-02: prevent double-start
+	stopOnce    sync.Once // prevent double-close panic
+	started     bool      // prevent double-start
 }
 
 // NewMonitor creates a new health monitor.
@@ -51,13 +51,13 @@ func NewMonitor(store *state.Store, nc *nats.Conn, interval time.Duration, maxFa
 }
 
 // SetRestartManager configures the restart manager invoked when an agent becomes unhealthy.
-// T2-01: The monitor delegates to the RestartManager for policy-based restarts.
+// The monitor delegates to the RestartManager for policy-based restarts.
 func (m *Monitor) SetRestartManager(rm *RestartManager) {
 	m.restartManager = rm
 }
 
 // Start begins monitoring heartbeats.
-// T3-02: Returns error if already started.
+// Returns error if already started.
 func (m *Monitor) Start() error {
 	m.mu.Lock()
 	if m.started {
@@ -79,7 +79,7 @@ func (m *Monitor) Start() error {
 	return nil
 }
 
-// Stop stops the health monitor. Safe to call multiple times (T3-01).
+// Stop stops the health monitor. Safe to call multiple times.
 func (m *Monitor) Stop() {
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
@@ -200,7 +200,7 @@ func (m *Monitor) markUnhealthy(agentID string) {
 		m.logger.Error("failed to update agent state", "agent_id", agentID, "error", err)
 	}
 
-	// T2-01: Invoke the restart manager asynchronously so the caller's mutex
+	// Invoke the restart manager asynchronously so the caller's mutex
 	// is released immediately (backoff in HandleUnhealthy can be long).
 	if m.restartManager == nil {
 		return

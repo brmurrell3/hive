@@ -7,13 +7,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
 )
 
 // connectNATS establishes a connection to the NATS server at the configured URL.
 // It retries with exponential backoff to handle boot race conditions where
-// the sidecar starts before hived's NATS server is ready (T1-06).
+// the sidecar starts before hived's NATS server is ready.
 func (s *Sidecar) connectNATS() error {
 	opts := []nats.Option{
 		nats.Name(fmt.Sprintf("sidecar-%s", s.agentID)),
@@ -35,7 +35,7 @@ func (s *Sidecar) connectNATS() error {
 		opts = append(opts, nats.Token(s.config.NATSToken))
 	}
 
-	// T1-06: Retry with exponential backoff for up to 60s.
+	// Retry with exponential backoff for up to 60s.
 	maxRetryDuration := 60 * time.Second
 	backoff := 1 * time.Second
 	maxBackoff := 30 * time.Second
@@ -77,7 +77,8 @@ func (s *Sidecar) connectNATS() error {
 func (s *Sidecar) subscribeControl() error {
 	subject := fmt.Sprintf("hive.control.%s", s.agentID)
 
-	_, err := s.natsConn.Subscribe(subject, func(msg *nats.Msg) {
+	var err error
+	s.controlSub, err = s.natsConn.Subscribe(subject, func(msg *nats.Msg) {
 		s.logger.Info("received control message",
 			"subject", msg.Subject,
 			"size", len(msg.Data),
@@ -209,7 +210,8 @@ func (s *Sidecar) publishHeartbeat(subject string) {
 func (s *Sidecar) subscribeMemoryUpdates() error {
 	subject := fmt.Sprintf("hive.agent.%s.memory", s.agentID)
 
-	_, err := s.natsConn.Subscribe(subject, func(msg *nats.Msg) {
+	var err error
+	s.memorySub, err = s.natsConn.Subscribe(subject, func(msg *nats.Msg) {
 		s.logger.Debug("received memory update",
 			"subject", msg.Subject,
 			"size", len(msg.Data),

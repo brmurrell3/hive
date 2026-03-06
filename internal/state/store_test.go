@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -62,20 +62,22 @@ func TestValidateTransition(t *testing.T) {
 		{"STOPPING -> STOPPED", AgentStatusStopping, AgentStatusStopped, false},
 		{"STOPPING -> FAILED", AgentStatusStopping, AgentStatusFailed, false},
 		{"STOPPED -> CREATING (restart)", AgentStatusStopped, AgentStatusCreating, false},
+		{"STOPPED -> PENDING (restart reset)", AgentStatusStopped, AgentStatusPending, false},
 		{"FAILED -> CREATING (manual restart)", AgentStatusFailed, AgentStatusCreating, false},
+		{"FAILED -> STOPPED (restart reset)", AgentStatusFailed, AgentStatusStopped, false},
+		{"FAILED -> PENDING (restart reset)", AgentStatusFailed, AgentStatusPending, false},
+		{"PENDING -> FAILED (early validation)", AgentStatusPending, AgentStatusFailed, false},
 
 		// Invalid transitions.
 		{"PENDING -> RUNNING (skip)", AgentStatusPending, AgentStatusRunning, true},
 		{"PENDING -> STARTING (skip)", AgentStatusPending, AgentStatusStarting, true},
 		{"PENDING -> STOPPED", AgentStatusPending, AgentStatusStopped, true},
-		{"PENDING -> FAILED", AgentStatusPending, AgentStatusFailed, true},
 		{"RUNNING -> CREATING (no direct restart)", AgentStatusRunning, AgentStatusCreating, true},
 		{"RUNNING -> STOPPED (skip STOPPING)", AgentStatusRunning, AgentStatusStopped, true},
 		{"RUNNING -> STARTING (backwards)", AgentStatusRunning, AgentStatusStarting, true},
 		{"STOPPED -> RUNNING (skip)", AgentStatusStopped, AgentStatusRunning, true},
 		{"STOPPED -> STARTING (skip)", AgentStatusStopped, AgentStatusStarting, true},
 		{"FAILED -> RUNNING (skip)", AgentStatusFailed, AgentStatusRunning, true},
-		{"FAILED -> STOPPED", AgentStatusFailed, AgentStatusStopped, true},
 		{"CREATING -> RUNNING (skip)", AgentStatusCreating, AgentStatusRunning, true},
 		{"STOPPING -> CREATING", AgentStatusStopping, AgentStatusCreating, true},
 	}
@@ -492,8 +494,8 @@ func TestSetAgent_OverwritesExisting(t *testing.T) {
 		t.Fatalf("SetAgent (1): %v", err)
 	}
 
-	// Overwrite with updated fields.
-	updated := testAgentState("overwrite", "team-b", AgentStatusRunning)
+	// Overwrite with updated fields using a valid transition (PENDING -> CREATING).
+	updated := testAgentState("overwrite", "team-b", AgentStatusCreating)
 	updated.VMPID = 777
 	if err := store.SetAgent(updated); err != nil {
 		t.Fatalf("SetAgent (2): %v", err)
@@ -506,8 +508,8 @@ func TestSetAgent_OverwritesExisting(t *testing.T) {
 	if got.Team != "team-b" {
 		t.Errorf("Team = %q, want %q", got.Team, "team-b")
 	}
-	if got.Status != AgentStatusRunning {
-		t.Errorf("Status = %q, want %q", got.Status, AgentStatusRunning)
+	if got.Status != AgentStatusCreating {
+		t.Errorf("Status = %q, want %q", got.Status, AgentStatusCreating)
 	}
 	if got.VMPID != 777 {
 		t.Errorf("VMPID = %d, want 777", got.VMPID)
@@ -517,6 +519,71 @@ func TestSetAgent_OverwritesExisting(t *testing.T) {
 	all := store.AllAgents()
 	if len(all) != 1 {
 		t.Errorf("AllAgents returned %d, want 1", len(all))
+	}
+}
+
+func TestSetAgent_RejectsInvalidTransition(t *testing.T) {
+	store, _ := testStore(t)
+
+	// Insert agent in PENDING status.
+	agent := testAgentState("bad-transition", "team-a", AgentStatusPending)
+	if err := store.SetAgent(agent); err != nil {
+		t.Fatalf("SetAgent (initial): %v", err)
+	}
+
+	// Attempt invalid transition: PENDING -> RUNNING (skips CREATING, STARTING).
+	updated := testAgentState("bad-transition", "team-a", AgentStatusRunning)
+	if err := store.SetAgent(updated); err == nil {
+		t.Fatal("expected error for invalid transition PENDING -> RUNNING, got nil")
+	}
+
+	// Verify the original status is unchanged.
+	got := store.GetAgent("bad-transition")
+	if got.Status != AgentStatusPending {
+		t.Errorf("Status = %q after rejected transition, want %q", got.Status, AgentStatusPending)
+	}
+}
+
+func TestSetAgent_AllowsSameStatus(t *testing.T) {
+	store, _ := testStore(t)
+
+	// Insert agent in RUNNING status.
+	agent := testAgentState("same-status", "team-a", AgentStatusRunning)
+	agent.RestartCount = 0
+	if err := store.SetAgent(agent); err != nil {
+		t.Fatalf("SetAgent (initial): %v", err)
+	}
+
+	// Update fields without changing status - should succeed.
+	updated := testAgentState("same-status", "team-a", AgentStatusRunning)
+	updated.RestartCount = 5
+	if err := store.SetAgent(updated); err != nil {
+		t.Fatalf("SetAgent (same status): %v", err)
+	}
+
+	got := store.GetAgent("same-status")
+	if got.RestartCount != 5 {
+		t.Errorf("RestartCount = %d, want 5", got.RestartCount)
+	}
+}
+
+func TestSetAgent_AllowsAnyInitialStatus(t *testing.T) {
+	store, _ := testStore(t)
+
+	// New agents should be accepted with any initial status.
+	statuses := []AgentStatus{
+		AgentStatusPending,
+		AgentStatusRunning,
+		AgentStatusStopped,
+		AgentStatusFailed,
+		AgentStatusCreating,
+	}
+	for i, status := range statuses {
+		id := fmt.Sprintf("new-agent-%d", i)
+		agent := testAgentState(id, "team-a", status)
+		if err := store.SetAgent(agent); err != nil {
+			t.Errorf("SetAgent(%s, %s): unexpected error: %v", id, status, err)
+		}
 	}
 }
 

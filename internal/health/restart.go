@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // VMManager is the interface required for restarting agent VMs.

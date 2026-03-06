@@ -9,7 +9,7 @@ import (
 // processExists checks whether a process with the given PID is alive by
 // sending signal 0 (which checks for process existence without actually
 // delivering a signal).
-// T1-11: Returns true on EPERM (process exists but belongs to another user).
+// Returns true on EPERM (process exists but belongs to another user).
 func processExists(pid int) bool {
 	proc, err := os.FindProcess(pid)
 	if err != nil {

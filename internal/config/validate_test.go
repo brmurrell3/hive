@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hivehq/hive/internal/types"
+	"github.com/brmurrell3/hive/internal/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -290,7 +290,7 @@ spec:
 		}
 	}
 
-	// T2-12: Duplicate agent IDs should now return an error.
+	// Duplicate agent IDs should now return an error.
 	agents, err := LoadAgents(dir)
 	if err == nil {
 		t.Fatalf("expected error for duplicate agent IDs, got %d agents", len(agents))

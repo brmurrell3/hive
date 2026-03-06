@@ -10,7 +10,7 @@ rootfs/rootfs.ext4
 rootfs/hive-sidecar
 
 # State
-state.json
+state.db
 .state/
 
 # OS
@@ -20,3 +20,16 @@ state.json
 .idea/
 .vscode/
 *.swp
+
+# Environment
+.env
+.env.*
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+
+# Local validation (not shipped)
+VALIDATE.sh

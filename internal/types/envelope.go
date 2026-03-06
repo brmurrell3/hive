@@ -39,6 +39,7 @@ type Envelope struct {
 	Payload       interface{} `json:"payload"`
 	ReplyTo       string      `json:"reply_to,omitempty"`
 	CorrelationID string      `json:"correlation_id,omitempty"`
+	UserToken     string      `json:"user_token,omitempty"`
 }
 
 // MessageType defines the type of a Hive message.
@@ -74,13 +75,16 @@ var ValidMessageTypes = map[MessageType]bool{
 }
 
 // Validate checks that the envelope has the required fields populated:
-// ID, From, Type must be non-empty, and Timestamp must be non-zero.
+// ID, From, To, Type must be non-empty, and Timestamp must be non-zero.
 func (e *Envelope) Validate() error {
 	if e.ID == "" {
 		return fmt.Errorf("envelope validation: ID is required")
 	}
 	if e.From == "" {
 		return fmt.Errorf("envelope validation: From is required")
+	}
+	if e.To == "" {
+		return fmt.Errorf("envelope validation: To is required")
 	}
 	if e.Type == "" {
 		return fmt.Errorf("envelope validation: Type is required")

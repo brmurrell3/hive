@@ -168,14 +168,32 @@ in
         . /agent/sidecar.conf
       fi
 
-      exec /opt/hive/sidecar \
+      EXTRA_ARGS=""
+
+      if [ -n "''${RUNTIME_CMD:-}" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --runtime-cmd ''${RUNTIME_CMD}"
+      fi
+
+      if [ -n "''${RUNTIME_ARGS:-}" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --runtime-args ''${RUNTIME_ARGS}"
+      fi
+
+      if [ -n "''${CAPABILITIES:-}" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --capabilities '''''${CAPABILITIES}'"
+      fi
+
+      if [ -n "''${NATS_TOKEN:-}" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --nats-token ''${NATS_TOKEN}"
+      fi
+
+      eval exec /opt/hive/sidecar \
         --agent-id "$AGENT_ID" \
         --team-id "$TEAM_ID" \
         --nats-url "$NATS_URL" \
-        --nats-token "$NATS_TOKEN" \
         --workspace /agent \
         --vsock \
-        --vsock-port "$VSOCK_PORT"
+        --vsock-port "$VSOCK_PORT" \
+        $EXTRA_ARGS
     '';
 
     serviceConfig = {

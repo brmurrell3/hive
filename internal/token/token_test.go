@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hivehq/hive/internal/state"
+	"github.com/brmurrell3/hive/internal/state"
 )
 
 // ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ import (
 func testStore(t *testing.T) *state.Store {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
+	path := filepath.Join(dir, "state.db")
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	store, err := state.NewStore(path, logger)
 	if err != nil {
