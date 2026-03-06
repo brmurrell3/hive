@@ -111,18 +111,18 @@ type rawClusterConfig struct {
 }
 
 type rawClusterSpec struct {
-	NATS          rawNATSConfig            `yaml:"nats"`
-	Defaults      rawDefaultsConfig        `yaml:"defaults"`
-	MQTT          types.MQTTConfig         `yaml:"mqtt"`
-	Dashboard     types.DashboardConfig    `yaml:"dashboard"`
-	Metrics       types.MetricsConfig      `yaml:"metrics"`
-	Logging       types.LoggingConfig      `yaml:"logging"`
-	Secrets       map[string]string        `yaml:"secrets"`
-	Models        []types.ModelConfig      `yaml:"models"`
-	Nodes         types.NodeConfig         `yaml:"nodes"`
-	VM            types.VMConfig           `yaml:"vm"`
-	Director      types.DirectorConfig     `yaml:"director"`
-	Users         []types.UserConfig       `yaml:"users"`
+	NATS          rawNATSConfig             `yaml:"nats"`
+	Defaults      rawDefaultsConfig         `yaml:"defaults"`
+	MQTT          types.MQTTConfig          `yaml:"mqtt"`
+	Dashboard     types.DashboardConfig     `yaml:"dashboard"`
+	Metrics       types.MetricsConfig       `yaml:"metrics"`
+	Logging       types.LoggingConfig       `yaml:"logging"`
+	Secrets       map[string]string         `yaml:"secrets"`
+	Models        []types.ModelConfig       `yaml:"models"`
+	Nodes         types.NodeConfig          `yaml:"nodes"`
+	VM            types.VMConfig            `yaml:"vm"`
+	Director      types.DirectorConfig      `yaml:"director"`
+	Users         []types.UserConfig        `yaml:"users"`
 	Communication types.CommunicationConfig `yaml:"communication"`
 }
 

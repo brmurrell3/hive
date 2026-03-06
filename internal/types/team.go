@@ -26,11 +26,11 @@ type TeamResources struct {
 }
 
 type TeamCommunication struct {
-	Namespace              string      `yaml:"namespace,omitempty" json:"namespace,omitempty"`
-	Persistent             bool        `yaml:"persistent,omitempty" json:"persistent,omitempty"`
-	HistoryDepth           int         `yaml:"historyDepth,omitempty" json:"historyDepth,omitempty"`
-	CrossTeamCapabilities  interface{} `yaml:"crossTeamCapabilities,omitempty" json:"crossTeamCapabilities,omitempty"`
-	AllowedCallers         []string    `yaml:"allowedCallers,omitempty" json:"allowedCallers,omitempty"`
+	Namespace             string      `yaml:"namespace,omitempty" json:"namespace,omitempty"`
+	Persistent            bool        `yaml:"persistent,omitempty" json:"persistent,omitempty"`
+	HistoryDepth          int         `yaml:"historyDepth,omitempty" json:"historyDepth,omitempty"`
+	CrossTeamCapabilities interface{} `yaml:"crossTeamCapabilities,omitempty" json:"crossTeamCapabilities,omitempty"`
+	AllowedCallers        []string    `yaml:"allowedCallers,omitempty" json:"allowedCallers,omitempty"`
 }
 
 type SharedVolume struct {

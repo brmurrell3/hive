@@ -28,9 +28,9 @@ func testLogger() *slog.Logger {
 // IsRunning() returns true after Start on the runtime.
 func newTestSidecar(caps []Capability) *Sidecar {
 	cfg := Config{
-		AgentID:  "test-agent",
-		TeamID:   "test-team",
-		HTTPAddr: ":0",
+		AgentID:      "test-agent",
+		TeamID:       "test-team",
+		HTTPAddr:     ":0",
 		Capabilities: caps,
 	}
 

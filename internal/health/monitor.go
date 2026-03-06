@@ -21,13 +21,13 @@ type Monitor struct {
 	maxFailures    int
 	restartManager *RestartManager
 
-	mu          sync.Mutex
-	lastSeen    map[string]time.Time // agentID → last heartbeat time
-	inRestart   map[string]struct{}  // agentIDs currently being restarted
-	sub         *nats.Subscription
-	stopCh      chan struct{}
-	stopOnce    sync.Once // prevent double-close panic
-	started     bool      // prevent double-start
+	mu        sync.Mutex
+	lastSeen  map[string]time.Time // agentID → last heartbeat time
+	inRestart map[string]struct{}  // agentIDs currently being restarted
+	sub       *nats.Subscription
+	stopCh    chan struct{}
+	stopOnce  sync.Once // prevent double-close panic
+	started   bool      // prevent double-start
 }
 
 // NewMonitor creates a new health monitor.

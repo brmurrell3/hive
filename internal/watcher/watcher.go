@@ -44,7 +44,7 @@ func NewWatcher(clusterRoot string, onChange func(agentID string, content []byte
 		clusterRoot: clusterRoot,
 		fsWatcher:   fsw,
 		logger:      logger.With("component", "memory-watcher"),
-		onChange:     onChange,
+		onChange:    onChange,
 		stopCh:      make(chan struct{}),
 		debounce:    make(map[string]*time.Timer),
 	}, nil

@@ -434,4 +434,3 @@ func (r *Router) publishErrorResponse(msg *nats.Msg, replyTo, capName, code, mes
 		)
 	}
 }
-

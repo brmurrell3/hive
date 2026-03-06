@@ -60,16 +60,16 @@ const MaxSocketPathLen = 104
 // Hypervisor interface, the state.Store for persistence, and the filesystem
 // for rootfs copies and socket files.
 type Manager struct {
-	clusterRoot            string
-	natsPort               uint32 // Port of the local NATS server (for vsock forwarding)
-	natsToken              string // Auth token for the NATS server (passed to sidecar via sidecar.conf)
-	store                  *state.Store
-	logger                 *slog.Logger
-	hypervisor             Hypervisor
-	nextCID                uint32
-	forwarders             map[string]*VsockForwarder // agentID -> VsockForwarder
-	skipSocketPathValidation bool // set to true in tests with mock hypervisors
-	mu                     sync.Mutex
+	clusterRoot              string
+	natsPort                 uint32 // Port of the local NATS server (for vsock forwarding)
+	natsToken                string // Auth token for the NATS server (passed to sidecar via sidecar.conf)
+	store                    *state.Store
+	logger                   *slog.Logger
+	hypervisor               Hypervisor
+	nextCID                  uint32
+	forwarders               map[string]*VsockForwarder // agentID -> VsockForwarder
+	skipSocketPathValidation bool                       // set to true in tests with mock hypervisors
+	mu                       sync.Mutex
 }
 
 // NewManager creates a new VM manager. natsPort is the port of the local NATS

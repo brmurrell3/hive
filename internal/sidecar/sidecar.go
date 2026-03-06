@@ -111,11 +111,11 @@ type Config struct {
 
 // Capability describes a single capability that an agent exposes to the cluster.
 type Capability struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
 	Inputs      []CapabilityParam `json:"inputs,omitempty"`
 	Outputs     []CapabilityParam `json:"outputs,omitempty"`
-	Async       bool             `json:"async,omitempty"`
+	Async       bool              `json:"async,omitempty"`
 }
 
 // CapabilityParam describes an input or output parameter for a capability.

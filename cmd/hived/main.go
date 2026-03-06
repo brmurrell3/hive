@@ -19,13 +19,13 @@ import (
 	"github.com/brmurrell3/hive/internal/config"
 	"github.com/brmurrell3/hive/internal/dashboard"
 	"github.com/brmurrell3/hive/internal/director"
+	"github.com/brmurrell3/hive/internal/firmware"
 	"github.com/brmurrell3/hive/internal/health"
 	"github.com/brmurrell3/hive/internal/logs"
 	"github.com/brmurrell3/hive/internal/metrics"
 	"github.com/brmurrell3/hive/internal/mqtt"
 	hivenats "github.com/brmurrell3/hive/internal/nats"
 	"github.com/brmurrell3/hive/internal/node"
-	"github.com/brmurrell3/hive/internal/firmware"
 	"github.com/brmurrell3/hive/internal/production"
 	"github.com/brmurrell3/hive/internal/reconciler"
 	"github.com/brmurrell3/hive/internal/scheduler"
@@ -510,9 +510,9 @@ type ctlRequest struct {
 
 // ctlResponse is the payload returned from hived to hivectl.
 type ctlResponse struct {
-	Success bool              `json:"success"`
-	Error   string            `json:"error,omitempty"`
-	Agent   *state.AgentState `json:"agent,omitempty"`
+	Success bool                `json:"success"`
+	Error   string              `json:"error,omitempty"`
+	Agent   *state.AgentState   `json:"agent,omitempty"`
 	Agents  []*state.AgentState `json:"agents,omitempty"`
 }
 

@@ -37,7 +37,7 @@ type FirecrackerHypervisor struct {
 type firecrackerProcess struct {
 	cmd     *exec.Cmd
 	done    chan struct{} // closed by the background reaper goroutine
-	logFile *os.File     // per-VM log file for stdout/stderr; closed on stop/destroy
+	logFile *os.File      // per-VM log file for stdout/stderr; closed on stop/destroy
 }
 
 // NewFirecrackerHypervisor creates a new FirecrackerHypervisor.

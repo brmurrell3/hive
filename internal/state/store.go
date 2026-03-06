@@ -63,11 +63,11 @@ type AgentState struct {
 
 // State is the top-level runtime state (kept in-memory, persisted to SQLite).
 type State struct {
-	Agents       map[string]*AgentState        `json:"agents"`
-	Nodes        map[string]*types.NodeState   `json:"nodes,omitempty"`
-	Tokens       []*types.Token                `json:"tokens,omitempty"`
-	Capabilities *types.CapabilityRegistry     `json:"capabilities,omitempty"`
-	Users        []*auth.User                  `json:"users,omitempty"`
+	Agents       map[string]*AgentState      `json:"agents"`
+	Nodes        map[string]*types.NodeState `json:"nodes,omitempty"`
+	Tokens       []*types.Token              `json:"tokens,omitempty"`
+	Capabilities *types.CapabilityRegistry   `json:"capabilities,omitempty"`
+	Users        []*auth.User                `json:"users,omitempty"`
 }
 
 func newState() *State {

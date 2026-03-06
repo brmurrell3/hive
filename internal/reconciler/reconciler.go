@@ -46,19 +46,19 @@ type Action struct {
 // It runs a periodic polling loop (every 5 seconds) and can also be
 // triggered by fsnotify events.
 type Reconciler struct {
-	mu            sync.Mutex
-	runMu         sync.Mutex // serializes runOnce calls
-	store         *state.Store
-	clusterRoot   string
-	logger        *slog.Logger
-	handler       func(Action) error
-	scheduler     AgentScheduler
-	interval      time.Duration
-	stopCh        chan struct{}
-	stopped       chan struct{}
-	stopOnce      sync.Once // prevent double-close panic
-	started       bool      // prevent double-start
-	triggerCh     chan struct{}
+	mu          sync.Mutex
+	runMu       sync.Mutex // serializes runOnce calls
+	store       *state.Store
+	clusterRoot string
+	logger      *slog.Logger
+	handler     func(Action) error
+	scheduler   AgentScheduler
+	interval    time.Duration
+	stopCh      chan struct{}
+	stopped     chan struct{}
+	stopOnce    sync.Once // prevent double-close panic
+	started     bool      // prevent double-start
+	triggerCh   chan struct{}
 }
 
 // NewReconciler creates a new Reconciler.

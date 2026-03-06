@@ -585,10 +585,10 @@ func (d *Director) handleTeamStatus(msg *nats.Msg) {
 	}
 
 	d.respondJSON(msg, map[string]interface{}{
-		"team_id":      req.TeamID,
-		"agent_count":  len(teamAgents),
-		"running":      running,
-		"agents":       teamAgents,
+		"team_id":     req.TeamID,
+		"agent_count": len(teamAgents),
+		"running":     running,
+		"agents":      teamAgents,
 	})
 }
 
@@ -786,4 +786,3 @@ func (d *Director) respondError(msg *nats.Msg, code, message string) {
 		d.logger.Error("failed to publish error response", "reply", msg.Reply, "error", err)
 	}
 }
-

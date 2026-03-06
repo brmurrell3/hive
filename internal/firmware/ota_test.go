@@ -139,11 +139,11 @@ func TestGenerateManifest(t *testing.T) {
 	t.Helper()
 
 	tests := []struct {
-		name        string
-		dataLen     int
-		version     string
-		chunkSize   int
-		wantChunks  int
+		name       string
+		dataLen    int
+		version    string
+		chunkSize  int
+		wantChunks int
 	}{
 		{"standard", 10000, "1.0.0", DefaultChunkSize, 3},
 		{"exact", 8192, "2.0.0", DefaultChunkSize, 2},

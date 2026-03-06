@@ -27,7 +27,7 @@ import (
 // VsockForwarder listens on the Firecracker-generated UDS path and proxies
 // each accepted connection to the local NATS server (or any TCP endpoint).
 type VsockForwarder struct {
-	udsPath   string // UDS path to listen on (e.g., "/path/to/firecracker.sock.vsock_4222")
+	udsPath    string // UDS path to listen on (e.g., "/path/to/firecracker.sock.vsock_4222")
 	targetAddr string // TCP address to forward to (e.g., "127.0.0.1:4222")
 
 	listener net.Listener

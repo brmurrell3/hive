@@ -242,8 +242,8 @@ func (cr *CrashRecovery) Reconcile() error {
 
 // RateLimiterConfig configures the per-subject rate limiter.
 type RateLimiterConfig struct {
-	DefaultRate int          // messages per second per subject
-	BurstSize   int          // burst allowance
+	DefaultRate int // messages per second per subject
+	BurstSize   int // burst allowance
 	Logger      *slog.Logger
 }
 

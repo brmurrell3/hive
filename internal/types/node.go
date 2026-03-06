@@ -17,10 +17,10 @@ const (
 type NodeTier int
 
 const (
-	NodeTierUnknown  NodeTier = 0
-	NodeTier1        NodeTier = 1
-	NodeTier2        NodeTier = 2
-	NodeTier3        NodeTier = 3
+	NodeTierUnknown NodeTier = 0
+	NodeTier1       NodeTier = 1
+	NodeTier2       NodeTier = 2
+	NodeTier3       NodeTier = 3
 )
 
 // NodeState holds the runtime state for a registered node.

@@ -28,10 +28,10 @@ type Bridge struct {
 	natsSubs []*nats.Subscription
 
 	// Track connected agent IDs (populated by the hook).
-	clients   map[string]string // clientID -> agentID
-	clientMu  sync.RWMutex
+	clients  map[string]string // clientID -> agentID
+	clientMu sync.RWMutex
 	// Track per-client NATS subscriptions for cleanup.
-	clientSubs   map[string][]*nats.Subscription // clientID -> NATS subs
+	clientSubs map[string][]*nats.Subscription // clientID -> NATS subs
 }
 
 // Config holds MQTT bridge configuration.

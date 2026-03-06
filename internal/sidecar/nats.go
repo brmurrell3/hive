@@ -306,4 +306,3 @@ func (s *Sidecar) closeNATS() {
 
 	s.logger.Info("NATS connection closed")
 }
-

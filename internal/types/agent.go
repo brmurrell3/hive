@@ -17,18 +17,18 @@ type AgentMetadata struct {
 }
 
 type AgentSpec struct {
-	Tier         string              `yaml:"tier,omitempty" json:"tier,omitempty"`
-	Mode         string              `yaml:"mode,omitempty" json:"mode,omitempty"`
-	Resources    AgentResources      `yaml:"resources,omitempty" json:"resources,omitempty"`
-	Runtime      AgentRuntime        `yaml:"runtime" json:"runtime"`
-	Capabilities []AgentCapability   `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
-	Network      AgentNetwork        `yaml:"network,omitempty" json:"network,omitempty"`
-	Volumes      []AgentVolume       `yaml:"volumes,omitempty" json:"volumes,omitempty"`
-	Health       AgentHealth         `yaml:"health,omitempty" json:"health,omitempty"`
-	Restart      AgentRestart        `yaml:"restart,omitempty" json:"restart,omitempty"`
-	Placement    AgentPlacement      `yaml:"placement,omitempty" json:"placement,omitempty"`
-	Firmware     AgentFirmware       `yaml:"firmware,omitempty" json:"firmware,omitempty"`
-	Hardware     AgentHardware       `yaml:"hardware,omitempty" json:"hardware,omitempty"`
+	Tier         string            `yaml:"tier,omitempty" json:"tier,omitempty"`
+	Mode         string            `yaml:"mode,omitempty" json:"mode,omitempty"`
+	Resources    AgentResources    `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Runtime      AgentRuntime      `yaml:"runtime" json:"runtime"`
+	Capabilities []AgentCapability `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	Network      AgentNetwork      `yaml:"network,omitempty" json:"network,omitempty"`
+	Volumes      []AgentVolume     `yaml:"volumes,omitempty" json:"volumes,omitempty"`
+	Health       AgentHealth       `yaml:"health,omitempty" json:"health,omitempty"`
+	Restart      AgentRestart      `yaml:"restart,omitempty" json:"restart,omitempty"`
+	Placement    AgentPlacement    `yaml:"placement,omitempty" json:"placement,omitempty"`
+	Firmware     AgentFirmware     `yaml:"firmware,omitempty" json:"firmware,omitempty"`
+	Hardware     AgentHardware     `yaml:"hardware,omitempty" json:"hardware,omitempty"`
 }
 
 type AgentResources struct {
@@ -49,11 +49,11 @@ type AgentModel struct {
 }
 
 type AgentCapability struct {
-	Name        string           `yaml:"name" json:"name"`
-	Description string           `yaml:"description" json:"description"`
+	Name        string            `yaml:"name" json:"name"`
+	Description string            `yaml:"description" json:"description"`
 	Inputs      []CapabilityParam `yaml:"inputs,omitempty" json:"inputs,omitempty"`
 	Outputs     []CapabilityParam `yaml:"outputs,omitempty" json:"outputs,omitempty"`
-	Async       bool             `yaml:"async,omitempty" json:"async,omitempty"`
+	Async       bool              `yaml:"async,omitempty" json:"async,omitempty"`
 }
 
 type CapabilityParam struct {

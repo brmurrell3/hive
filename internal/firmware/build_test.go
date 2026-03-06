@@ -15,10 +15,10 @@ func TestBuild_MissingSourceDir(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	_, err := Build(BuildConfig{
-		AgentID:     "test-agent",
-		Platform:    PlatformBareMetal,
-		SourceDir:   "/nonexistent/path",
-		Logger:      logger,
+		AgentID:   "test-agent",
+		Platform:  PlatformBareMetal,
+		SourceDir: "/nonexistent/path",
+		Logger:    logger,
 	})
 
 	if err == nil {

@@ -437,7 +437,7 @@ func TestValidateDesiredState_TeamLeadReferencesExistingAgent(t *testing.T) {
 
 func TestValidateDesiredState_TeamLeadWrongTeam(t *testing.T) {
 	agent := validAgent("worker", "other-team") // belongs to "other-team"
-	team := validTeam("alpha", "worker")         // alpha says lead is "worker"
+	team := validTeam("alpha", "worker")        // alpha says lead is "worker"
 
 	ds := mustDS(t, nil,
 		map[string]*types.AgentManifest{"worker": agent},

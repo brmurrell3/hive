@@ -138,7 +138,7 @@ func scaffoldCluster(dir string) error {
 	}
 
 	files := map[string]string{
-		filepath.Join(dir, "cluster.yaml"): clusterTemplate,
+		filepath.Join(dir, "cluster.yaml"):                             clusterTemplate,
 		filepath.Join(dir, "agents", "example-agent", "manifest.yaml"): agentTemplate,
 		filepath.Join(dir, "teams", "default.yaml"):                    teamTemplate,
 	}

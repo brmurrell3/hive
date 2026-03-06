@@ -19,7 +19,7 @@ type VMManager interface {
 
 // RestartConfig defines the restart policy for a single agent.
 type RestartConfig struct {
-	Policy      string                // "always", "on-failure", "never"
+	Policy      string // "always", "on-failure", "never"
 	MaxRestarts int
 	Backoff     time.Duration
 	Manifest    *types.AgentManifest

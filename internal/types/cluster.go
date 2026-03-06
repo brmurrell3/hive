@@ -128,7 +128,7 @@ type NATSConfig struct {
 	ClusterPort  int             `yaml:"clusterPort" json:"clusterPort"`
 	JetStream    JetStreamConfig `yaml:"jetstream" json:"jetstream"`
 	Mode         string          `yaml:"mode,omitempty" json:"mode,omitempty"`                 // "embedded" or "external"
-	URLs         []string        `yaml:"urls,omitempty" json:"urls,omitempty"`                  // external NATS URLs
+	URLs         []string        `yaml:"urls,omitempty" json:"urls,omitempty"`                 // external NATS URLs
 	ClusterPeers []string        `yaml:"clusterPeers,omitempty" json:"clusterPeers,omitempty"` // for NATS clustering
 	// AuthToken is the NATS authentication token. If empty, a random token is
 	// generated at startup and written to .state/nats-auth-token for clients.
