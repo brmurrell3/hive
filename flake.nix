@@ -22,11 +22,9 @@
           inherit version;
           src = self;
 
-          # TODO: replace with actual hash after first successful build:
-          #   nix build .#hived 2>&1 | grep 'got:'
-          vendorHash = null;
+          vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
-          CGO_ENABLED = 0;
+          env.CGO_ENABLED = 0;
           ldflags = [ "-s" "-w" "-X main.version=${version}" ];
 
           subPackages = [ "cmd/${name}" ];
