@@ -19,6 +19,7 @@ import (
 const (
 	apiVersionV1     = "hive/v1"
 	restartOnFailure = "on-failure"
+	backendProcess   = "process"
 )
 
 // ValidationError collects multiple validation errors.
@@ -390,6 +391,17 @@ func ValidateDesiredState(ds *types.DesiredState) error {
 func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, teams map[string]*types.TeamManifest, cluster *types.ClusterConfig) {
 	prefix := fmt.Sprintf("agent %q", id)
 
+	validateAgentMetadata(ve, prefix, agent, teams)
+	validateAgentRuntime(ve, prefix, agent, cluster)
+	validateAgentResources(ve, prefix, agent)
+	validateAgentNetwork(ve, prefix, agent)
+	validateAgentMounts(ve, prefix, agent, teams, cluster)
+	validateAgentCapabilities(ve, prefix, id, agent)
+}
+
+// validateAgentMetadata validates agent apiVersion, kind, metadata.id, metadata.team,
+// and label maps.
+func validateAgentMetadata(ve *ValidationError, prefix string, agent *types.AgentManifest, teams map[string]*types.TeamManifest) {
 	// Validate apiVersion and kind
 	if agent.APIVersion != apiVersionV1 {
 		ve.addf("%s: apiVersion must be \"hive/v1\", got %q", prefix, agent.APIVersion)
@@ -414,9 +426,18 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Validate map fields for safe keys and values (no control chars, no NATS wildcards).
+	validateMapLabels(ve, prefix, "metadata.labels", agent.Metadata.Labels)
+	validateMapLabels(ve, prefix, "spec.hardware.custom", agent.Spec.Hardware.Custom)
+	validateMapLabels(ve, prefix, "spec.placement.nodeLabels", agent.Spec.Placement.NodeLabels)
+}
+
+// validateAgentRuntime validates runtime type, backend, command, image, tier,
+// mode, and model environment variables including secret references.
+func validateAgentRuntime(ve *ValidationError, prefix string, agent *types.AgentManifest, cluster *types.ClusterConfig) {
 	// Validate runtime.type is required
 	validRuntimeTypes := map[string]bool{
-		"openclaw": true, "custom": true, "process": true,
+		"openclaw": true, "custom": true, backendProcess: true,
 	}
 	if agent.Spec.Runtime.Type == "" {
 		ve.addf("%s: spec.runtime.type is required", prefix)
@@ -426,14 +447,14 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 
 	// Validate runtime.backend
 	if agent.Spec.Runtime.Backend != "" {
-		validBackends := map[string]bool{"firecracker": true, "process": true}
+		validBackends := map[string]bool{"firecracker": true, backendProcess: true}
 		if !validBackends[agent.Spec.Runtime.Backend] {
 			ve.addf("%s: spec.runtime.backend must be one of [firecracker, process], got %q", prefix, agent.Spec.Runtime.Backend)
 		}
 	}
 
 	// Validate runtime.command is required for process and custom types
-	if agent.Spec.Runtime.Type == "process" || agent.Spec.Runtime.Type == "custom" {
+	if agent.Spec.Runtime.Type == backendProcess || agent.Spec.Runtime.Type == "custom" {
 		if agent.Spec.Runtime.Command == "" {
 			ve.addf("%s: spec.runtime.command is required when runtime.type is %q", prefix, agent.Spec.Runtime.Type)
 		}
@@ -470,7 +491,7 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 	if agent.Spec.Runtime.Backend == "firecracker" && agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
 		ve.addf("%s: spec.runtime.backend \"firecracker\" requires tier \"vm\", got %q", prefix, agent.Spec.Tier)
 	}
-	if agent.Spec.Runtime.Backend == "process" && agent.Spec.Tier == "vm" {
+	if agent.Spec.Runtime.Backend == backendProcess && agent.Spec.Tier == "vm" {
 		ve.addf("%s: spec.runtime.backend \"process\" is incompatible with tier \"vm\"", prefix)
 	}
 
@@ -486,6 +507,42 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Cap environment variables per agent to prevent excessive resource usage.
+	if len(agent.Spec.Runtime.Model.Env) > 1000 {
+		ve.addf("%s: spec.runtime.model.env has %d entries, maximum is 1000", prefix, len(agent.Spec.Runtime.Model.Env))
+	}
+
+	// Validate runtime.model.env keys.
+	for envKey := range agent.Spec.Runtime.Model.Env {
+		if !envKeyRegex.MatchString(envKey) {
+			ve.addf("%s: spec.runtime.model.env key %q is not a valid environment variable name", prefix, envKey)
+		}
+		if blockedEnvKeys[envKey] {
+			ve.addf("%s: spec.runtime.model.env key %q is a blocked security-sensitive environment variable", prefix, envKey)
+		}
+	}
+
+	// Rule 6: Validate secret references (${SECRET_NAME}) in runtime.model.env
+	// resolve against spec.secrets in cluster config.
+	if cluster != nil && len(agent.Spec.Runtime.Model.Env) > 0 {
+		secrets := cluster.Spec.Secrets
+		for envKey, envVal := range agent.Spec.Runtime.Model.Env {
+			matches := secretRefRegex.FindAllStringSubmatch(envVal, -1)
+			for _, match := range matches {
+				secretName := match[1]
+				if secrets == nil {
+					ve.addf("%s: env %q references secret ${%s} but spec.secrets is not defined", prefix, envKey, secretName)
+				} else if _, ok := secrets[secretName]; !ok {
+					ve.addf("%s: env %q references secret ${%s} which is not in spec.secrets", prefix, envKey, secretName)
+				}
+			}
+		}
+	}
+}
+
+// validateAgentResources validates memory, CPU, disk resource parsing and bounds,
+// and replica count limits.
+func validateAgentResources(ve *ValidationError, prefix string, agent *types.AgentManifest) {
 	// Validate resources
 	if agent.Spec.Resources.Memory != "" {
 		memBytes, err := ParseMemory(agent.Spec.Resources.Memory)
@@ -502,260 +559,13 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		ve.addf("%s: spec.resources.vcpus exceeds maximum of 256, got %d", prefix, agent.Spec.Resources.VCPUs)
 	}
 
-	// Validate capabilities (rule 7: unique names within agent)
-	validParamTypes := map[string]bool{"string": true, "int": true, "float": true, "bool": true, "bytes": true}
-	capNames := make(map[string]bool)
-	for _, cap := range agent.Spec.Capabilities {
-		if cap.Name == "" {
-			ve.addf("%s: capability name is required", prefix)
-			continue
-		}
-		if err := types.ValidateSubjectComponent("capability name", cap.Name); err != nil {
-			ve.addf("%s: capability %q: %v", prefix, cap.Name, err)
-		}
-		if cap.Description == "" {
-			ve.addf("%s: capability %q description is required", prefix, cap.Name)
-		}
-		if capNames[cap.Name] {
-			ve.addf("%s: duplicate capability name %q", prefix, cap.Name)
-		}
-		capNames[cap.Name] = true
-		for _, param := range cap.Inputs {
-			if param.Type != "" && !validParamTypes[param.Type] {
-				ve.addf("%s: capability %q input %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
-			}
-		}
-		for _, param := range cap.Outputs {
-			if param.Type != "" && !validParamTypes[param.Type] {
-				ve.addf("%s: capability %q output %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
-			}
-		}
-	}
-
-	// Collect cleaned volume mount paths for cross-overlap detection with mounts (VAL-H2).
-	type volumeMountEntry struct {
-		name      string
-		cleanPath string
-	}
-	var volumeMountPaths []volumeMountEntry
-
-	// Validate volumes reference team shared_volumes (rule 2, 9)
-	if len(agent.Spec.Volumes) > 0 {
-		if agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
-			ve.addf("%s: volumes are only valid for vm tier", prefix)
-		}
-		// Enforce maximum volume count (vdc through vdz = 23 drives available).
-		if len(agent.Spec.Volumes) > 23 {
-			ve.addf("%s: spec.volumes has %d entries, maximum is 23 (vdc through vdz)", prefix, len(agent.Spec.Volumes))
-		}
-		if agent.Metadata.Team == "" {
-			ve.addf("%s: volumes require metadata.team to be set (volumes reference team shared_volumes)", prefix)
-		} else if team, ok := teams[agent.Metadata.Team]; ok {
-			svByName := make(map[string]*types.SharedVolume)
-			for i := range team.Spec.SharedVolumes {
-				svByName[team.Spec.SharedVolumes[i].Name] = &team.Spec.SharedVolumes[i]
-			}
-			validVolumeAccess := map[string]bool{"ro": true, "rw": true}
-			volNames := make(map[string]bool)
-			for _, vol := range agent.Spec.Volumes {
-				// Volume name must be non-empty.
-				if vol.Name == "" {
-					ve.addf("%s: volume name is required", prefix)
-					continue
-				}
-				// Volume name must contain only safe characters (VAL-H3).
-				if !validVolumeNameRegex.MatchString(vol.Name) {
-					ve.addf("%s: volume name %q contains invalid characters (only [a-zA-Z0-9_-] allowed, must start with alphanumeric)", prefix, vol.Name)
-				}
-				// Volume name must be unique within the agent.
-				if volNames[vol.Name] {
-					ve.addf("%s: duplicate volume name %q", prefix, vol.Name)
-				}
-				volNames[vol.Name] = true
-				// Volume name must reference an existing team shared_volume.
-				sv, svExists := svByName[vol.Name]
-				if !svExists {
-					ve.addf("%s: volume %q references nonexistent shared_volume in team %q", prefix, vol.Name, agent.Metadata.Team)
-				} else {
-					// Validate the team shared_volume has a hostPath.
-					if sv.HostPath == "" {
-						ve.addf("%s: volume %q references team shared_volume %q which has no hostPath", prefix, vol.Name, sv.Name)
-					}
-				}
-				// MountPath must be an absolute path with safe characters only.
-				if vol.MountPath == "" {
-					ve.addf("%s: volume %q mountPath is required", prefix, vol.Name)
-				} else if !strings.HasPrefix(vol.MountPath, "/") {
-					ve.addf("%s: volume %q mountPath must be an absolute path, got %q", prefix, vol.Name, vol.MountPath)
-				} else if strings.Contains(vol.MountPath, "..") {
-					ve.addf("%s: volume %q mountPath %q contains path traversal (..)", prefix, vol.Name, vol.MountPath)
-				} else if !validMountPathRegex.MatchString(vol.MountPath) {
-					ve.addf("%s: volume %q mountPath %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, vol.Name, vol.MountPath)
-				} else {
-					// Use prefix match for dangerous guest paths (e.g. /etc/foo is also dangerous).
-					cleanMount := filepath.Clean(vol.MountPath)
-					for dp := range dangerousGuestPaths {
-						if cleanMount == dp || strings.HasPrefix(cleanMount, dp+"/") {
-							ve.addf("%s: volume %q mountPath %q is under dangerous system path %q", prefix, vol.Name, vol.MountPath, dp)
-							break
-						}
-					}
-					// Collect for cross-overlap detection with mounts (VAL-H2).
-					volumeMountPaths = append(volumeMountPaths, volumeMountEntry{name: vol.Name, cleanPath: cleanMount})
-				}
-				// Access must be "ro" or "rw" (default "rw").
-				if vol.Access != "" && !validVolumeAccess[vol.Access] {
-					ve.addf("%s: volume %q access must be one of [ro, rw], got %q", prefix, vol.Name, vol.Access)
-				}
-			}
-		}
-	}
-
-	// Validate mounts.
-	if len(agent.Spec.Mounts) > 0 {
-		mountNames := make(map[string]bool)
-		rwGuests := make(map[string]bool)
-		validMountModes := map[string]bool{"ro": true, "rw": true}
-		// Collect cleaned guest paths for prefix-overlap detection.
-		type mountGuestEntry struct {
-			name      string
-			cleanPath string
-		}
-		var guestPaths []mountGuestEntry
-		for _, m := range agent.Spec.Mounts {
-			if m.Name == "" {
-				ve.addf("%s: mount name is required", prefix)
-			} else if mountNames[m.Name] {
-				ve.addf("%s: duplicate mount name %q", prefix, m.Name)
-			}
-			mountNames[m.Name] = true
-			if m.Host == "" {
-				ve.addf("%s: mount %q host path is required", prefix, m.Name)
-			} else if !strings.HasPrefix(m.Host, "/") {
-				ve.addf("%s: mount %q host path must be an absolute path, got %q", prefix, m.Name, m.Host)
-			} else if strings.Contains(m.Host, "..") {
-				ve.addf("%s: mount %q host path %q contains path traversal (..)", prefix, m.Name, m.Host)
-			} else {
-				// Validate character set (VAL-C2).
-				if !validMountPathRegex.MatchString(m.Host) {
-					ve.addf("%s: mount %q host path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Host)
-				}
-				// Block dangerous host directories.
-				cleanHost := filepath.Clean(m.Host)
-				for dp := range dangerousMountHostPaths {
-					if cleanHost == dp || strings.HasPrefix(cleanHost, dp+"/") {
-						ve.addf("%s: mount %q host path %q is under dangerous host directory %q", prefix, m.Name, m.Host, dp)
-						break
-					}
-				}
-			}
-			if m.Guest == "" {
-				ve.addf("%s: mount %q guest path is required", prefix, m.Name)
-			} else if !strings.HasPrefix(m.Guest, "/") {
-				ve.addf("%s: mount %q guest path must be an absolute path, got %q", prefix, m.Name, m.Guest)
-			} else {
-				// Validate character set (VAL-C2).
-				if !validMountPathRegex.MatchString(m.Guest) {
-					ve.addf("%s: mount %q guest path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Guest)
-				}
-				// Use prefix match for dangerous guest paths.
-				cleanGuest := filepath.Clean(m.Guest)
-				for dp := range dangerousGuestPaths {
-					if cleanGuest == dp || strings.HasPrefix(cleanGuest, dp+"/") {
-						ve.addf("%s: mount %q guest path %q is under dangerous system path %q", prefix, m.Name, m.Guest, dp)
-						break
-					}
-				}
-				if strings.Contains(m.Guest, "..") {
-					ve.addf("%s: mount %q guest path %q contains path traversal (..)", prefix, m.Name, m.Guest)
-				}
-				// Track for prefix-overlap detection.
-				guestPaths = append(guestPaths, mountGuestEntry{name: m.Name, cleanPath: cleanGuest})
-			}
-			if m.Mode != "" && !validMountModes[m.Mode] {
-				ve.addf("%s: mount %q mode must be one of [ro, rw], got %q", prefix, m.Name, m.Mode)
-			}
-			// Check for overlapping rw mounts on the same guest path (VAL-C2).
-			// Use cleaned path to prevent bypasses via path traversal like "/../".
-			if m.Mode == "rw" && m.Guest != "" {
-				cleanRwGuest := filepath.Clean(m.Guest)
-				if rwGuests[cleanRwGuest] {
-					ve.addf("%s: mount %q overlapping rw mount on guest path %q", prefix, m.Name, m.Guest)
-				}
-				rwGuests[cleanRwGuest] = true
-			}
-		}
-		// Detect prefix-overlapping mount paths (e.g. /data and /data/secrets).
-		for i := 0; i < len(guestPaths); i++ {
-			for j := i + 1; j < len(guestPaths); j++ {
-				a, b := guestPaths[i], guestPaths[j]
-				if a.cleanPath == b.cleanPath {
-					// Exact duplicates are already caught by the rw check above;
-					// report here for any mode combination.
-					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
-				} else if strings.HasPrefix(b.cleanPath, a.cleanPath+"/") {
-					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, b.cleanPath, b.name, a.cleanPath, a.name)
-				} else if strings.HasPrefix(a.cleanPath, b.cleanPath+"/") {
-					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
-				}
-			}
-		}
-	}
-
-	// Check for cross-overlap between volume mount paths and regular mount guest paths (VAL-H2).
-	if len(volumeMountPaths) > 0 && len(agent.Spec.Mounts) > 0 {
-		for _, vm := range volumeMountPaths {
-			for _, m := range agent.Spec.Mounts {
-				if m.Guest == "" {
-					continue
-				}
-				cleanMountGuest := filepath.Clean(m.Guest)
-				if vm.cleanPath == cleanMountGuest {
-					ve.addf("%s: volume %q mountPath %q conflicts with mount %q guest path %q", prefix, vm.name, vm.cleanPath, m.Name, cleanMountGuest)
-				} else if strings.HasPrefix(cleanMountGuest, vm.cleanPath+"/") {
-					ve.addf("%s: mount %q guest path %q overlaps with volume %q mountPath %q", prefix, m.Name, cleanMountGuest, vm.name, vm.cleanPath)
-				} else if strings.HasPrefix(vm.cleanPath, cleanMountGuest+"/") {
-					ve.addf("%s: volume %q mountPath %q overlaps with mount %q guest path %q", prefix, vm.name, vm.cleanPath, m.Name, cleanMountGuest)
-				}
-			}
-		}
-	}
-
-	// Validate secrets reference existing cluster secrets.
-	if len(agent.Spec.Secrets) > 0 {
-		seenSecretNames := make(map[string]bool)
-		seenSecretEnvs := make(map[string]bool)
-		for _, s := range agent.Spec.Secrets {
-			if s.Name == "" {
-				ve.addf("%s: secret name is required", prefix)
-				continue
-			}
-			if seenSecretNames[s.Name] {
-				ve.addf("%s: duplicate secret name %q", prefix, s.Name)
-			}
-			seenSecretNames[s.Name] = true
-			if s.Env == "" {
-				ve.addf("%s: secret %q env is required", prefix, s.Name)
-			} else {
-				if !envKeyRegex.MatchString(s.Env) {
-					ve.addf("%s: secret %q env %q is not a valid environment variable name", prefix, s.Name, s.Env)
-				}
-				if blockedEnvKeys[s.Env] {
-					ve.addf("%s: secret %q env %q is a blocked security-sensitive environment variable", prefix, s.Name, s.Env)
-				}
-				if seenSecretEnvs[s.Env] {
-					ve.addf("%s: duplicate secret env %q", prefix, s.Env)
-				}
-				seenSecretEnvs[s.Env] = true
-			}
-			// Cross-reference against cluster secrets.
-			if cluster != nil {
-				if cluster.Spec.Secrets == nil {
-					ve.addf("%s: secret %q referenced but no secrets defined in cluster config", prefix, s.Name)
-				} else if _, ok := cluster.Spec.Secrets[s.Name]; !ok {
-					ve.addf("%s: secret %q not found in cluster spec.secrets", prefix, s.Name)
-				}
-			}
+	// Validate disk size.
+	if agent.Spec.Resources.Disk != "" {
+		diskBytes, err := ParseDiskSize(agent.Spec.Resources.Disk)
+		if err != nil {
+			ve.addf("%s: spec.resources.disk %q is invalid: %v", prefix, agent.Spec.Resources.Disk, err)
+		} else if diskBytes > 10*1024*1024*1024*1024 { // 10 TB upper bound
+			ve.addf("%s: spec.resources.disk %q exceeds maximum of 10TB", prefix, agent.Spec.Resources.Disk)
 		}
 	}
 
@@ -772,7 +582,11 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 	if agent.Spec.Replicas.Min > 0 && agent.Spec.Replicas.Max > 0 && agent.Spec.Replicas.Min > agent.Spec.Replicas.Max {
 		ve.addf("%s: spec.replicas.min (%d) must be <= max (%d)", prefix, agent.Spec.Replicas.Min, agent.Spec.Replicas.Max)
 	}
+}
 
+// validateAgentNetwork validates network egress/ingress mode, egress allowlist
+// entries, DNS hostnames, hardware fields, and ingress configuration.
+func validateAgentNetwork(ve *ValidationError, prefix string, agent *types.AgentManifest) {
 	// Validate network egress only for vm tier (rule 10).
 	// Always validate if egress is set, even when tier is empty string (VAL-H1).
 	if agent.Spec.Network.Egress != "" && agent.Spec.Tier != "vm" {
@@ -881,6 +695,292 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Validate ingress configuration.
+	if agent.Spec.Ingress.Port != 0 || agent.Spec.Ingress.Path != "" {
+		if agent.Spec.Ingress.Port <= 0 || agent.Spec.Ingress.Port > 65535 {
+			ve.addf("%s: spec.ingress.port must be between 1 and 65535, got %d", prefix, agent.Spec.Ingress.Port)
+		}
+		if agent.Spec.Ingress.Path != "" {
+			if agent.Spec.Ingress.Path[0] != '/' {
+				ve.addf("%s: spec.ingress.path must start with '/', got %q", prefix, agent.Spec.Ingress.Path)
+			}
+			if strings.Contains(agent.Spec.Ingress.Path, "..") {
+				ve.addf("%s: spec.ingress.path %q contains path traversal (..)", prefix, agent.Spec.Ingress.Path)
+			}
+			if ingressPathInvalidChars.MatchString(agent.Spec.Ingress.Path) {
+				ve.addf("%s: spec.ingress.path %q contains invalid characters", prefix, agent.Spec.Ingress.Path)
+			}
+		}
+	}
+}
+
+// validateAgentMounts validates volumes, shared volume references, mount paths,
+// dangerous path checks, cross-overlap detection, and secret references.
+func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentManifest, teams map[string]*types.TeamManifest, cluster *types.ClusterConfig) {
+	// Collect cleaned volume mount paths for cross-overlap detection with mounts (VAL-H2).
+	type volumeMountEntry struct {
+		name      string
+		cleanPath string
+	}
+	var volumeMountPaths []volumeMountEntry
+
+	// Validate volumes reference team shared_volumes (rule 2, 9)
+	if len(agent.Spec.Volumes) > 0 {
+		if agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
+			ve.addf("%s: volumes are only valid for vm tier", prefix)
+		}
+		// Enforce maximum volume count (vdc through vdz = 23 drives available).
+		if len(agent.Spec.Volumes) > 23 {
+			ve.addf("%s: spec.volumes has %d entries, maximum is 23 (vdc through vdz)", prefix, len(agent.Spec.Volumes))
+		}
+		if agent.Metadata.Team == "" {
+			ve.addf("%s: volumes require metadata.team to be set (volumes reference team shared_volumes)", prefix)
+		} else if team, ok := teams[agent.Metadata.Team]; ok {
+			svByName := make(map[string]*types.SharedVolume)
+			for i := range team.Spec.SharedVolumes {
+				svByName[team.Spec.SharedVolumes[i].Name] = &team.Spec.SharedVolumes[i]
+			}
+			validVolumeAccess := map[string]bool{"ro": true, "rw": true}
+			volNames := make(map[string]bool)
+			for _, vol := range agent.Spec.Volumes {
+				// Volume name must be non-empty.
+				if vol.Name == "" {
+					ve.addf("%s: volume name is required", prefix)
+					continue
+				}
+				// Volume name must contain only safe characters (VAL-H3).
+				if !validVolumeNameRegex.MatchString(vol.Name) {
+					ve.addf("%s: volume name %q contains invalid characters (only [a-zA-Z0-9_-] allowed, must start with alphanumeric)", prefix, vol.Name)
+				}
+				// Volume name must be unique within the agent.
+				if volNames[vol.Name] {
+					ve.addf("%s: duplicate volume name %q", prefix, vol.Name)
+				}
+				volNames[vol.Name] = true
+				// Volume name must reference an existing team shared_volume.
+				sv, svExists := svByName[vol.Name]
+				if !svExists {
+					ve.addf("%s: volume %q references nonexistent shared_volume in team %q", prefix, vol.Name, agent.Metadata.Team)
+				} else if sv.HostPath == "" {
+					// Validate the team shared_volume has a hostPath.
+					ve.addf("%s: volume %q references team shared_volume %q which has no hostPath", prefix, vol.Name, sv.Name)
+				}
+				// MountPath must be an absolute path with safe characters only.
+				switch {
+				case vol.MountPath == "":
+					ve.addf("%s: volume %q mountPath is required", prefix, vol.Name)
+				case !strings.HasPrefix(vol.MountPath, "/"):
+					ve.addf("%s: volume %q mountPath must be an absolute path, got %q", prefix, vol.Name, vol.MountPath)
+				case strings.Contains(vol.MountPath, ".."):
+					ve.addf("%s: volume %q mountPath %q contains path traversal (..)", prefix, vol.Name, vol.MountPath)
+				case !validMountPathRegex.MatchString(vol.MountPath):
+					ve.addf("%s: volume %q mountPath %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, vol.Name, vol.MountPath)
+				default:
+					// Use prefix match for dangerous guest paths (e.g. /etc/foo is also dangerous).
+					cleanMount := filepath.Clean(vol.MountPath)
+					for dp := range dangerousGuestPaths {
+						if cleanMount == dp || strings.HasPrefix(cleanMount, dp+"/") {
+							ve.addf("%s: volume %q mountPath %q is under dangerous system path %q", prefix, vol.Name, vol.MountPath, dp)
+							break
+						}
+					}
+					// Collect for cross-overlap detection with mounts (VAL-H2).
+					volumeMountPaths = append(volumeMountPaths, volumeMountEntry{name: vol.Name, cleanPath: cleanMount})
+				}
+				// Access must be "ro" or "rw" (default "rw").
+				if vol.Access != "" && !validVolumeAccess[vol.Access] {
+					ve.addf("%s: volume %q access must be one of [ro, rw], got %q", prefix, vol.Name, vol.Access)
+				}
+			}
+		}
+	}
+
+	// Validate mounts.
+	if len(agent.Spec.Mounts) > 0 {
+		mountNames := make(map[string]bool)
+		rwGuests := make(map[string]bool)
+		validMountModes := map[string]bool{"ro": true, "rw": true}
+		// Collect cleaned guest paths for prefix-overlap detection.
+		type mountGuestEntry struct {
+			name      string
+			cleanPath string
+		}
+		var guestPaths []mountGuestEntry
+		for _, m := range agent.Spec.Mounts {
+			if m.Name == "" {
+				ve.addf("%s: mount name is required", prefix)
+			} else if mountNames[m.Name] {
+				ve.addf("%s: duplicate mount name %q", prefix, m.Name)
+			}
+			mountNames[m.Name] = true
+			switch {
+			case m.Host == "":
+				ve.addf("%s: mount %q host path is required", prefix, m.Name)
+			case !strings.HasPrefix(m.Host, "/"):
+				ve.addf("%s: mount %q host path must be an absolute path, got %q", prefix, m.Name, m.Host)
+			case strings.Contains(m.Host, ".."):
+				ve.addf("%s: mount %q host path %q contains path traversal (..)", prefix, m.Name, m.Host)
+			default:
+				// Validate character set (VAL-C2).
+				if !validMountPathRegex.MatchString(m.Host) {
+					ve.addf("%s: mount %q host path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Host)
+				}
+				// Block dangerous host directories.
+				cleanHost := filepath.Clean(m.Host)
+				for dp := range dangerousMountHostPaths {
+					if cleanHost == dp || strings.HasPrefix(cleanHost, dp+"/") {
+						ve.addf("%s: mount %q host path %q is under dangerous host directory %q", prefix, m.Name, m.Host, dp)
+						break
+					}
+				}
+			}
+			switch {
+			case m.Guest == "":
+				ve.addf("%s: mount %q guest path is required", prefix, m.Name)
+			case !strings.HasPrefix(m.Guest, "/"):
+				ve.addf("%s: mount %q guest path must be an absolute path, got %q", prefix, m.Name, m.Guest)
+			default:
+				// Validate character set (VAL-C2).
+				if !validMountPathRegex.MatchString(m.Guest) {
+					ve.addf("%s: mount %q guest path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Guest)
+				}
+				// Use prefix match for dangerous guest paths.
+				cleanGuest := filepath.Clean(m.Guest)
+				for dp := range dangerousGuestPaths {
+					if cleanGuest == dp || strings.HasPrefix(cleanGuest, dp+"/") {
+						ve.addf("%s: mount %q guest path %q is under dangerous system path %q", prefix, m.Name, m.Guest, dp)
+						break
+					}
+				}
+				if strings.Contains(m.Guest, "..") {
+					ve.addf("%s: mount %q guest path %q contains path traversal (..)", prefix, m.Name, m.Guest)
+				}
+				// Track for prefix-overlap detection.
+				guestPaths = append(guestPaths, mountGuestEntry{name: m.Name, cleanPath: cleanGuest})
+			}
+			if m.Mode != "" && !validMountModes[m.Mode] {
+				ve.addf("%s: mount %q mode must be one of [ro, rw], got %q", prefix, m.Name, m.Mode)
+			}
+			// Check for overlapping rw mounts on the same guest path (VAL-C2).
+			// Use cleaned path to prevent bypasses via path traversal like "/../".
+			if m.Mode == "rw" && m.Guest != "" {
+				cleanRwGuest := filepath.Clean(m.Guest)
+				if rwGuests[cleanRwGuest] {
+					ve.addf("%s: mount %q overlapping rw mount on guest path %q", prefix, m.Name, m.Guest)
+				}
+				rwGuests[cleanRwGuest] = true
+			}
+		}
+		// Detect prefix-overlapping mount paths (e.g. /data and /data/secrets).
+		for i := 0; i < len(guestPaths); i++ {
+			for j := i + 1; j < len(guestPaths); j++ {
+				a, b := guestPaths[i], guestPaths[j]
+				switch {
+				case a.cleanPath == b.cleanPath:
+					// Exact duplicates are already caught by the rw check above;
+					// report here for any mode combination.
+					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
+				case strings.HasPrefix(b.cleanPath, a.cleanPath+"/"):
+					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, b.cleanPath, b.name, a.cleanPath, a.name)
+				case strings.HasPrefix(a.cleanPath, b.cleanPath+"/"):
+					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
+				}
+			}
+		}
+	}
+
+	// Check for cross-overlap between volume mount paths and regular mount guest paths (VAL-H2).
+	if len(volumeMountPaths) > 0 && len(agent.Spec.Mounts) > 0 {
+		for _, vm := range volumeMountPaths {
+			for _, m := range agent.Spec.Mounts {
+				if m.Guest == "" {
+					continue
+				}
+				cleanMountGuest := filepath.Clean(m.Guest)
+				switch {
+				case vm.cleanPath == cleanMountGuest:
+					ve.addf("%s: volume %q mountPath %q conflicts with mount %q guest path %q", prefix, vm.name, vm.cleanPath, m.Name, cleanMountGuest)
+				case strings.HasPrefix(cleanMountGuest, vm.cleanPath+"/"):
+					ve.addf("%s: mount %q guest path %q overlaps with volume %q mountPath %q", prefix, m.Name, cleanMountGuest, vm.name, vm.cleanPath)
+				case strings.HasPrefix(vm.cleanPath, cleanMountGuest+"/"):
+					ve.addf("%s: volume %q mountPath %q overlaps with mount %q guest path %q", prefix, vm.name, vm.cleanPath, m.Name, cleanMountGuest)
+				}
+			}
+		}
+	}
+
+	// Validate secrets reference existing cluster secrets.
+	if len(agent.Spec.Secrets) > 0 {
+		seenSecretNames := make(map[string]bool)
+		seenSecretEnvs := make(map[string]bool)
+		for _, s := range agent.Spec.Secrets {
+			if s.Name == "" {
+				ve.addf("%s: secret name is required", prefix)
+				continue
+			}
+			if seenSecretNames[s.Name] {
+				ve.addf("%s: duplicate secret name %q", prefix, s.Name)
+			}
+			seenSecretNames[s.Name] = true
+			if s.Env == "" {
+				ve.addf("%s: secret %q env is required", prefix, s.Name)
+			} else {
+				if !envKeyRegex.MatchString(s.Env) {
+					ve.addf("%s: secret %q env %q is not a valid environment variable name", prefix, s.Name, s.Env)
+				}
+				if blockedEnvKeys[s.Env] {
+					ve.addf("%s: secret %q env %q is a blocked security-sensitive environment variable", prefix, s.Name, s.Env)
+				}
+				if seenSecretEnvs[s.Env] {
+					ve.addf("%s: duplicate secret env %q", prefix, s.Env)
+				}
+				seenSecretEnvs[s.Env] = true
+			}
+			// Cross-reference against cluster secrets.
+			if cluster != nil {
+				if cluster.Spec.Secrets == nil {
+					ve.addf("%s: secret %q referenced but no secrets defined in cluster config", prefix, s.Name)
+				} else if _, ok := cluster.Spec.Secrets[s.Name]; !ok {
+					ve.addf("%s: secret %q not found in cluster spec.secrets", prefix, s.Name)
+				}
+			}
+		}
+	}
+}
+
+// validateAgentCapabilities validates capability definitions, restart/health
+// settings, and placement configuration.
+func validateAgentCapabilities(ve *ValidationError, prefix string, id string, agent *types.AgentManifest) {
+	// Validate capabilities (rule 7: unique names within agent)
+	validParamTypes := map[string]bool{"string": true, "int": true, "float": true, "bool": true, "bytes": true}
+	capNames := make(map[string]bool)
+	for _, cap := range agent.Spec.Capabilities {
+		if cap.Name == "" {
+			ve.addf("%s: capability name is required", prefix)
+			continue
+		}
+		if err := types.ValidateSubjectComponent("capability name", cap.Name); err != nil {
+			ve.addf("%s: capability %q: %v", prefix, cap.Name, err)
+		}
+		if cap.Description == "" {
+			ve.addf("%s: capability %q description is required", prefix, cap.Name)
+		}
+		if capNames[cap.Name] {
+			ve.addf("%s: duplicate capability name %q", prefix, cap.Name)
+		}
+		capNames[cap.Name] = true
+		for _, param := range cap.Inputs {
+			if param.Type != "" && !validParamTypes[param.Type] {
+				ve.addf("%s: capability %q input %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
+			}
+		}
+		for _, param := range cap.Outputs {
+			if param.Type != "" && !validParamTypes[param.Type] {
+				ve.addf("%s: capability %q output %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
+			}
+		}
+	}
+
 	// Validate restart policy
 	if agent.Spec.Restart.Policy != "" {
 		validPolicies := map[string]bool{"always": true, restartOnFailure: true, "never": true}
@@ -899,66 +999,6 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		ve.addf("%s: spec.health.maxFailures must be <= 10000, got %d", prefix, agent.Spec.Health.MaxFailures)
 	}
 
-	// Validate ingress configuration.
-	if agent.Spec.Ingress.Port != 0 || agent.Spec.Ingress.Path != "" {
-		if agent.Spec.Ingress.Port <= 0 || agent.Spec.Ingress.Port > 65535 {
-			ve.addf("%s: spec.ingress.port must be between 1 and 65535, got %d", prefix, agent.Spec.Ingress.Port)
-		}
-		if agent.Spec.Ingress.Path != "" {
-			if agent.Spec.Ingress.Path[0] != '/' {
-				ve.addf("%s: spec.ingress.path must start with '/', got %q", prefix, agent.Spec.Ingress.Path)
-			}
-			if strings.Contains(agent.Spec.Ingress.Path, "..") {
-				ve.addf("%s: spec.ingress.path %q contains path traversal (..)", prefix, agent.Spec.Ingress.Path)
-			}
-			if ingressPathInvalidChars.MatchString(agent.Spec.Ingress.Path) {
-				ve.addf("%s: spec.ingress.path %q contains invalid characters", prefix, agent.Spec.Ingress.Path)
-			}
-		}
-	}
-
-	// Validate disk size.
-	if agent.Spec.Resources.Disk != "" {
-		diskBytes, err := ParseDiskSize(agent.Spec.Resources.Disk)
-		if err != nil {
-			ve.addf("%s: spec.resources.disk %q is invalid: %v", prefix, agent.Spec.Resources.Disk, err)
-		} else if diskBytes > 10*1024*1024*1024*1024 { // 10 TB upper bound
-			ve.addf("%s: spec.resources.disk %q exceeds maximum of 10TB", prefix, agent.Spec.Resources.Disk)
-		}
-	}
-
-	// Cap environment variables per agent to prevent excessive resource usage.
-	if len(agent.Spec.Runtime.Model.Env) > 1000 {
-		ve.addf("%s: spec.runtime.model.env has %d entries, maximum is 1000", prefix, len(agent.Spec.Runtime.Model.Env))
-	}
-
-	// Validate runtime.model.env keys.
-	for envKey := range agent.Spec.Runtime.Model.Env {
-		if !envKeyRegex.MatchString(envKey) {
-			ve.addf("%s: spec.runtime.model.env key %q is not a valid environment variable name", prefix, envKey)
-		}
-		if blockedEnvKeys[envKey] {
-			ve.addf("%s: spec.runtime.model.env key %q is a blocked security-sensitive environment variable", prefix, envKey)
-		}
-	}
-
-	// Rule 6: Validate secret references (${SECRET_NAME}) in runtime.model.env
-	// resolve against spec.secrets in cluster config.
-	if cluster != nil && len(agent.Spec.Runtime.Model.Env) > 0 {
-		secrets := cluster.Spec.Secrets
-		for envKey, envVal := range agent.Spec.Runtime.Model.Env {
-			matches := secretRefRegex.FindAllStringSubmatch(envVal, -1)
-			for _, match := range matches {
-				secretName := match[1]
-				if secrets == nil {
-					ve.addf("%s: env %q references secret ${%s} but spec.secrets is not defined", prefix, envKey, secretName)
-				} else if _, ok := secrets[secretName]; !ok {
-					ve.addf("%s: env %q references secret ${%s} which is not in spec.secrets", prefix, envKey, secretName)
-				}
-			}
-		}
-	}
-
 	// Rule 16: Placement nodeId warning if set (node may not be registered at
 	// parse time, so this is a warning, not an error).
 	// NOTE: Uses global slog logger. A future refactor could accept a logger
@@ -968,11 +1008,6 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		slog.Warn("agent placement.nodeId is set; node registration cannot be verified at parse time",
 			"agent_id", id, "node_id", agent.Spec.Placement.NodeID)
 	}
-
-	// Validate map fields for safe keys and values (no control chars, no NATS wildcards).
-	validateMapLabels(ve, prefix, "metadata.labels", agent.Metadata.Labels)
-	validateMapLabels(ve, prefix, "spec.hardware.custom", agent.Spec.Hardware.Custom)
-	validateMapLabels(ve, prefix, "spec.placement.nodeLabels", agent.Spec.Placement.NodeLabels)
 }
 
 func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agents map[string]*types.AgentManifest) {
@@ -1047,13 +1082,14 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 		volumeNames[vol.Name] = true
 
 		// HostPath is required for shared volumes.
-		if vol.HostPath == "" {
+		switch {
+		case vol.HostPath == "":
 			ve.addf("%s: shared_volume %q hostPath is required", prefix, vol.Name)
-		} else if !strings.HasPrefix(vol.HostPath, "/") {
+		case !strings.HasPrefix(vol.HostPath, "/"):
 			ve.addf("%s: shared_volume %q hostPath must be an absolute path, got %q", prefix, vol.Name, vol.HostPath)
-		} else if strings.Contains(vol.HostPath, "..") {
+		case strings.Contains(vol.HostPath, ".."):
 			ve.addf("%s: shared_volume %q hostPath %q contains path traversal (..)", prefix, vol.Name, vol.HostPath)
-		} else {
+		default:
 			// Validate hostPath character set to prevent injection attacks (VAL-C1).
 			if !validMountPathRegex.MatchString(vol.HostPath) {
 				ve.addf("%s: shared_volume %q hostPath %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, vol.Name, vol.HostPath)

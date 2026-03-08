@@ -47,38 +47,37 @@ Examples:
   hivectl tokens create --ttl 48h
   # Output: hvtk_e5f6g7h8...`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			payload := map[string]string{}
 			if ttl != "" {
 				// Validate TTL format locally before sending.
 				if _, err := time.ParseDuration(ttl); err != nil {
 					return fmt.Errorf("invalid TTL %q: %w", ttl, err)
 				}
-				payload["ttl"] = ttl
 			}
 
-			resp, err := client.request(protocol.SubjTokenCreate, payload)
-			if err != nil {
-				return fmt.Errorf("creating token: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+			return withClient(func(client *DaemonClient) error {
+				payload := map[string]string{}
+				if ttl != "" {
+					payload["ttl"] = ttl
+				}
 
-			var result struct {
-				Token string `json:"token"`
-			}
-			if err := json.Unmarshal(resp.Data, &result); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
+				resp, err := client.request(protocol.SubjTokenCreate, payload)
+				if err != nil {
+					return fmt.Errorf("creating token: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			fmt.Println(result.Token)
-			return nil
+				var result struct {
+					Token string `json:"token"`
+				}
+				if err := json.Unmarshal(resp.Data, &result); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
+
+				fmt.Println(result.Token)
+				return nil
+			})
 		},
 	}
 
@@ -92,57 +91,53 @@ func tokensListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List active tokens",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			resp, err := client.request(protocol.SubjTokenList, nil)
-			if err != nil {
-				return fmt.Errorf("listing tokens: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			var tokens []*types.Token
-			if err := json.Unmarshal(resp.Data, &tokens); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "PREFIX\tCREATED\tEXPIRES\tLAST USED\tSTATUS")
-
-			for _, t := range tokens {
-				expires := "-"
-				if !t.ExpiresAt.IsZero() {
-					expires = t.ExpiresAt.Format(time.RFC3339)
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjTokenList, nil)
+				if err != nil {
+					return fmt.Errorf("listing tokens: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
 				}
 
-				lastUsed := "-"
-				if !t.LastUsed.IsZero() {
-					lastUsed = t.LastUsed.Format(time.RFC3339)
+				var tokens []*types.Token
+				if err := json.Unmarshal(resp.Data, &tokens); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
 				}
 
-				status := "active"
-				if t.Revoked {
-					status = "revoked"
-				} else if t.IsExpired() {
-					status = "expired"
+				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "PREFIX\tCREATED\tEXPIRES\tLAST USED\tSTATUS")
+
+				for _, t := range tokens {
+					expires := "-"
+					if !t.ExpiresAt.IsZero() {
+						expires = t.ExpiresAt.Format(time.RFC3339)
+					}
+
+					lastUsed := "-"
+					if !t.LastUsed.IsZero() {
+						lastUsed = t.LastUsed.Format(time.RFC3339)
+					}
+
+					status := "active"
+					if t.Revoked {
+						status = "revoked"
+					} else if t.IsExpired() {
+						status = "expired"
+					}
+
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+						t.Prefix,
+						t.CreatedAt.Format(time.RFC3339),
+						expires,
+						lastUsed,
+						status,
+					)
 				}
 
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-					t.Prefix,
-					t.CreatedAt.Format(time.RFC3339),
-					expires,
-					lastUsed,
-					status,
-				)
-			}
-
-			w.Flush()
-			return nil
+				w.Flush()
+				return nil
+			})
 		},
 	}
 }
@@ -155,22 +150,18 @@ func tokensRevokeCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prefix := args[0]
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjTokenRevoke, map[string]string{"prefix": prefix})
+				if err != nil {
+					return fmt.Errorf("revoking token: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjTokenRevoke, map[string]string{"prefix": prefix})
-			if err != nil {
-				return fmt.Errorf("revoking token: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			fmt.Printf("Token %s revoked\n", prefix)
-			return nil
+				fmt.Printf("Token %s revoked\n", prefix)
+				return nil
+			})
 		},
 	}
 }

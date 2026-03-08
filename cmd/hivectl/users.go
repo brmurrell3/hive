@@ -53,44 +53,40 @@ func usersCreateCmd() *cobra.Command {
 				return fmt.Errorf("validating role: %w", err)
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				payload := map[string]interface{}{
+					"user_id": userID,
+					"role":    role,
+				}
+				if teams != "" {
+					payload["teams"] = splitTrimmed(teams)
+				}
+				if agents != "" {
+					payload["agents"] = splitTrimmed(agents)
+				}
 
-			payload := map[string]interface{}{
-				"user_id": userID,
-				"role":    role,
-			}
-			if teams != "" {
-				payload["teams"] = splitTrimmed(teams)
-			}
-			if agents != "" {
-				payload["agents"] = splitTrimmed(agents)
-			}
+				resp, err := client.request(protocol.SubjUserCreate, payload)
+				if err != nil {
+					return fmt.Errorf("creating user: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjUserCreate, payload)
-			if err != nil {
-				return fmt.Errorf("creating user: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+				var result struct {
+					UserID string `json:"user_id"`
+					Role   string `json:"role"`
+					Token  string `json:"token"`
+				}
+				if err := json.Unmarshal(resp.Data, &result); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
 
-			var result struct {
-				UserID string `json:"user_id"`
-				Role   string `json:"role"`
-				Token  string `json:"token"`
-			}
-			if err := json.Unmarshal(resp.Data, &result); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			fmt.Printf("User %s created with role %s\n", result.UserID, result.Role)
-			fmt.Printf("Token: %s\n", result.Token)
-			fmt.Println("Save this token - it cannot be retrieved later.")
-			return nil
+				fmt.Printf("User %s created with role %s\n", result.UserID, result.Role)
+				fmt.Printf("Token: %s\n", result.Token)
+				fmt.Println("Save this token - it cannot be retrieved later.")
+				return nil
+			})
 		},
 	}
 
@@ -107,42 +103,38 @@ func usersListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List all users",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			resp, err := client.request(protocol.SubjUserList, nil)
-			if err != nil {
-				return fmt.Errorf("listing users: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			var users []*auth.User
-			if err := json.Unmarshal(resp.Data, &users); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "USER_ID\tROLE\tTEAMS\tAGENTS")
-
-			for _, u := range users {
-				teams := "-"
-				if len(u.Teams) > 0 {
-					teams = strings.Join(u.Teams, ",")
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjUserList, nil)
+				if err != nil {
+					return fmt.Errorf("listing users: %w", err)
 				}
-				agents := "-"
-				if len(u.Agents) > 0 {
-					agents = strings.Join(u.Agents, ",")
+				if err := resp.Err(); err != nil {
+					return err
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", u.ID, u.Role, teams, agents)
-			}
 
-			w.Flush()
-			return nil
+				var users []*auth.User
+				if err := json.Unmarshal(resp.Data, &users); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
+
+				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "USER_ID\tROLE\tTEAMS\tAGENTS")
+
+				for _, u := range users {
+					teams := "-"
+					if len(u.Teams) > 0 {
+						teams = strings.Join(u.Teams, ",")
+					}
+					agents := "-"
+					if len(u.Agents) > 0 {
+						agents = strings.Join(u.Agents, ",")
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", u.ID, u.Role, teams, agents)
+				}
+
+				w.Flush()
+				return nil
+			})
 		},
 	}
 }
@@ -171,12 +163,6 @@ func usersUpdateCmd() *cobra.Command {
 				}
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
 			payload := map[string]interface{}{
 				"user_id": userID,
 			}
@@ -200,16 +186,18 @@ func usersUpdateCmd() *cobra.Command {
 				}
 			}
 
-			resp, err := client.request(protocol.SubjUserUpdate, payload)
-			if err != nil {
-				return fmt.Errorf("updating user: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjUserUpdate, payload)
+				if err != nil {
+					return fmt.Errorf("updating user: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			fmt.Printf("User %s updated\n", userID)
-			return nil
+				fmt.Printf("User %s updated\n", userID)
+				return nil
+			})
 		},
 	}
 
@@ -232,22 +220,18 @@ func usersRevokeCmd() *cobra.Command {
 				return err
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjUserRevoke, protocol.CtlRequest{AgentID: userID})
+				if err != nil {
+					return fmt.Errorf("revoking user: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjUserRevoke, protocol.CtlRequest{AgentID: userID})
-			if err != nil {
-				return fmt.Errorf("revoking user: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			fmt.Printf("User %s revoked\n", userID)
-			return nil
+				fmt.Printf("User %s revoked\n", userID)
+				return nil
+			})
 		},
 	}
 }
@@ -264,31 +248,27 @@ func usersRotateCmd() *cobra.Command {
 				return err
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjUserRotate, protocol.CtlRequest{AgentID: userID})
+				if err != nil {
+					return fmt.Errorf("rotating user token: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjUserRotate, protocol.CtlRequest{AgentID: userID})
-			if err != nil {
-				return fmt.Errorf("rotating user token: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+				var result struct {
+					Token string `json:"token"`
+				}
+				if err := json.Unmarshal(resp.Data, &result); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
 
-			var result struct {
-				Token string `json:"token"`
-			}
-			if err := json.Unmarshal(resp.Data, &result); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			fmt.Printf("Token rotated for user %s\n", userID)
-			fmt.Printf("Token: %s\n", result.Token)
-			fmt.Println("Save this token - it cannot be retrieved later.")
-			return nil
+				fmt.Printf("Token rotated for user %s\n", userID)
+				fmt.Printf("Token: %s\n", result.Token)
+				fmt.Println("Save this token - it cannot be retrieved later.")
+				return nil
+			})
 		},
 	}
 }

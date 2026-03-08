@@ -39,44 +39,40 @@ func nodesListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List all registered nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjNodeList, nil)
+				if err != nil {
+					return fmt.Errorf("listing nodes: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjNodeList, nil)
-			if err != nil {
-				return fmt.Errorf("listing nodes: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+				var nodes []*types.NodeState
+				if err := json.Unmarshal(resp.Data, &nodes); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
 
-			var nodes []*types.NodeState
-			if err := json.Unmarshal(resp.Data, &nodes); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
+				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "NODE_ID\tTIER\tARCH\tSTATUS\tMEMORY\tCPUS\tAGENTS")
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE_ID\tTIER\tARCH\tSTATUS\tMEMORY\tCPUS\tAGENTS")
+				for _, n := range nodes {
+					memStr := formatBytes(n.Resources.MemoryTotal)
+					agentCount := len(n.Agents)
+					fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%d\t%d\n",
+						n.ID,
+						n.Tier,
+						n.Arch,
+						n.Status,
+						memStr,
+						n.Resources.CPUCount,
+						agentCount,
+					)
+				}
 
-			for _, n := range nodes {
-				memStr := formatBytes(n.Resources.MemoryTotal)
-				agentCount := len(n.Agents)
-				fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%d\t%d\n",
-					n.ID,
-					n.Tier,
-					n.Arch,
-					n.Status,
-					memStr,
-					n.Resources.CPUCount,
-					agentCount,
-				)
-			}
-
-			w.Flush()
-			return nil
+				w.Flush()
+				return nil
+			})
 		},
 	}
 }
@@ -93,31 +89,27 @@ func nodesStatusCmd() *cobra.Command {
 				return err
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjNodeStatus, protocol.CtlRequest{AgentID: nodeID})
+				if err != nil {
+					return fmt.Errorf("getting node status: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjNodeStatus, protocol.CtlRequest{AgentID: nodeID})
-			if err != nil {
-				return fmt.Errorf("getting node status: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+				var n types.NodeState
+				if err := json.Unmarshal(resp.Data, &n); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
 
-			var n types.NodeState
-			if err := json.Unmarshal(resp.Data, &n); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			data, err := json.MarshalIndent(n, "", "  ")
-			if err != nil {
-				return fmt.Errorf("marshaling node state: %w", err)
-			}
-			fmt.Println(string(data))
-			return nil
+				data, err := json.MarshalIndent(n, "", "  ")
+				if err != nil {
+					return fmt.Errorf("marshaling node state: %w", err)
+				}
+				fmt.Println(string(data))
+				return nil
+			})
 		},
 	}
 }
@@ -125,31 +117,13 @@ func nodesStatusCmd() *cobra.Command {
 // simpleNodeCmd creates a cobra command that validates a node ID,
 // sends a node control request, and prints a success message.
 func simpleNodeCmd(use, short string, subject, pastMsg string) *cobra.Command {
-	return &cobra.Command{
-		Use:   use + " NODE_ID",
-		Short: short,
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			nodeID := args[0]
-			if err := types.ValidateSubjectComponent("node_id", nodeID); err != nil {
-				return err
-			}
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-			resp, err := client.request(subject, protocol.CtlRequest{AgentID: nodeID})
-			if err != nil {
-				return err
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-			fmt.Printf("Node %s %s\n", nodeID, pastMsg)
-			return nil
-		},
-	}
+	return simpleResourceCmd(use+" NODE_ID", short, "", "node_id", "Node", func(client *DaemonClient, nodeID string) error {
+		resp, err := client.request(subject, protocol.CtlRequest{AgentID: nodeID})
+		if err != nil {
+			return err
+		}
+		return resp.Err()
+	}, pastMsg)
 }
 
 func nodesDrainCmd() *cobra.Command {
@@ -193,25 +167,21 @@ func nodesLabelCmd() *cobra.Command {
 				labels[key] = value
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjNodeLabel, map[string]interface{}{
+					"node_id": nodeID,
+					"labels":  labels,
+				})
+				if err != nil {
+					return fmt.Errorf("labeling node: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjNodeLabel, map[string]interface{}{
-				"node_id": nodeID,
-				"labels":  labels,
+				fmt.Printf("Node %s labeled\n", nodeID)
+				return nil
 			})
-			if err != nil {
-				return fmt.Errorf("labeling node: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			fmt.Printf("Node %s labeled\n", nodeID)
-			return nil
 		},
 	}
 }
@@ -230,25 +200,21 @@ func nodesUnlabelCmd() *cobra.Command {
 
 			keys := args[1:]
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjNodeUnlabel, map[string]interface{}{
+					"node_id": nodeID,
+					"keys":    keys,
+				})
+				if err != nil {
+					return fmt.Errorf("unlabeling node: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjNodeUnlabel, map[string]interface{}{
-				"node_id": nodeID,
-				"keys":    keys,
+				fmt.Printf("Node %s unlabeled\n", nodeID)
+				return nil
 			})
-			if err != nil {
-				return fmt.Errorf("unlabeling node: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			fmt.Printf("Node %s unlabeled\n", nodeID)
-			return nil
 		},
 	}
 }

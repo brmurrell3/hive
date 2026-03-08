@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, phase-2-developer-experience]
   pull_request:
     branches: [main]
 

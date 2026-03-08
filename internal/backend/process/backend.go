@@ -7,10 +7,8 @@
 package process
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,7 +16,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -103,7 +100,7 @@ type processInstance struct {
 	stderr        *safeBuf
 	cancel        context.CancelFunc
 	done          chan struct{}
-	closeOnce     sync.Once // BE-H2: prevents double-close of done channel
+	closeOnce     sync.Once  // BE-H2: prevents double-close of done channel
 	mu            sync.Mutex // guards started and stopped flags
 	started       bool       // BE-H8: prevents double-Start
 	stopped       bool       // BE-H7: prevents Start after Stop
@@ -218,7 +215,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	// Build environment from a minimal allow-list of parent variables
 	// instead of inheriting the full parent environment, which could
 	// leak secrets (BE-H2).
-	var env []string
+	env := make([]string, 0, 16)
 	for _, key := range []string{"PATH", "HOME", "USER", "TMPDIR", "LANG", "TERM"} {
 		if v := os.Getenv(key); v != "" {
 			env = append(env, fmt.Sprintf("%s=%s", key, v))
@@ -230,11 +227,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	// A denylist prevents injection of HIVE_*, LD_*, DYLD_*, PATH,
 	// HOME, and SHELL keys.
 	for k, v := range spec.Spec.Runtime.Model.Env {
-		upper := strings.ToUpper(k)
-		if strings.HasPrefix(upper, "HIVE_") ||
-			strings.HasPrefix(upper, "LD_") ||
-			strings.HasPrefix(upper, "DYLD_") ||
-			upper == "PATH" || upper == "HOME" || upper == "SHELL" {
+		if isEnvVarDenied(k) {
 			b.logger.Warn("model env var denied by denylist",
 				"agent_id", agentID, "key", k)
 			continue
@@ -544,74 +537,11 @@ func (b *Backend) Logs(ctx context.Context, id string, opts backend.LogOpts) (io
 	return io.NopCloser(combined), nil
 }
 
-// systemMemoryMB returns the total physical system RAM in megabytes.
-// It uses platform-specific methods:
-//   - Linux:  parses /proc/meminfo for MemTotal
-//   - macOS:  reads hw.memsize via syscall.Sysctl
-//
-// Returns 0 if detection fails so the caller can apply a fallback.
-func systemMemoryMB() int64 {
-	switch goruntime.GOOS {
-	case "linux":
-		return linuxMemoryMB()
-	case "darwin":
-		return darwinMemoryMB()
-	default:
-		return 0
-	}
-}
-
-// linuxMemoryMB parses /proc/meminfo to extract MemTotal in MB.
-func linuxMemoryMB() int64 {
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "MemTotal:") {
-			continue
-		}
-		// Format: "MemTotal:       16384000 kB"
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			return 0
-		}
-		kB, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
-			return 0
-		}
-		return kB / 1024 // kB -> MB
-	}
-	return 0
-}
-
-// darwinMemoryMB reads hw.memsize via syscall.Sysctl to get total RAM in MB.
-func darwinMemoryMB() int64 {
-	val, err := syscall.Sysctl("hw.memsize")
-	if err != nil || len(val) == 0 {
-		return 0
-	}
-	// syscall.Sysctl returns a raw byte string; hw.memsize is a uint64 in
-	// host byte order (little-endian on all supported Apple hardware).
-	b := []byte(val)
-	// The kernel may or may not include a trailing NUL byte.
-	// Ensure we have at least 8 bytes for the uint64.
-	if len(b) < 8 {
-		return 0
-	}
-	memBytes := binary.LittleEndian.Uint64(b[:8])
-	return int64(memBytes / (1024 * 1024))
-}
-
 func (b *Backend) Available() backend.Resources {
 	cpuCount := goruntime.NumCPU()
 
 	// Detect actual system RAM using platform-specific methods.
-	memTotal := systemMemoryMB()
+	memTotal := backend.SystemMemoryMB()
 	if memTotal < 256 {
 		memTotal = 8192 // fallback if detection fails or returns unreasonably low value
 	}

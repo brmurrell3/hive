@@ -19,6 +19,7 @@ import (
 	"github.com/brmurrell3/hive/internal/state"
 	"github.com/brmurrell3/hive/internal/types"
 	"github.com/nats-io/nats.go"
+	"github.com/spf13/cobra"
 )
 
 // NATS timeout constants used across hivectl commands.
@@ -137,6 +138,46 @@ func connectNATS(name string) (*nats.Conn, error) {
 	}
 
 	return nc, nil
+}
+
+// withClient creates a DaemonClient, passes it to fn, and ensures Close is
+// called when fn returns. This eliminates boilerplate around newDaemonClient /
+// defer client.Close() that is repeated across subcommands.
+func withClient(fn func(*DaemonClient) error) error {
+	client, err := newDaemonClient()
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	return fn(client)
+}
+
+// simpleResourceCmd creates a cobra command that validates an ID argument,
+// connects to the daemon, runs an action, and prints a success message.
+// It unifies the patterns used by simpleAgentCmd and simpleNodeCmd.
+func simpleResourceCmd(use, short, long, idField, noun string, action func(c *DaemonClient, id string) error, pastTense string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: short,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := args[0]
+			if err := types.ValidateSubjectComponent(idField, id); err != nil {
+				return err
+			}
+			return withClient(func(client *DaemonClient) error {
+				if err := action(client, id); err != nil {
+					return err
+				}
+				fmt.Printf("%s %s %s\n", noun, id, pastTense)
+				return nil
+			})
+		},
+	}
+	if long != "" {
+		cmd.Long = long
+	}
+	return cmd
 }
 
 // newDaemonClient connects to hived's NATS server using the port from cluster.yaml

@@ -165,42 +165,38 @@ func capabilitiesListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List all registered capabilities across agents",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			resp, err := client.request(protocol.SubjCapabilityList, nil)
-			if err != nil {
-				return fmt.Errorf("requesting capabilities list: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			var caps []struct {
-				Name    string `json:"name"`
-				AgentID string `json:"agent_id"`
-				Team    string `json:"team,omitempty"`
-			}
-			if err := json.Unmarshal(resp.Data, &caps); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			if len(caps) == 0 {
-				fmt.Println("No capabilities registered.")
-				return nil
-			}
-
-			for _, c := range caps {
-				team := ""
-				if c.Team != "" {
-					team = fmt.Sprintf(" [team: %s]", c.Team)
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjCapabilityList, nil)
+				if err != nil {
+					return fmt.Errorf("requesting capabilities list: %w", err)
 				}
-				fmt.Printf("  %s  (agent: %s)%s\n", c.Name, c.AgentID, team)
-			}
-			return nil
+				if err := resp.Err(); err != nil {
+					return err
+				}
+
+				var caps []struct {
+					Name    string `json:"name"`
+					AgentID string `json:"agent_id"`
+					Team    string `json:"team,omitempty"`
+				}
+				if err := json.Unmarshal(resp.Data, &caps); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
+
+				if len(caps) == 0 {
+					fmt.Println("No capabilities registered.")
+					return nil
+				}
+
+				for _, c := range caps {
+					team := ""
+					if c.Team != "" {
+						team = fmt.Sprintf(" [team: %s]", c.Team)
+					}
+					fmt.Printf("  %s  (agent: %s)%s\n", c.Name, c.AgentID, team)
+				}
+				return nil
+			})
 		},
 	}
 }
@@ -217,45 +213,41 @@ func capabilitiesDescribeCmd() *cobra.Command {
 				return err
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjCapabilityDescribe, map[string]string{"name": capName})
+				if err != nil {
+					return fmt.Errorf("requesting capability description: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjCapabilityDescribe, map[string]string{"name": capName})
-			if err != nil {
-				return fmt.Errorf("requesting capability description: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+				var cap types.AgentCapability
+				if err := json.Unmarshal(resp.Data, &cap); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
 
-			var cap types.AgentCapability
-			if err := json.Unmarshal(resp.Data, &cap); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
+				fmt.Printf("Name:        %s\n", cap.Name)
+				fmt.Printf("Description: %s\n", cap.Description)
 
-			fmt.Printf("Name:        %s\n", cap.Name)
-			fmt.Printf("Description: %s\n", cap.Description)
-
-			if len(cap.Inputs) > 0 {
-				fmt.Println("\nInputs:")
-				for _, in := range cap.Inputs {
-					required := ""
-					if in.IsRequired() {
-						required = " (required)"
+				if len(cap.Inputs) > 0 {
+					fmt.Println("\nInputs:")
+					for _, in := range cap.Inputs {
+						required := ""
+						if in.IsRequired() {
+							required = " (required)"
+						}
+						fmt.Printf("  %s [%s]%s - %s\n", in.Name, in.Type, required, in.Description)
 					}
-					fmt.Printf("  %s [%s]%s - %s\n", in.Name, in.Type, required, in.Description)
 				}
-			}
-			if len(cap.Outputs) > 0 {
-				fmt.Println("\nOutputs:")
-				for _, out := range cap.Outputs {
-					fmt.Printf("  %s [%s] - %s\n", out.Name, out.Type, out.Description)
+				if len(cap.Outputs) > 0 {
+					fmt.Println("\nOutputs:")
+					for _, out := range cap.Outputs {
+						fmt.Printf("  %s [%s] - %s\n", out.Name, out.Type, out.Description)
+					}
 				}
-			}
-			return nil
+				return nil
+			})
 		},
 	}
 }
@@ -272,43 +264,39 @@ func capabilitiesProvidersCmd() *cobra.Command {
 				return err
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			resp, err := client.request(protocol.SubjCapabilityProviders, map[string]string{"name": capName})
-			if err != nil {
-				return fmt.Errorf("requesting capability providers: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
-
-			var providers []struct {
-				AgentID string `json:"agent_id"`
-				Team    string `json:"team,omitempty"`
-				Status  string `json:"status"`
-			}
-			if err := json.Unmarshal(resp.Data, &providers); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
-
-			if len(providers) == 0 {
-				fmt.Printf("No agents provide capability %q.\n", capName)
-				return nil
-			}
-
-			fmt.Printf("Providers of %q:\n", capName)
-			for _, p := range providers {
-				team := ""
-				if p.Team != "" {
-					team = fmt.Sprintf(" [team: %s]", p.Team)
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjCapabilityProviders, map[string]string{"name": capName})
+				if err != nil {
+					return fmt.Errorf("requesting capability providers: %w", err)
 				}
-				fmt.Printf("  %s (%s)%s\n", p.AgentID, p.Status, team)
-			}
-			return nil
+				if err := resp.Err(); err != nil {
+					return err
+				}
+
+				var providers []struct {
+					AgentID string `json:"agent_id"`
+					Team    string `json:"team,omitempty"`
+					Status  string `json:"status"`
+				}
+				if err := json.Unmarshal(resp.Data, &providers); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
+
+				if len(providers) == 0 {
+					fmt.Printf("No agents provide capability %q.\n", capName)
+					return nil
+				}
+
+				fmt.Printf("Providers of %q:\n", capName)
+				for _, p := range providers {
+					team := ""
+					if p.Team != "" {
+						team = fmt.Sprintf(" [team: %s]", p.Team)
+					}
+					fmt.Printf("  %s (%s)%s\n", p.AgentID, p.Status, team)
+				}
+				return nil
+			})
 		},
 	}
 }
