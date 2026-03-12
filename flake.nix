@@ -51,6 +51,11 @@
             gotools
             go-tools
             gnumake
+          ] ++ lib.optionals stdenv.isLinux [
+            # Available on Linux runners for VM and network tests
+            e2fsprogs
+            nftables
+            iproute2
           ];
         };
       }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hive-sdk"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python SDK for building Hive agents"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -13,7 +13,7 @@ authors = [
     {name = "The Hive Authors"},
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",

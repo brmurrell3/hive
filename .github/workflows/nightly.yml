@@ -1,0 +1,123 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 3am UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extended-e2e:
+    name: Extended E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: E2E tests (extended timeout)
+        run: go test -tags e2e -count=1 -timeout 20m -v ./test/e2e/
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+
+  fuzz-extended:
+    name: Extended Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - {pkg: "./internal/config/", func: "FuzzParseMemory"}
+          - {pkg: "./internal/config/", func: "FuzzParseDiskSize"}
+          - {pkg: "./internal/types/", func: "FuzzValidateSubjectComponent"}
+          - {pkg: "./internal/types/", func: "FuzzEnvelopeValidate"}
+          - {pkg: "./internal/auth/", func: "FuzzAuthenticate"}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Fuzz ${{ matrix.target.func }} (5 minutes)
+        run: >-
+          go test -tags unit -run='^$'
+          -fuzz='^${{ matrix.target.func }}$'
+          -fuzztime=5m
+          ${{ matrix.target.pkg }}
+
+  race-stress:
+    name: Race Stress (10x)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Race detector (10 iterations)
+        run: go test -tags unit,integration -race -count=10 -timeout 50m ./...
+
+  soak:
+    name: Soak Test (10 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Soak test
+        run: ./scripts/soak-test.sh
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+          SOAK_DURATION: "600"
+
+  smoke:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Smoke test
+        run: ./scripts/smoke-test.sh
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run benchmarks
+        run: go test -tags unit -bench=. -benchmem -run='^$' -timeout 10m ./... | tee bench.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ github.sha }}
+          path: bench.txt

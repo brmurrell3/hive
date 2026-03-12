@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/brmurrell3/hive/internal/config"
 	"github.com/spf13/cobra"
@@ -19,6 +20,8 @@ var (
 	authUser     string
 	authToken    string
 	version      = "dev"
+	commit       = "unknown"
+	buildDate    = "unknown"
 )
 
 func main() {
@@ -74,6 +77,9 @@ func main() {
 	rootCmd.AddCommand(completionCmd())
 	rootCmd.AddCommand(devCmd())
 	rootCmd.AddCommand(triggerCmd())
+	rootCmd.AddCommand(doctorCmd())
+	rootCmd.AddCommand(logsCmd())
+	rootCmd.AddCommand(execCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -86,6 +92,9 @@ func versionCmd() *cobra.Command {
 		Short: "Print the version of hivectl",
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Printf("hivectl %s\n", version)
+			fmt.Printf("  Commit:     %s\n", commit)
+			fmt.Printf("  Built:      %s\n", buildDate)
+			fmt.Printf("  Go version: %s\n", runtime.Version())
 		},
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -290,6 +291,11 @@ func startDevAgent(ctx context.Context, agent *types.AgentManifest, index int, a
 	}
 
 	runtimeCmd := agent.Spec.Runtime.Command
+	var runtimeArgs []string
+	if parts := strings.Fields(runtimeCmd); len(parts) > 1 {
+		runtimeCmd = parts[0]
+		runtimeArgs = parts[1:]
+	}
 	agentDir := filepath.Join(absRoot, "agents", agentID)
 
 	envVars := []string{
@@ -316,6 +322,7 @@ func startDevAgent(ctx context.Context, agent *types.AgentManifest, index int, a
 		HTTPAddr:      fmt.Sprintf(":%d", sidecarPort),
 		Capabilities:  caps,
 		RuntimeCmd:    runtimeCmd,
+		RuntimeArgs:   runtimeArgs,
 		WorkspacePath: agentDir,
 		Tier:          "native",
 		Mode:          sidecar.ModeLibrary,

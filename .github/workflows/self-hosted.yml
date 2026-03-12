@@ -1,0 +1,163 @@
+name: Self-Hosted (KVM)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only one run at a time on the self-hosted runner
+concurrency:
+  group: self-hosted-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix-build:
+    name: Nix Build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, nixos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all packages
+        run: |
+          nix build .#packages.x86_64-linux.hived --no-link
+          nix build .#packages.x86_64-linux.hivectl --no-link
+          nix build .#packages.x86_64-linux.hive-agent --no-link
+
+      - name: Verify nix binaries
+        run: |
+          nix run .#packages.x86_64-linux.hived -- --version
+          nix run .#packages.x86_64-linux.hivectl -- version
+
+  vm-tests:
+    name: VM Tests (Real KVM)
+    # Requires /dev/kvm — only runs on hosts with hardware virtualization
+    if: false
+    runs-on: [self-hosted, nixos, kvm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify KVM access
+        run: |
+          test -e /dev/kvm || { echo "ERROR: /dev/kvm not found"; exit 1; }
+          test -r /dev/kvm || { echo "ERROR: /dev/kvm not readable"; exit 1; }
+          echo "KVM access OK"
+
+      - name: Enter dev shell and run VM tests
+        run: |
+          nix develop --command bash -c '
+            echo "Go version: $(go version)"
+            echo "Running VM tests with real KVM..."
+            go test -tags vm -count=1 -timeout 10m -v ./...
+          '
+
+  e2e-linux:
+    name: E2E (Linux Native)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, nixos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: E2E tests
+        run: |
+          nix develop --command bash -c '
+            go test -tags e2e -count=1 -timeout 10m -v ./test/e2e/
+          '
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+
+  nftables:
+    name: nftables Integration
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, nixos, kvm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify nftables
+        run: |
+          which nft && nft --version
+          echo "nftables available"
+
+      - name: Run nftables-related tests
+        run: |
+          nix develop --command bash -c '
+            go test -tags unit -run "TestGenerateNftables" -count=1 -v ./internal/vm/
+          '
+
+  smoke-linux:
+    name: Smoke Test (Linux)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, nixos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Smoke test
+        run: |
+          nix develop --command bash -c '
+            ./scripts/smoke-test.sh
+          '
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+
+  rootfs-build:
+    name: Rootfs Build
+    # Requires Docker on the runner — enable after adding virtualisation.docker.enable = true to NixOS config
+    if: false
+    runs-on: [self-hosted, nixos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build hive-sidecar for rootfs
+        run: |
+          nix develop --command bash -c '
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o hive-sidecar ./cmd/hive-sidecar/
+          '
+
+      - name: Build base rootfs
+        run: |
+          nix develop --command bash -c '
+            cd rootfs
+            chmod +x build-rootfs.sh
+            ./build-rootfs.sh test-rootfs.ext4 512M ../hive-sidecar
+          '
+
+      - name: Verify rootfs
+        run: |
+          nix develop --command bash -c '
+            file rootfs/test-rootfs.ext4
+            ls -lh rootfs/test-rootfs.ext4
+            e2fsck -n rootfs/test-rootfs.ext4
+          '
+
+      - name: Cleanup
+        if: always()
+        run: rm -f rootfs/test-rootfs.ext4 hive-sidecar
+
+  full-suite:
+    name: Full Test Suite
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, nixos]
+    needs: [nix-build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit + Integration tests (race detector)
+        run: |
+          nix develop --command bash -c '
+            go test -tags unit,integration -race -count=1 -timeout 10m ./...
+          '
+
+      - name: Fuzz tests (1 minute each)
+        run: |
+          nix develop --command bash -c '
+            go test -tags unit -run="^$" -fuzz="^FuzzParseMemory$" -fuzztime=1m ./internal/config/
+            go test -tags unit -run="^$" -fuzz="^FuzzParseDiskSize$" -fuzztime=1m ./internal/config/
+            go test -tags unit -run="^$" -fuzz="^FuzzValidateSubjectComponent$" -fuzztime=1m ./internal/types/
+            go test -tags unit -run="^$" -fuzz="^FuzzEnvelopeValidate$" -fuzztime=1m ./internal/types/
+            go test -tags unit -run="^$" -fuzz="^FuzzAuthenticate$" -fuzztime=1m ./internal/auth/
+          '

@@ -83,6 +83,15 @@ type AgentState struct {
 	Error          string      `json:"error,omitempty"`
 }
 
+// Uptime returns the duration since the agent was started. If the agent has
+// not been started (StartedAt is zero), it returns zero.
+func (a *AgentState) Uptime() time.Duration {
+	if a.StartedAt.IsZero() {
+		return 0
+	}
+	return time.Since(a.StartedAt)
+}
+
 // State is the top-level runtime state (kept in-memory, persisted to SQLite).
 type State struct {
 	Agents       map[string]*AgentState      `json:"agents"`

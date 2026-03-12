@@ -1,155 +1,396 @@
-# Hive Architecture Specification
+# Hive Architecture
 
-## CONCEPTS
+## Concepts
 
 ### Agent
-- Logical unit of work or capability
-- Identity: ID (format: [a-z0-9][a-z0-9-]{0,62}), labels, optional team membership
-- Transport: NATS bus
-- Execution: backed by VM or process
-- Manifest declares: identity, team, capabilities, resources, execution config
+
+The fundamental unit of work in Hive. An agent is a program that exposes capabilities (functions) and communicates with other agents over NATS.
+
+- **Identity:** ID (format: `[a-z0-9][a-z0-9-]{0,62}`), labels, optional team membership
+- **Transport:** NATS message bus
+- **Execution:** backed by a Firecracker VM (Tier 1) or OS process (Tier 1 native / Tier 2)
+- **Manifest:** declares identity, team, capabilities, resources, and runtime configuration
 
 ### Node
-Physical cluster device, self-registered, classified by tier:
 
-**Tier 1 - Full Compute**
-- Requirements: Linux, KVM, 4GB+ RAM, x86_64 or arm64
-- Capabilities: Firecracker micro-VMs, multi-agent, VM isolation
-- OS: NixOS (official), others compatible
-- Examples: workstations, servers, NUCs
-- Agent execution: each agent in dedicated Firecracker VM (isolated kernel, memory ceiling, network namespace)
-- Control plane: runs on Tier 1 nodes
+A physical or virtual machine in the cluster. Self-registered, classified by tier:
 
-**Tier 2 - Single-Agent Linux**
-- Requirements: Linux + systemd, 512MB+ RAM, any Go-supported arch
-- Capabilities: one native agent as process, process isolation, direct hardware access
-- OS: any Linux (NixOS images provided as convenience)
-- Examples: Raspberry Pi, BeagleBone, Jetson Nano, old laptops
-- Agent execution: hive-agent binary runs agent runtime as child process, sidecar logic in-process
+**Tier 1 -- Full Compute**
+- Requirements: Linux, KVM, 4 GB+ RAM, x86_64 or arm64
+- Capabilities: Firecracker microVMs, multi-agent hosting, VM isolation
+- Agent execution: each agent in a dedicated Firecracker VM with isolated kernel, memory ceiling, and network namespace
+- The control plane runs on Tier 1 nodes
 
-**Classification at join:**
+**Tier 2 -- Single-Agent Linux**
+- Requirements: Linux + systemd, 512 MB+ RAM, any Go-supported architecture
+- Capabilities: one native agent as a process, direct hardware access
+- Agent execution: `hive-agent` binary runs agent runtime as a child process with sidecar logic in-process
+- Examples: Raspberry Pi, BeagleBone, Jetson Nano
+
+**Tier classification at join time:**
 ```
-if kvm_available AND memory >= 4GB: Tier 1
+if kvm_available AND memory >= 4 GB: Tier 1
 else: Tier 2
 ```
 
-**Native agents on Tier 1:**
-Native agents CAN run on Tier 1 nodes as processes managed by hived (not in VMs). Valid for agents requiring direct host hardware access. Execution: managed by hived directly, same as native on Tier 2 but on a Tier 1 host.
+Native agents can also run on Tier 1 nodes as processes managed by hived (not in VMs), for agents requiring direct host hardware access.
 
 ### Team
-- Named group of agents
-- NATS namespace: team.TEAM_ID.*
-- Optional: shared resources (volumes for VM agents), lead agent
-- Any agent from any tier can join
-- Lead agent must be team member
 
-### Capabilities
-- Declared functions an agent performs
-- Declared in agent manifest
-- Purposes: discovery (agent capability enumeration), tool generation (LLM auto-tooling)
-- Constraint: unique within agent
+A named group of agents with optional shared resources and a lead agent.
 
-### Communication Bus (NATS)
-- Universal transport
-- Patterns: direct messaging, team broadcast, request-reply, persistent (JetStream)
-- Subject hierarchy: agent ID and team ID organized
+- NATS namespace: `hive.team.<team_id>.*`
+- Optional: shared volumes (for VM agents), lead agent designation
+- Any agent from any tier can join a team
+- Lead agent must be a team member
+
+### Capability
+
+A declared function that an agent can perform. Defined in the agent manifest with typed inputs and outputs. Used for:
+- **Discovery:** other agents enumerate available capabilities
+- **Tool generation:** LLM-backed agents auto-generate tool definitions
+- **Routing:** the capability router dispatches invocations via NATS
 
 ### Control Plane
-- Runs on Tier 1 node(s)
-- Binary: hived (single Go executable)
-- Responsibilities: cluster state, agent lifecycle, scheduling, team management, node discovery, capability routing
-- Loop: reconciliation (desired state from manifests vs actual state from agents), runs every 5s or on filesystem change
-- Idempotent: all actions safe to replay
 
-### Cluster Root
-Directory structure:
-```
-cluster.yaml                          # cluster config
-agents/AGENT_ID/
-  manifest.yaml                       # agent declaration
-  (runtime files)
-teams/TEAM_ID.yaml                   # team definitions
-.state/
-  nodes/NODE_ID.json                 # node records (control-plane managed)
-  agents/AGENT_ID/
-    vm.json                          # VM state
-    workspace/                       # agent working directory
-  cluster/
-    desired.json                     # validated desired state
-    actual.json                      # actual state
-    tokens.json                      # hashed join tokens
-    capabilities.json                # capability registry cache
-    allocations.json                 # resource allocations
-```
+Runs on Tier 1 nodes. Single binary: `hived`.
 
-Notes:
-- Node records NOT in cluster root; nodes self-register
-- Control plane stores node records in .state/nodes/
+Responsibilities:
+- Cluster state management (SQLite)
+- Agent lifecycle (create, start, stop, destroy)
+- Bin-packing scheduler for VM placement
+- Reconciliation loop (5-second interval, or on filesystem change)
+- Capability registry and routing
+- Health monitoring with auto-restart
+- RBAC enforcement
 
-### Users (Optional)
-- Defined in cluster.yaml: spec.users
-- Enables multi-user access control
-- Roles: operator (full assigned access), viewer (read-only)
-- Primary operator (filesystem access to cluster root): full authority
-- Auth: tokens, SHA-256 hashed in config
+---
 
-## COMPONENT MAP
-
-Go packages in hived:
+## Component Map
 
 | Package | Purpose |
 |---------|---------|
-| internal/config | cluster.yaml and agent/team manifest parsing and validation |
-| internal/nats | embedded NATS server wrapper with TLS, JetStream, and hardened settings |
-| internal/state | SQLite persistence: agents, nodes, tokens, capabilities (schema versioned) |
-| internal/vm | Firecracker VM lifecycle: PENDING → SCHEDULED → CREATING → STARTING → RUNNING → STOPPING → STOPPED (or FAILED → DESTROYING) |
-| internal/sidecar | agent runtime HTTP API, NATS heartbeats, control message handler |
-| internal/capability | capability registry, tool generation, capability routing, panic recovery, timeout, dedup |
-| internal/health | heartbeat monitoring and auto-restart with exponential backoff |
-| internal/reconciler | compare desired vs actual, generate actions, idempotent, runs every 5s or on change |
-| internal/scheduler | VM assignment to Tier 1 nodes (filter: tier/arch/resources/labels, score: availability + team co-location) |
-| internal/watcher | fsnotify on cluster root, debounce 500ms, emits DesiredStateChange |
-| internal/auth | RBAC: token validation, user authorization (admin/operator/viewer) |
-| internal/token | join token generation and validation (SHA-256 hashed, MaxUses support) |
-| internal/node | node registry: join, heartbeat, offline detection, rate limiting |
-| internal/cluster | multi-node clustering with TLS, auth, and reconnect jitter |
-| internal/secrets | secret management for agents and cluster |
-| internal/events | internal event bus for component coordination |
-| internal/metrics | Prometheus /metrics with bounded cardinality and stale series cleanup |
-| internal/logs | log aggregation via NATS (SQLite, sanitized levels, bounded followers) |
-| internal/dashboard | REST and WebSocket API with per-user RBAC |
-| internal/production | graceful shutdown, crash recovery, rate limiting, resource monitoring |
-| internal/types | shared types: Envelope, CorrelationID, subject/capability validation |
-| internal/backend/firecracker | Firecracker backend implementation |
-| internal/backend/process | process backend implementation for native agents |
+| `internal/config` | YAML parsing + validation for cluster, agent, and team manifests |
+| `internal/nats` | Embedded NATS server with TLS, JetStream, hardened cipher suites |
+| `internal/state` | SQLite persistence: agents, nodes, tokens, capabilities (schema versioned) |
+| `internal/vm` | Firecracker VM lifecycle management |
+| `internal/sidecar` | Agent runtime HTTP API, NATS heartbeats, control message handler |
+| `internal/capability` | Capability registry, NATS routing, cross-team support, dedup, timeouts |
+| `internal/health` | Heartbeat monitoring and auto-restart with exponential backoff |
+| `internal/reconciler` | Desired-state reconciliation (manifests vs actual state) |
+| `internal/scheduler` | Bin-packing scheduler with team co-location scoring |
+| `internal/watcher` | fsnotify on cluster root with 500 ms debounce |
+| `internal/auth` | RBAC: admin, operator, viewer roles |
+| `internal/token` | Join token generation and validation (SHA-256 hashed) |
+| `internal/node` | Node registry: join, heartbeat, offline detection |
+| `internal/cluster` | Multi-node clustering with TLS and reconnect jitter |
+| `internal/federation` | Cluster federation with peer allowlists |
+| `internal/director` | Director agent with org-wide management tools |
+| `internal/dashboard` | REST + WebSocket API with per-user RBAC |
+| `internal/metrics` | Prometheus /metrics with bounded cardinality |
+| `internal/logs` | Log aggregation via NATS with SQLite storage |
+| `internal/production` | Graceful shutdown, crash recovery, rate limiting, resource monitoring |
+| `internal/plugin` | Plugin system with lifecycle management |
+| `internal/types` | Shared types: Envelope, CorrelationID, subject validation |
+| `internal/mqtt` | MQTT-NATS bridge for IoT integration |
+| `internal/firmware` | Tier 3 firmware tracking, OTA updates, Ed25519 signing |
 
-## BINARIES
+---
 
-**hived**: control plane daemon
-- Runs on: Tier 1 nodes only
-- Usage: `hived --config CLUSTER_ROOT [--log-level debug|info|warn|error] [--log-format text|json]`
+## Binaries
 
-**hivectl**: management CLI
-- Runs: anywhere with network access
-- Usage: `hivectl [--config PATH | --control-plane ADDRESS] COMMAND`
+**hived** -- Control plane daemon
+- Runs on Tier 1 nodes
+- Usage: `hived --cluster-root PATH [--log-level debug|info|warn|error]`
+- Embeds NATS server, SQLite state, reconciler, scheduler, health monitor
 
-**hive-agent**: Tier 2 agent host
-- Type: single static Go binary
-- Usage: `hive-agent --config /etc/hive/config.yaml`
+**hivectl** -- Management CLI
+- Runs anywhere with network access
+- Usage: `hivectl [--cluster-root PATH | --control-plane ADDRESS] COMMAND`
+- Commands: init, validate, dev, trigger, agents, tokens, nodes, users, capabilities, status
 
-**hive-sidecar**: standalone sidecar binary for VMs
-- Type: single static Go binary
-- Usage: runs inside Firecracker VMs to provide agent runtime and NATS connectivity
+**hive-agent** -- Tier 2 agent host
+- Single static Go binary for edge devices
+- Usage: `hive-agent join --token TOKEN --control-plane HOST:PORT --agent-id ID`
 
-## EXECUTION MODEL SUMMARY
+**hive-sidecar** -- VM sidecar binary
+- Runs inside Firecracker VMs
+- Provides agent runtime, HTTP API (:9100), NATS connectivity via vsock
+
+---
+
+## Firecracker VM Lifecycle
+
+When an agent with `tier: vm` is started, hived provisions a Firecracker microVM through the following stages:
+
+### 1. Resource allocation
+
+The scheduler selects a Tier 1 node based on available memory, CPU, and team co-location. Resources (memory, vCPUs, disk) are reserved atomically from the node's pool.
+
+### 2. VM creation
+
+hived prepares the VM:
+- Copies the base rootfs image to `.state/agents/<agent-id>/rootfs.ext4`
+- Creates an agent drive image (`.state/agents/<agent-id>/agent-drive.ext4`) containing:
+  - `sidecar.conf` with agent configuration (agent ID, team, NATS auth token, capabilities)
+  - Agent files (manifest, entrypoint, workspace files)
+- Allocates a unique CID (Context ID) for vsock communication
+- Spawns the Firecracker process with the API socket at `.state/agents/<agent-id>/firecracker.sock`
+- Configures the VM via the Firecracker API: kernel, rootfs drive, agent drive, memory, vCPUs, vsock device
+
+### 3. Network setup
+
+For each VM:
+- A TAP device is created for the VM's network interface
+- nftables rules are applied based on the agent's `network.egress` setting:
+  - `none`: all outbound traffic blocked
+  - `restricted`: only traffic to domains/IPs in `egress_allowlist` permitted
+  - `full`: all outbound traffic allowed
+- The vsock forwarder starts on the host side, binding a Unix domain socket that bridges the VM's vsock CID to the host NATS server
+
+### 4. Boot sequence
+
+Inside the VM:
+1. Firecracker boots the Linux kernel with init parameters
+2. The init script mounts proc, sys, devtmpfs
+3. The agent drive is mounted at `/workspace`
+4. The sidecar binary starts, reads `sidecar.conf`
+5. The sidecar connects to the host NATS server via vsock
+6. The sidecar begins publishing heartbeats on `hive.health.<agent-id>`
+7. The sidecar registers capabilities on `hive.capabilities.registry`
+8. The sidecar starts the agent runtime (OpenClaw, custom script, etc.)
+
+### 5. Steady state
+
+Once running:
+- Heartbeats are published every `health.interval` (default 30 seconds)
+- The health monitor on hived tracks heartbeat arrivals
+- Capabilities are invocable via NATS request-reply
+- Manifest changes trigger hot-reload (MEMORY.md, skills) or cold-reload (restart)
+
+### 6. Shutdown and cleanup
+
+On stop or destroy:
+- hived sends a shutdown command via `hive.control.<agent-id>`
+- The sidecar performs graceful shutdown of the agent runtime
+- The Firecracker process is terminated
+- nftables rules for this VM are removed
+- The vsock forwarder is stopped
+- CID is reclaimed for reuse
+- On destroy: rootfs copy, agent drive, and socket files are deleted
+
+---
+
+## Network Topology
+
+### Tier 1 VM agent communication
+
+```
++---------------------------+
+|        Tier 1 Host        |
+|                           |
+|  +-------+    +--------+  |
+|  | hived |----| NATS   |  |
+|  +-------+    | Server |  |
+|               +---+----+  |
+|                   |        |
+|            vsock forwarder |
+|                   |        |
+|  - - - - - - - - -|- - -  |
+|  | Firecracker VM |       |
+|  |                |       |
+|  |  +---------+   |       |
+|  |  | sidecar |   |       |
+|  |  +----+----+   |       |
+|  |       |         |       |
+|  |   vsock proxy   |       |
+|  |                  |       |
+|  |  +---------+    |       |
+|  |  |  agent  |    |       |
+|  |  | runtime |    |       |
+|  |  +---------+    |       |
+|  +------------------+      |
+|                           |
+|  TAP device + nftables     |
+|  (egress control)          |
++---------------------------+
+```
+
+- **vsock:** Bidirectional host-guest channel. No TCP ports exposed from the VM. The sidecar inside the VM connects to a vsock CID:PORT, which the host-side vsock forwarder bridges to the NATS server.
+- **TAP + nftables:** Each VM gets a TAP network device. nftables rules control egress based on the agent manifest's `network.egress` setting.
+- **NATS:** All agent-to-agent and agent-to-control-plane communication flows through the embedded NATS server. Agents never communicate directly with each other.
+
+### Tier 2 agent communication
+
+```
++----------------+          +------------------+
+| Tier 2 Node    |   TCP    |   Tier 1 Host    |
+| (e.g., RPi)    |  / TLS   |                  |
+|                |--------->|   NATS Server    |
+| +------------+ |          |                  |
+| | hive-agent | |          |   +-------+      |
+| | + sidecar  | |          |   | hived |      |
+| +------------+ |          |   +-------+      |
++----------------+          +------------------+
+```
+
+Tier 2 agents connect to the control plane NATS server over TCP (with optional TLS). Authentication uses join tokens. The `hive-agent` binary includes the sidecar logic in-process.
+
+### Multi-node clustering
+
+```
++------------------+    NATS cluster    +------------------+
+|   Node 1 (T1)    |<----------------->|   Node 2 (T1)    |
+|   hived + NATS   |    port 6222      |   hived + NATS   |
+|   agents A, B    |   (TLS + auth)    |   agents C, D    |
++------------------+                    +------------------+
+        |                                       |
+        v                                       v
++------------------+                    +------------------+
+|   Node 3 (T2)    |                    |   Node 4 (T2)    |
+|   hive-agent E   |                    |   hive-agent F   |
++------------------+                    +------------------+
+```
+
+Multiple Tier 1 nodes form a NATS cluster. Agents on any node can invoke capabilities on agents running on any other node. The scheduler distributes VMs across nodes using bin-packing with team co-location preferences.
+
+---
+
+## Capability Routing Flow
+
+When Agent B invokes a capability on Agent A:
+
+```
+Agent B                  Sidecar B           NATS            Sidecar A           Agent A
+   |                        |                  |                 |                  |
+   |-- invoke("summarize")-->|                  |                 |                  |
+   |                        |                  |                 |                  |
+   |                        |-- NATS request -->|                 |                  |
+   |                        | hive.capabilities |                 |                  |
+   |                        | .agent-a.summarize|                 |                  |
+   |                        | .request          |                 |                  |
+   |                        |                  |-- deliver ------>|                  |
+   |                        |                  |                 |                  |
+   |                        |                  |                 |-- HTTP POST ----->|
+   |                        |                  |                 |  /handle/summarize|
+   |                        |                  |                 |                  |
+   |                        |                  |                 |<-- JSON outputs --|
+   |                        |                  |                 |                  |
+   |                        |                  |<-- NATS reply ---|                  |
+   |                        |                  |                 |                  |
+   |                        |<-- response -----|                 |                  |
+   |                        |                  |                 |                  |
+   |<-- outputs ------------|                  |                 |                  |
+```
+
+Key details:
+- **Request path:** Agent B's sidecar publishes to `hive.capabilities.<agent-a>.<capability>.request` with a `reply_to` subject
+- **Response path:** Agent A's sidecar publishes the result to the `reply_to` subject
+- **Timeout:** configurable per-invocation, default 30 seconds
+- **Cross-team:** works identically across teams; the NATS subject includes the target agent ID
+- **Deduplication:** the capability router tracks message IDs to prevent duplicate processing
+- **Circuit breaker:** per-agent, per-capability; trips after 5 consecutive errors within 60 seconds
+
+### Capability discovery
+
+When an agent registers or deregisters capabilities, it publishes to `hive.capabilities.registry`. All sidecars subscribe to this subject and update their local tool definitions. This enables:
+- Auto-discovery of new team member capabilities
+- LLM-backed agents to generate tool definitions automatically
+- Cross-team capability routing when configured
+
+---
+
+## Agent Lifecycle State Machine
+
+```
+                      +----------+
+                      | PENDING  |
+                      +----+-----+
+                           |
+                    start  |
+                           v
+                      +----------+
+                +---->| CREATING |
+                |     +----+-----+
+                |          |
+                |   create |  (provision VM / spawn process)
+                |          v
+                |     +----------+
+                |     | STARTING |
+                |     +----+-----+
+                |          |
+                |    boot  |  (sidecar connects, heartbeat arrives)
+                |          v
+                |     +----------+
+                |     | RUNNING  |----+
+                |     +----+-----+    |
+                |          |          |
+                |    stop  |          | failure / crash
+                |          v          |
+                |     +----------+    |
+                |     | STOPPING |    |
+                |     +----+-----+    |
+                |          |          |
+                |          v          v
+                |     +----------+  +--------+
+                |     | STOPPED  |  | FAILED |
+                |     +----+-----+  +----+---+
+                |          |             |
+                |  restart |     restart |
+                +----------+-------------+
+```
+
+State transitions:
+- `PENDING -> CREATING`: `hivectl agents start` or reconciler action
+- `CREATING -> STARTING`: VM provisioned or process spawned
+- `STARTING -> RUNNING`: first heartbeat received from sidecar
+- `RUNNING -> STOPPING`: `hivectl agents stop` or graceful shutdown
+- `STOPPING -> STOPPED`: agent process/VM terminated cleanly
+- `RUNNING -> FAILED`: heartbeat timeout (maxFailures consecutive misses), VM crash, or process exit
+- `CREATING -> FAILED`: VM provisioning error, resource allocation failure
+- `STARTING -> FAILED`: boot timeout, sidecar connection failure
+- `STOPPED -> CREATING`: `hivectl agents restart` or `on-failure` restart policy
+- `FAILED -> CREATING`: `hivectl agents restart` or auto-restart (up to maxRestarts)
+
+Auto-restart behavior is controlled by the `restart` configuration:
+- `always`: restart on any termination
+- `on-failure`: restart only on FAILED state (not clean stop)
+- `never`: do not auto-restart
+- Exponential backoff between restart attempts (configurable `backoff` duration)
+- Maximum restart count (configurable `maxRestarts`)
+
+---
+
+## Execution Model
 
 | Configuration | Execution | Isolation | Hardware Access |
 |---------------|-----------|-----------|-----------------|
-| Tier 1 + vm-tier agent | Firecracker micro-VM | full (kernel, memory, network) | indirect |
-| Tier 1 + native-tier agent | process on host (managed by hived) | process-level | direct |
-| Tier 2 + native-tier agent | process (managed by hive-agent) | process-level | direct |
-| Tier 1 (no agents) | — | — | compute capacity only |
+| Tier 1 + vm-tier agent | Firecracker microVM | Full (kernel, memory, network) | Indirect (via vsock) |
+| Tier 1 + native-tier agent | Process on host (managed by hived) | Process-level | Direct |
+| Tier 2 + native-tier agent | Process (managed by hive-agent) | Process-level | Direct |
 
-**Agent participation:**
-- Any tier agent: connects to NATS, joins teams, exposes capabilities
-- Tier-transparent capability invocation: LLM queries distributed via same mechanism regardless of agent tier
+Agent participation is tier-transparent: any agent connects to NATS, joins teams, and exposes capabilities using the same protocol regardless of whether it runs in a VM or as a native process.
+
+---
+
+## Cluster Root Directory
+
+```
+cluster.yaml                        # Cluster configuration
+agents/<agent-id>/
+  manifest.yaml                     # Agent declaration
+  entrypoint.sh                     # Optional custom runtime entry
+  AGENTS.md                         # Optional OpenClaw instructions
+  MEMORY.md                         # Optional OpenClaw memory
+teams/<team-id>.yaml                # Team definitions
+.state/
+  agents/<agent-id>/
+    rootfs.ext4                     # VM rootfs copy
+    agent-drive.ext4                # Agent files drive
+    firecracker.sock                # Firecracker API socket
+    console.log                     # Serial console output
+    workspace/                      # Agent working directory
+  jetstream/                        # NATS JetStream data
+  nats-auth-token                   # Auto-generated NATS auth token
+state.db                            # SQLite runtime state
+```

@@ -1,0 +1,24 @@
+[Unit]
+Description=Hive Control Plane Daemon
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/brmurrell3/hive
+
+[Service]
+Type=notify
+User=hive
+Group=hive
+ExecStart=/usr/local/bin/hived --cluster-root /var/lib/hive --log-level info
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hive /var/log/hive
+ProtectHome=true
+PrivateTmp=true
+Environment=HIVE_CLUSTER_ROOT=/var/lib/hive
+
+[Install]
+WantedBy=multi-user.target

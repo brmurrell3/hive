@@ -45,8 +45,10 @@ if [ -z "$MKE2FS" ]; then
     exit 1
 fi
 
-# Verify that -d flag is supported (e2fsprogs >= 1.43)
-if ! "$MKE2FS" --help 2>&1 | grep -q -- '-d'; then
+# Verify that -d flag is supported (e2fsprogs >= 1.43).
+# Capture help output first to avoid pipefail issues (--help may exit non-zero).
+MKE2FS_HELP=$("$MKE2FS" --help 2>&1 || true)
+if ! echo "$MKE2FS_HELP" | grep -q -- '-d'; then
     echo "Error: mkfs.ext4 at '$MKE2FS' does not support the -d flag."
     echo "  Upgrade e2fsprogs to >= 1.43."
     exit 1

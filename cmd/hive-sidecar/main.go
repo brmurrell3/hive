@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -21,7 +22,11 @@ import (
 	"github.com/brmurrell3/hive/internal/types"
 )
 
-var version = "dev"
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
 
 func main() {
 	// When running as PID 1 inside a Firecracker VM, orphaned child
@@ -56,6 +61,9 @@ func main() {
 
 	if *showVersion {
 		fmt.Printf("hive-sidecar %s\n", version)
+		fmt.Printf("  Commit:     %s\n", commit)
+		fmt.Printf("  Built:      %s\n", buildDate)
+		fmt.Printf("  Go version: %s\n", runtime.Version())
 		return
 	}
 

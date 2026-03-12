@@ -75,7 +75,15 @@ func NewServer(cfg types.NATSConfig, dataDir string, logger *slog.Logger) (*Serv
 		maxSubs = 10000
 	}
 
+	// Resolve a server name for NATS. JetStream clustering requires a
+	// unique server_name to be set; we default to the OS hostname.
+	srvName, _ := os.Hostname()
+	if srvName == "" {
+		srvName = fmt.Sprintf("hive-%d", os.Getpid())
+	}
+
 	opts := &natsserver.Options{
+		ServerName:    srvName,
 		Host:          host,
 		Port:          cfg.Port,
 		Authorization: authToken,
@@ -226,6 +234,10 @@ func (s *Server) Start() error {
 	readyTimeout := s.config.ReadyTimeout
 	if readyTimeout == 0 {
 		readyTimeout = 10 * time.Second
+		// JetStream clustering takes longer to initialize.
+		if s.config.ClusterPort > 0 && s.config.JetStream.IsEnabled() {
+			readyTimeout = 30 * time.Second
+		}
 	}
 
 	if !s.ns.ReadyForConnections(readyTimeout) {

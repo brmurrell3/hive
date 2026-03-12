@@ -46,6 +46,9 @@ const (
 
 	// ext4MagicNumber is the ext4 filesystem magic number (little-endian uint16 at offset 0x438).
 	ext4MagicNumber = 0xEF53
+
+	// schemeHTTPS is the required URL scheme for all download and checksum URLs.
+	schemeHTTPS = "https"
 )
 
 // errChecksumUnavailable is a sentinel error indicating the checksum file
@@ -73,7 +76,7 @@ var httpClient = &http.Client{
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}
-		if req.URL.Scheme != "https" {
+		if req.URL.Scheme != schemeHTTPS {
 			return fmt.Errorf("refusing redirect to non-HTTPS URL: %s", req.URL.Redacted())
 		}
 		return nil
@@ -262,7 +265,7 @@ func (m *ImageManager) downloadFile(ctx context.Context, rawURL, destPath string
 	if parseErr != nil {
 		return fmt.Errorf("invalid download URL %q: %w", rawURL, parseErr)
 	}
-	if parsedURL.Scheme != "https" {
+	if parsedURL.Scheme != schemeHTTPS {
 		return fmt.Errorf("refusing non-HTTPS download URL: %s", rawURL)
 	}
 
@@ -374,7 +377,7 @@ func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePa
 	if parseErr != nil {
 		return fmt.Errorf("invalid checksum URL %q: %w", checksumURL, parseErr)
 	}
-	if parsedChecksum.Scheme != "https" {
+	if parsedChecksum.Scheme != schemeHTTPS {
 		return fmt.Errorf("refusing non-HTTPS checksum URL: %s", checksumURL)
 	}
 

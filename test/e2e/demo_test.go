@@ -52,7 +52,7 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// TestDemoPipeline validates the Phase 1 demo flow end-to-end:
+// TestDemoPipeline validates the demo flow end-to-end:
 // hivectl init --template ci-pipeline → hivectl dev → hivectl trigger → pipeline report.
 func TestDemoPipeline(t *testing.T) {
 	if testing.Short() {

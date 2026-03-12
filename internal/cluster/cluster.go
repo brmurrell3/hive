@@ -2,7 +2,6 @@
 // Copyright 2025 The Hive Authors
 
 // Package cluster manages multi-node clustering over NATS with TLS, state replication, and reconnect logic.
-// TODO: Add unit tests for cluster lifecycle and state replication.
 package cluster
 
 import (
@@ -85,6 +84,7 @@ type Cluster struct {
 	running         bool
 	monitorLaunched bool // true if the background goroutine was started
 	stopOnce        sync.Once
+	stoppedOnce     sync.Once // guards closing the stopped channel
 	stopCh          chan struct{}
 	stopped         chan struct{}
 }
@@ -215,12 +215,10 @@ func (c *Cluster) Start() error {
 	}
 
 	c.running = true
+	c.monitorLaunched = true // set under Start's lock, before goroutine launch
 
 	go func() {
-		c.mu.Lock()
-		c.monitorLaunched = true
-		c.mu.Unlock()
-		defer close(c.stopped)
+		defer c.stoppedOnce.Do(func() { close(c.stopped) })
 		<-c.stopCh
 		c.logger.Info("cluster stopped")
 	}()
@@ -232,17 +230,19 @@ func (c *Cluster) Start() error {
 func (c *Cluster) Stop() {
 	c.mu.Lock()
 	if !c.running {
+		monitorWasLaunched := c.monitorLaunched
 		c.mu.Unlock()
 		// Even if Start() was never called or already stopped, ensure
 		// stopOnce fires so that any future <-c.stopped won't block.
 		c.stopOnce.Do(func() {
 			close(c.stopCh)
-			// If the monitoring goroutine was never launched, close stopped
-			// ourselves to prevent deadlock.
-			if !c.monitorLaunched {
-				close(c.stopped)
-			}
 		})
+		// If the monitoring goroutine was never launched, close stopped
+		// ourselves to prevent deadlock. stoppedOnce ensures this is safe
+		// even if the goroutine is racing to close it.
+		if !monitorWasLaunched {
+			c.stoppedOnce.Do(func() { close(c.stopped) })
+		}
 		return
 	}
 	c.running = false

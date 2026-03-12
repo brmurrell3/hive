@@ -1,8 +1,6 @@
-name: Build Rootfs Images
+name: Build Rootfs Images (Manual)
 
 on:
-  release:
-    types: [created]
   workflow_dispatch:
     inputs:
       variant:
@@ -16,18 +14,14 @@ on:
           - openclaw
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-rootfs:
     strategy:
       matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm64
-    runs-on: ${{ matrix.runner }}
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +39,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y e2fsprogs
 
       - name: Build base rootfs
-        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'base' || github.event_name == 'release'
+        if: inputs.variant == 'all' || inputs.variant == 'base'
         run: |
           cd rootfs
           chmod +x build-rootfs.sh
@@ -54,7 +48,7 @@ jobs:
           sha256sum hive-rootfs-base-${{ matrix.arch }}.ext4.gz > hive-rootfs-base-${{ matrix.arch }}.ext4.gz.sha256
 
       - name: Build OpenClaw rootfs
-        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'openclaw' || github.event_name == 'release'
+        if: inputs.variant == 'all' || inputs.variant == 'openclaw'
         run: |
           cd rootfs
           chmod +x build-rootfs-openclaw.sh
@@ -62,20 +56,22 @@ jobs:
           gzip -9 hive-rootfs-openclaw-${{ matrix.arch }}.ext4
           sha256sum hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz > hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz.sha256
 
-      - name: Upload release assets
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
+      - name: Download Firecracker kernel
         run: |
-          cd rootfs
-          for f in *.ext4.gz *.sha256; do
-            [ -f "$f" ] && gh release upload "$TAG_NAME" "$f" --clobber
-          done
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            FC_ARCH="x86_64"
+          else
+            FC_ARCH="aarch64"
+          fi
+          KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${FC_ARCH}/kernels/vmlinux.bin"
+          echo "Downloading kernel from ${KERNEL_URL}..."
+          curl -fSL -o "rootfs/vmlinux-${{ matrix.arch }}" "${KERNEL_URL}"
+          sha256sum "rootfs/vmlinux-${{ matrix.arch }}" > "rootfs/vmlinux-${{ matrix.arch }}.sha256"
 
       - name: Upload artifacts
-        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: rootfs-${{ matrix.arch }}
-          path: rootfs/*.ext4.gz*
+          path: |
+            rootfs/*.ext4.gz*
+            rootfs/vmlinux-*

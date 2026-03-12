@@ -60,6 +60,11 @@ type VMConfig struct {
 	RootfsPath    string `yaml:"rootfsPath,omitempty" json:"rootfsPath,omitempty"`
 	TotalMemoryMB int64  `yaml:"totalMemoryMB,omitempty" json:"totalMemoryMB,omitempty"` // Total memory available for VMs (0 = unlimited)
 	TotalVCPUs    int64  `yaml:"totalVCPUs,omitempty" json:"totalVCPUs,omitempty"`       // Total vCPUs available for VMs (0 = unlimited)
+	// ImageURL overrides the default GitHub Releases URL for downloading kernel
+	// and rootfs images. This supports air-gapped environments where images are
+	// hosted on an internal mirror or local file server. Must use https:// or
+	// file:// scheme.
+	ImageURL string `yaml:"imageURL,omitempty" json:"imageURL,omitempty"`
 }
 
 // UserConfig defines a user entry for multi-user mode.

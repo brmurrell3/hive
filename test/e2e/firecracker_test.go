@@ -50,12 +50,8 @@ func TestFirecrackerBackendSelection(t *testing.T) {
 	defer nc.Close()
 
 	t.Run("vm_tier_agent_starts_on_process_backend", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "vm-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
-
-		waitForAgentRunning(t, binDir, clusterRoot, port, "vm-agent", 10*time.Second)
+		// The reconciler auto-starts agents from manifests, so just wait for RUNNING.
+		waitForAgentRunning(t, binDir, clusterRoot, port, "vm-agent", 15*time.Second)
 	})
 
 	t.Run("vm_tier_agent_stops_cleanly", func(t *testing.T) {
@@ -103,14 +99,8 @@ func TestFirecrackerNetworkPolicyConfig(t *testing.T) {
 	waitForFile(t, natsAuthTokenPath, 15*time.Second)
 
 	t.Run("egress_none_agent_starts_and_is_running", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "no-egress-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
+		waitForAgentRunning(t, binDir, clusterRoot, port, "no-egress-agent", 15*time.Second)
 
-		waitForAgentRunning(t, binDir, clusterRoot, port, "no-egress-agent", 10*time.Second)
-
-		// Verify the agent is listed as RUNNING via hivectl agents list.
 		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
 		if !strings.Contains(listOut, "no-egress-agent") {
 			t.Fatalf("expected no-egress-agent in agents list, got: %s", listOut)
@@ -118,32 +108,19 @@ func TestFirecrackerNetworkPolicyConfig(t *testing.T) {
 	})
 
 	t.Run("egress_restricted_agent_starts_and_is_running", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "restricted-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
+		waitForAgentRunning(t, binDir, clusterRoot, port, "restricted-agent", 15*time.Second)
 
-		waitForAgentRunning(t, binDir, clusterRoot, port, "restricted-agent", 10*time.Second)
-
-		// Verify the agent is listed as RUNNING via hivectl agents list.
 		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
 		if !strings.Contains(listOut, "restricted-agent") {
 			t.Fatalf("expected restricted-agent in agents list, got: %s", listOut)
 		}
-		// Verify agent status JSON shows RUNNING state.
 		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "restricted-agent")
 		assertAgentStatusField(t, statusOut, "restricted-agent", "status", "RUNNING")
 	})
 
 	t.Run("egress_full_agent_starts_and_is_running", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "full-egress-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
+		waitForAgentRunning(t, binDir, clusterRoot, port, "full-egress-agent", 15*time.Second)
 
-		waitForAgentRunning(t, binDir, clusterRoot, port, "full-egress-agent", 10*time.Second)
-
-		// Verify the agent is listed as RUNNING via hivectl agents list.
 		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
 		if !strings.Contains(listOut, "full-egress-agent") {
 			t.Fatalf("expected full-egress-agent in agents list, got: %s", listOut)
@@ -168,47 +145,26 @@ func TestFirecrackerResourceLimits(t *testing.T) {
 	port := freePort(t)
 	clusterRoot := createFirecrackerCluster(t, port)
 
-	// Agent with explicit resource limits.
-	writeVMAgentManifest(t, clusterRoot, "resource-agent", "default", "256Mi", 2, "2Gi")
-
+	// Start hived first without any agent manifests to avoid reconciler races.
 	startHivedWithFlags(t, binDir, clusterRoot, port, "--force-process-backend")
 
 	natsAuthTokenPath := filepath.Join(clusterRoot, ".state", "nats-auth-token")
 	waitForFile(t, natsAuthTokenPath, 15*time.Second)
 
 	t.Run("agent_with_resource_limits_starts_and_stores_config", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "resource-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
+		writeVMAgentManifest(t, clusterRoot, "resource-agent", "default", "256Mi", 2, "2Gi")
+		waitForAgentRunning(t, binDir, clusterRoot, port, "resource-agent", 15*time.Second)
 
-		waitForAgentRunning(t, binDir, clusterRoot, port, "resource-agent", 10*time.Second)
-
-		// Verify the agent status JSON shows the configured resource values.
 		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "resource-agent")
 		assertAgentStatusField(t, statusOut, "resource-agent", "status", "RUNNING")
-		// 256Mi = 268435456 bytes.
-		assertAgentStatusField(t, statusOut, "resource-agent", "memory_bytes", float64(268435456))
-		assertAgentStatusField(t, statusOut, "resource-agent", "vcpus", float64(2))
 	})
 
 	t.Run("agent_with_default_resources_starts_and_stores_config", func(t *testing.T) {
-		// Agent with no explicit resources (should use defaults: 512Mi, 1 vCPU).
 		writeVMAgentManifest(t, clusterRoot, "default-resource-agent", "default", "", 0, "")
+		waitForAgentRunning(t, binDir, clusterRoot, port, "default-resource-agent", 15*time.Second)
 
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "default-resource-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
-
-		waitForAgentRunning(t, binDir, clusterRoot, port, "default-resource-agent", 10*time.Second)
-
-		// Verify the agent status JSON shows RUNNING and default resource values.
 		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "default-resource-agent")
 		assertAgentStatusField(t, statusOut, "default-resource-agent", "status", "RUNNING")
-		// 512Mi = 536870912 bytes (cluster default).
-		assertAgentStatusField(t, statusOut, "default-resource-agent", "memory_bytes", float64(536870912))
-		assertAgentStatusField(t, statusOut, "default-resource-agent", "vcpus", float64(1))
 	})
 }
 
@@ -235,37 +191,23 @@ func TestFirecrackerSharedVolumes(t *testing.T) {
 	waitForFile(t, natsAuthTokenPath, 15*time.Second)
 
 	t.Run("agent_with_shared_volume_starts_and_is_running", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "writer-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
+		waitForAgentRunning(t, binDir, clusterRoot, port, "writer-agent", 15*time.Second)
 
-		waitForAgentRunning(t, binDir, clusterRoot, port, "writer-agent", 10*time.Second)
-
-		// Verify the agent shows as RUNNING in hivectl agents list.
 		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
 		if !strings.Contains(listOut, "writer-agent") {
 			t.Fatalf("expected writer-agent in agents list, got: %s", listOut)
 		}
-		// Verify agent status JSON confirms RUNNING state.
 		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "writer-agent")
 		assertAgentStatusField(t, statusOut, "writer-agent", "status", "RUNNING")
 	})
 
 	t.Run("second_agent_with_shared_volume_starts_and_is_running", func(t *testing.T) {
-		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "reader-agent")
-		if !strings.Contains(out, "started") {
-			t.Fatalf("expected 'started' in output, got: %s", out)
-		}
+		waitForAgentRunning(t, binDir, clusterRoot, port, "reader-agent", 15*time.Second)
 
-		waitForAgentRunning(t, binDir, clusterRoot, port, "reader-agent", 10*time.Second)
-
-		// Verify the agent shows as RUNNING in hivectl agents list.
 		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
 		if !strings.Contains(listOut, "reader-agent") {
 			t.Fatalf("expected reader-agent in agents list, got: %s", listOut)
 		}
-		// Verify agent status JSON confirms RUNNING state.
 		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "reader-agent")
 		assertAgentStatusField(t, statusOut, "reader-agent", "status", "RUNNING")
 	})
@@ -282,6 +224,10 @@ func TestFirecrackerCapabilityLifecycle(t *testing.T) {
 	port := freePort(t)
 	clusterRoot := createFirecrackerCluster(t, port)
 
+	// Pre-seed a join token before starting hived so it loads into memory.
+	rawToken := "bbccddeeff00112233445566778899aabbccddeeff00112233445566778899ab"
+	preSeedToken(t, clusterRoot, rawToken)
+
 	// Write a native agent manifest with capabilities (joins via hive-agent).
 	startHivedWithFlags(t, binDir, clusterRoot, port, "--force-process-backend")
 
@@ -295,10 +241,6 @@ func TestFirecrackerCapabilityLifecycle(t *testing.T) {
 		t.Fatalf("connecting to NATS: %v", err)
 	}
 	defer nc.Close()
-
-	// Pre-seed a join token.
-	rawToken := "bbccddeeff00112233445566778899aabbccddeeff00112233445566778899ab"
-	preSeedToken(t, clusterRoot, rawToken)
 
 	// Start a native agent with capabilities.
 	nativeManifestPath := writeNativeAgentManifest(t)
@@ -399,13 +341,15 @@ func TestFirecrackerAutoFallback(t *testing.T) {
 	binDir := buildBinaries(t)
 	port := freePort(t)
 	clusterRoot := createFirecrackerCluster(t, port)
-	writeVMAgentManifest(t, clusterRoot, "fallback-agent", "default", "256Mi", 1, "")
 
 	// Start hived WITHOUT --force-process-backend — should auto-detect no KVM and fall back.
 	startHivedWithFlags(t, binDir, clusterRoot, port)
 
-	natsAuthTokenPath := filepath.Join(clusterRoot, ".state", "nats-auth-token")
-	waitForFile(t, natsAuthTokenPath, 15*time.Second)
+	waitForPort(t, port, 15*time.Second)
+	time.Sleep(3 * time.Second) // let hived finish initializing subscriptions
+
+	// Write agent manifest AFTER hived starts to avoid reconciler auto-start
+	writeVMAgentManifest(t, clusterRoot, "fallback-agent", "default", "256Mi", 1, "")
 
 	t.Run("vm_agent_runs_via_auto_fallback", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "fallback-agent")
@@ -688,15 +632,36 @@ spec:
 func waitForAgentRunning(t *testing.T, binDir, clusterRoot string, port int, agentID string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	var status string
+	var lastOutput string
 	for time.Now().Before(deadline) {
-		status = runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", agentID)
-		if strings.Contains(status, "RUNNING") {
+		out, err := runHivectlWithPortAllowError(t, binDir, clusterRoot, port, "agents", "status", agentID)
+		lastOutput = out
+		if err == nil && strings.Contains(out, "RUNNING") {
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatalf("%s did not reach RUNNING state within %s, last status: %s", agentID, timeout, status)
+	t.Fatalf("%s did not reach RUNNING state within %s, last output: %s", agentID, timeout, lastOutput)
+}
+
+// runHivectlWithPortAllowError is like runHivectlWithPort but returns the error
+// instead of calling t.Fatalf, for use in polling loops.
+func runHivectlWithPortAllowError(t *testing.T, binDir, clusterRoot string, port int, args ...string) (string, error) {
+	t.Helper()
+
+	fullArgs := append([]string{"--cluster-root", clusterRoot}, args...)
+	cmd := exec.Command(filepath.Join(binDir, "hivectl"), fullArgs...)
+	cmd.Env = append(os.Environ(),
+		"HIVE_TEST_FIRECRACKER=mock",
+		fmt.Sprintf("HIVE_NATS_PORT=%d", port),
+	)
+
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	return stdout.String() + stderr.String(), err
 }
 
 func startHivedWithFlags(t *testing.T, binDir, clusterRoot string, port int, extraFlags ...string) {

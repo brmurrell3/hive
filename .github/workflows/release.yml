@@ -1,52 +1,286 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
-  release:
-    name: Release
+  check:
+    name: Gate on CI
     runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Extract tag
+        id: tag
+        run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG}"
+
+  goreleaser:
+    name: GoReleaser
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release_id.outputs.id }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.check.outputs.tag }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Build release binaries
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SBOMs
         run: |
-          VERSION=${GITHUB_REF_NAME}
-          LDFLAGS="-X main.version=${VERSION}"
-
-          for PAIR in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            OS=${PAIR%/*}
-            ARCH=${PAIR#*/}
-            DIR="dist/hive-${VERSION}-${OS}-${ARCH}"
-            mkdir -p "${DIR}"
-
-            CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build -ldflags "${LDFLAGS}" -o "${DIR}/hived" ./cmd/hived
-            CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build -ldflags "${LDFLAGS}" -o "${DIR}/hivectl" ./cmd/hivectl
-            CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build -ldflags "${LDFLAGS}" -o "${DIR}/hive-agent" ./cmd/hive-agent
-            CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build -ldflags "${LDFLAGS}" -o "${DIR}/hive-sidecar" ./cmd/hive-sidecar
-
-            tar -czf "dist/hive-${VERSION}-${OS}-${ARCH}.tar.gz" -C dist "hive-${VERSION}-${OS}-${ARCH}"
+          for archive in dist/*.tar.gz; do
+            [ -f "$archive" ] || continue
+            base="$(basename "$archive" .tar.gz)"
+            syft "$archive" -o cyclonedx-json > "dist/${base}.sbom.json"
           done
 
-      - name: Generate checksums
-        run: cd dist && sha256sum *.tar.gz > sha256sums.txt
+      - name: Upload SBOMs to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          for sbom in dist/*.sbom.json; do
+            [ -f "$sbom" ] || continue
+            gh release upload "$TAG" "$sbom" --clobber
+          done
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Get release ID
+        id: release_id
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          ID=$(gh api "repos/${{ github.repository }}/releases" --jq ".[] | select(.tag_name==\"${TAG}\") | .id")
+          echo "id=${ID}" >> "$GITHUB_OUTPUT"
+
+  sign:
+    name: Sign Checksums
+    needs: [check, goreleaser]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "checksums.txt" --dir .
+
+      - name: Sign checksums with cosign (keyless)
+        run: cosign sign-blob --yes checksums.txt --output-signature checksums.txt.sig --output-certificate checksums.txt.pem
+
+      - name: Upload signature and certificate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          gh release upload "$TAG" checksums.txt.sig checksums.txt.pem --repo "${{ github.repository }}" --clobber
+
+  rootfs:
+    name: Build Rootfs (${{ matrix.arch }})
+    needs: [check, goreleaser]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
         with:
-          generate_release_notes: true
-          files: |
-            dist/*.tar.gz
-            dist/sha256sums.txt
+          ref: ${{ needs.check.outputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build hive-sidecar
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -o hive-sidecar ./cmd/hive-sidecar/
+
+      - name: Install e2fsprogs
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Build base rootfs
+        run: |
+          cd rootfs
+          chmod +x build-rootfs.sh
+          ./build-rootfs.sh hive-rootfs-base-${{ matrix.arch }}.ext4 512M ../hive-sidecar
+          gzip -9 hive-rootfs-base-${{ matrix.arch }}.ext4
+          sha256sum hive-rootfs-base-${{ matrix.arch }}.ext4.gz > hive-rootfs-base-${{ matrix.arch }}.ext4.gz.sha256
+
+      - name: Build OpenClaw rootfs
+        run: |
+          cd rootfs
+          chmod +x build-rootfs-openclaw.sh
+          ./build-rootfs-openclaw.sh hive-rootfs-openclaw-${{ matrix.arch }}.ext4 1G ../hive-sidecar
+          gzip -9 hive-rootfs-openclaw-${{ matrix.arch }}.ext4
+          sha256sum hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz > hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz.sha256
+
+      - name: Download Firecracker kernel
+        run: |
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            FC_ARCH="x86_64"
+          else
+            FC_ARCH="aarch64"
+          fi
+          KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${FC_ARCH}/kernels/vmlinux.bin"
+          echo "Downloading kernel from ${KERNEL_URL}..."
+          curl -fSL -o "rootfs/vmlinux-${{ matrix.arch }}" "${KERNEL_URL}"
+          sha256sum "rootfs/vmlinux-${{ matrix.arch }}" > "rootfs/vmlinux-${{ matrix.arch }}.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          cd rootfs
+          for f in *.ext4.gz *.sha256 vmlinux-*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
+          done
+
+  attestation:
+    name: SLSA Provenance
+    needs: [check, sign, rootfs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          mkdir -p artifacts
+          gh release download "$TAG" --repo "${{ github.repository }}" --dir artifacts
+
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'artifacts/*'
+
+  finalize:
+    name: Finalize Release
+    needs: [check, goreleaser, attestation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append verification instructions to release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          REPO="${{ github.repository }}"
+
+          EXISTING_BODY=$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body')
+
+          read -r -d '' VERIFY_DOCS <<'VEOF' || true
+
+          ---
+
+          ## Verifying Release Artifacts
+
+          ### SHA-256 Checksums
+          ```bash
+          curl -fSLO https://github.com/REPO/releases/download/TAG/checksums.txt
+          sha256sum --check --ignore-missing checksums.txt
+          ```
+
+          ### Cosign Signature (keyless)
+          ```bash
+          curl -fSLO https://github.com/REPO/releases/download/TAG/checksums.txt
+          curl -fSLO https://github.com/REPO/releases/download/TAG/checksums.txt.sig
+          curl -fSLO https://github.com/REPO/releases/download/TAG/checksums.txt.pem
+          cosign verify-blob checksums.txt \
+            --signature checksums.txt.sig \
+            --certificate checksums.txt.pem \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp 'github\.com/REPO'
+          ```
+
+          ### SLSA Provenance
+          ```bash
+          gh attestation verify <artifact-file> --repo REPO
+          ```
+
+          ### SBOMs
+          CycloneDX SBOMs are attached for each platform archive (`*.sbom.json`).
+          VEOF
+
+          VERIFY_DOCS="${VERIFY_DOCS//REPO/$REPO}"
+          VERIFY_DOCS="${VERIFY_DOCS//TAG/$TAG}"
+
+          FULL_BODY="${EXISTING_BODY}${VERIFY_DOCS}"
+
+          gh release edit "$TAG" --repo "$REPO" --draft=false --notes "$FULL_BODY"
+
+  validate:
+    name: Post-Release Validation
+    needs: [check, finalize]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Download and verify release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          VERSION="${TAG#v}"
+          ARCH="${{ matrix.arch }}"
+          TARBALL="hive-${VERSION}-linux-${ARCH}.tar.gz"
+
+          echo "Downloading ${TARBALL}..."
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern "$TARBALL" --pattern "checksums.txt" --dir .
+
+          echo "Verifying checksum..."
+          grep "$TARBALL" checksums.txt | sha256sum --check
+
+          echo "Extracting..."
+          mkdir -p extracted
+          tar -xzf "$TARBALL" -C extracted --strip-components=1
+
+          echo "Checking binaries exist..."
+          for bin in hived hivectl hive-agent hive-sidecar; do
+            test -f "extracted/${bin}" || { echo "MISSING: ${bin}"; exit 1; }
+            echo "  OK: ${bin}"
+          done
+
+      - name: Verify binary execution (amd64 only)
+        if: matrix.arch == 'amd64'
+        run: |
+          chmod +x extracted/*
+          extracted/hived --version
+          extracted/hivectl version
+          extracted/hive-agent version
+          extracted/hive-sidecar --version

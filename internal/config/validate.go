@@ -248,6 +248,13 @@ func validateCluster(cfg *types.ClusterConfig) error {
 	if cfg.Spec.VM.RootfsPath != "" && strings.Contains(cfg.Spec.VM.RootfsPath, "..") {
 		ve.add("spec.vm.rootfsPath contains path traversal")
 	}
+	if cfg.Spec.VM.ImageURL != "" {
+		if strings.Contains(cfg.Spec.VM.ImageURL, "..") {
+			ve.add("spec.vm.imageURL contains path traversal")
+		} else if !strings.HasPrefix(cfg.Spec.VM.ImageURL, "https://") && !strings.HasPrefix(cfg.Spec.VM.ImageURL, "file://") {
+			ve.add("spec.vm.imageURL must use https:// or file:// scheme")
+		}
+	}
 
 	// Validate model configs.
 	for i, model := range cfg.Spec.Models {
