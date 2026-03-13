@@ -4,6 +4,7 @@
 package vm
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -33,7 +34,7 @@ func NewMockHypervisor() *MockHypervisor {
 // CreateVM simulates VM creation by recording the socket path.
 // Returns a synthetic PID for the created VM process. The same PID will be
 // used by StartVM so that callers see consistent PID values.
-func (m *MockHypervisor) CreateVM(cfg VMConfig) (int, error) {
+func (m *MockHypervisor) CreateVM(_ context.Context, cfg VMConfig) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

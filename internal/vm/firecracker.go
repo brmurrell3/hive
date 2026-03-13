@@ -174,7 +174,7 @@ func (f *FirecrackerHypervisor) claimProcess(socketPath string) *firecrackerProc
 // CreateVM spawns the Firecracker process and configures the VM via the API
 // socket. The VM is configured but not started (use StartVM for that).
 // Returns the process PID on success.
-func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
+func (f *FirecrackerHypervisor) CreateVM(_ context.Context, cfg VMConfig) (int, error) {
 	f.logger.Info("creating Firecracker VM",
 		"agent_id", cfg.AgentID,
 		"socket", cfg.SocketPath,

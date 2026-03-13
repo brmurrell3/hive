@@ -829,10 +829,11 @@ func TestStartAgent_SocketPathTooLong(t *testing.T) {
 }
 
 func TestStartAgent_SocketPathShortEnough(t *testing.T) {
-	// Use a short cluster root that is well within the limit.
-	dir := "/tmp/hv"
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Skipf("cannot create %s: %v", dir, err)
+	// Use a short, unique cluster root that is well within the limit.
+	// Avoids hardcoded paths that may collide across parallel test runs.
+	dir, mkErr := os.MkdirTemp("/tmp", "hv")
+	if mkErr != nil {
+		t.Skipf("cannot create temp dir: %v", mkErr)
 	}
 	defer os.RemoveAll(dir)
 
@@ -878,6 +879,141 @@ func contains(s, substr string) bool {
 }
 
 func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Resource accounting: memory limit enforcement
+// ---------------------------------------------------------------------------
+
+func testManagerWithLimits(t *testing.T, totalMemoryMB int64, totalVCPUs int64) (*Manager, *MockHypervisor, *state.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	store, err := state.NewStore(filepath.Join(dir, "state.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := NewMockHypervisor()
+	mgr := NewManager(dir, store, logger, mock, 0, "", totalMemoryMB, totalVCPUs)
+	mgr.skipSocketPathValidation = true
+
+	rootfsDir := filepath.Join(dir, "rootfs")
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "vmlinux"), []byte("fake-kernel"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "rootfs.ext4"), []byte("fake-rootfs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	return mgr, mock, store
+}
+
+func TestStartAgent_ExceedsMemoryLimit(t *testing.T) {
+	// Total memory is 256MB, but the default agent requests 512MB.
+	mgr, _, _ := testManagerWithLimits(t, 256, 0)
+
+	err := mgr.StartAgent(context.Background(), testAgent("mem-hog"))
+	if err == nil {
+		t.Fatal("expected error when agent exceeds memory limit, got nil")
+	}
+	if !containsStr(err.Error(), "insufficient memory") {
+		t.Errorf("error = %q, expected it to mention 'insufficient memory'", err.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resource accounting: vCPU limit enforcement
+// ---------------------------------------------------------------------------
+
+func TestStartAgent_ExceedsVCPULimit(t *testing.T) {
+	// Total vCPUs is 1, but the default test agent requests 2 vCPUs.
+	mgr, _, _ := testManagerWithLimits(t, 0, 1)
+
+	err := mgr.StartAgent(context.Background(), testAgent("cpu-hog"))
+	if err == nil {
+		t.Fatal("expected error when agent exceeds vCPU limit, got nil")
+	}
+	if !containsStr(err.Error(), "insufficient vCPUs") {
+		t.Errorf("error = %q, expected it to mention 'insufficient vCPUs'", err.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resource accounting: resources released after stop, allowing new start
+// ---------------------------------------------------------------------------
+
+func TestStartAgent_ResourcesReleasedAfterStop(t *testing.T) {
+	// Total memory is 600MB — enough for one 512MB agent but not two.
+	mgr, _, _ := testManagerWithLimits(t, 600, 0)
+
+	if err := mgr.StartAgent(context.Background(), testAgent("first")); err != nil {
+		t.Fatalf("StartAgent(first): %v", err)
+	}
+
+	// Second agent should fail — not enough memory.
+	err := mgr.StartAgent(context.Background(), testAgent("second"))
+	if err == nil {
+		t.Fatal("expected error starting second agent with insufficient memory, got nil")
+	}
+
+	// Stop the first agent to release resources.
+	if err := mgr.StopAgent(context.Background(), "first"); err != nil {
+		t.Fatalf("StopAgent(first): %v", err)
+	}
+
+	// Now the second agent should succeed since resources were freed.
+	if err := mgr.StartAgent(context.Background(), testAgent("second")); err != nil {
+		t.Fatalf("StartAgent(second) after stop: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resource accounting: maxVMs limit enforcement
+// ---------------------------------------------------------------------------
+
+func TestStartAgent_MaxVMsEnforced(t *testing.T) {
+	mgr, _, _ := testManagerWithLimits(t, 0, 0)
+	// Set maxVMs to 2 (unexported field, accessible within same package).
+	mgr.maxVMs = 2
+
+	// Start two agents successfully.
+	if err := mgr.StartAgent(context.Background(), testAgent("vm1")); err != nil {
+		t.Fatalf("StartAgent(vm1): %v", err)
+	}
+	if err := mgr.StartAgent(context.Background(), testAgent("vm2")); err != nil {
+		t.Fatalf("StartAgent(vm2): %v", err)
+	}
+
+	// Third agent should be rejected.
+	err := mgr.StartAgent(context.Background(), testAgent("vm3"))
+	if err == nil {
+		t.Fatal("expected error when maxVMs limit reached, got nil")
+	}
+	if !containsStr(err.Error(), "maximum VM count") {
+		t.Errorf("error = %q, expected it to mention 'maximum VM count'", err.Error())
+	}
+
+	// Stop one agent and verify the third can now start.
+	if err := mgr.StopAgent(context.Background(), "vm1"); err != nil {
+		t.Fatalf("StopAgent(vm1): %v", err)
+	}
+	if err := mgr.StartAgent(context.Background(), testAgent("vm3")); err != nil {
+		t.Fatalf("StartAgent(vm3) after stop: %v", err)
+	}
+}
+
+// containsStr reports whether s contains the given substring.
+// Uses strings.Contains from the standard library.
+func containsStr(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
 			return true

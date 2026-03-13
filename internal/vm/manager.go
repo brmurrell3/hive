@@ -33,7 +33,7 @@ type Hypervisor interface {
 	// CreateVM creates a new VM from the given configuration. The VM is not
 	// started yet; the Firecracker process is spawned and configured.
 	// Returns the process PID and any error.
-	CreateVM(cfg VMConfig) (int, error)
+	CreateVM(ctx context.Context, cfg VMConfig) (int, error)
 
 	// StartVM boots a previously created VM via its API socket.
 	StartVM(socketPath string) error
@@ -96,6 +96,7 @@ type Manager struct {
 	totalVCPUs     int64    // Total vCPUs available for VMs (0 = unlimited)
 	allocatedMemMB int64    // Currently allocated memory across all VMs
 	allocatedVCPUs int64    // Currently allocated vCPUs across all VMs
+	activeVMs      int      // Currently active VMs (protected by mu, used for maxVMs check)
 	maxVMs         int      // Maximum number of concurrent VMs (0 = unlimited)
 	freeCIDs       []uint32 // CID reclamation pool
 
@@ -206,17 +207,8 @@ func (m *Manager) releaseCID(cid uint32) {
 // so, marks them as allocated in a single critical section. Must be called
 // with m.mu held.
 func (m *Manager) checkAndAllocateResources(memMB int64, vcpus int64) error {
-	if m.maxVMs > 0 {
-		activeCount := 0
-		for _, a := range m.store.AllAgents() {
-			if a.Status == state.AgentStatusRunning || a.Status == state.AgentStatusStarting ||
-				a.Status == state.AgentStatusCreating {
-				activeCount++
-			}
-		}
-		if activeCount >= m.maxVMs {
-			return fmt.Errorf("maximum VM count (%d) reached", m.maxVMs)
-		}
+	if m.maxVMs > 0 && m.activeVMs >= m.maxVMs {
+		return fmt.Errorf("maximum VM count (%d) reached", m.maxVMs)
 	}
 	if m.totalMemoryMB > 0 && m.allocatedMemMB+memMB > m.totalMemoryMB {
 		return fmt.Errorf("insufficient memory: need %dMB, available %dMB", memMB, m.totalMemoryMB-m.allocatedMemMB)
@@ -228,6 +220,7 @@ func (m *Manager) checkAndAllocateResources(memMB int64, vcpus int64) error {
 	// Resources available — allocate them while still under the lock.
 	m.allocatedMemMB += memMB
 	m.allocatedVCPUs += vcpus
+	m.activeVMs++
 	return nil
 }
 
@@ -250,6 +243,13 @@ func (m *Manager) releaseResources(memMB int64, vcpus int64) {
 			"released_vcpus", vcpus,
 		)
 		m.allocatedVCPUs = 0
+	}
+	m.activeVMs--
+	if m.activeVMs < 0 {
+		m.logger.Warn("active VM count went negative, clamping to zero (possible double-release bug)",
+			"computed_value", m.activeVMs,
+		)
+		m.activeVMs = 0
 	}
 }
 
@@ -419,7 +419,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			if bytes.ContainsAny(allowlistJSON, "\n\r") {
 				return fmt.Errorf("egress allowlist JSON contains newline characters")
 			}
-			confContent += fmt.Sprintf("HIVE_EGRESS_ALLOWLIST='%s'\n", string(allowlistJSON))
+			// Shell-escape single quotes for safe embedding in single-quoted strings.
+			escapedAllowlist := strings.ReplaceAll(string(allowlistJSON), "'", "'\\''")
+			confContent += fmt.Sprintf("HIVE_EGRESS_ALLOWLIST='%s'\n", escapedAllowlist)
 		}
 
 		// In restricted egress mode, the guest needs DNS resolution pointed at
@@ -441,7 +443,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		if bytes.ContainsAny(capsJSON, "\n\r") {
 			return fmt.Errorf("capabilities JSON contains newline characters")
 		}
-		confContent += fmt.Sprintf("CAPABILITIES='%s'\n", string(capsJSON))
+		// Shell-escape single quotes for safe embedding in single-quoted strings.
+		escapedCaps := strings.ReplaceAll(string(capsJSON), "'", "'\\''")
+		confContent += fmt.Sprintf("CAPABILITIES='%s'\n", escapedCaps)
 	}
 
 	// Resolve shared volumes: look up agent volumes against team shared_volumes,
@@ -594,15 +598,23 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	}
 	cidReleased = false // CID now allocated; deferred cleanup will release on failure
 
-	// Build network policy for the VM if egress is configured.
+	// Build network policy for the VM if any network restrictions are configured.
+	// Construct it ONCE here and reuse for both VMConfig and nftables generation.
 	var netPolicy *NetworkPolicy
-	if agent.Spec.Network.Egress != "" {
+	if agent.Spec.Network.Egress != "" || agent.Spec.Network.Ingress != "" {
 		tapDevice := TapDeviceName(agentID)
+		egressMode := agent.Spec.Network.Egress
+		// When only ingress is set without egress, default egress to "full"
+		// so that TAP device creation is triggered for nftables rules.
+		if egressMode == "" {
+			egressMode = egressFull
+		}
 		netPolicy = &NetworkPolicy{
 			TapDevice: tapDevice,
-			Egress:    agent.Spec.Network.Egress,
+			Egress:    egressMode,
 			Allowlist: agent.Spec.Network.EgressAllowlist,
 			Ingress:   agent.Spec.Network.Ingress,
+			GatewayIP: "172.16.0.1",
 		}
 	}
 
@@ -620,8 +632,11 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		Volumes:        volumeMounts,
 	}
 
-	vmPID, err := m.hypervisor.CreateVM(vmCfg)
+	vmPID, err := m.hypervisor.CreateVM(ctx, vmCfg)
 	if err != nil {
+		for _, imgPath := range volumeImgPaths {
+			os.Remove(imgPath)
+		}
 		os.Remove(rootfsCopy)
 		os.Remove(sidecarConf)
 		os.Remove(agentDriveImg)
@@ -629,6 +644,12 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	}
 
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusStarting); err != nil {
+		// VM process is spawned — must destroy it to avoid orphan.
+		m.hypervisor.DestroyVM(socketPath, vmPID)
+		m.stopForwarder(agentID)
+		for _, imgPath := range volumeImgPaths {
+			os.Remove(imgPath)
+		}
 		os.Remove(rootfsCopy)
 		os.Remove(sidecarConf)
 		os.Remove(agentDriveImg)
@@ -643,6 +664,15 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	agentState.VCPUs = vcpus
 	agentState.LastTransition = time.Now()
 	if err := m.store.SetAgent(agentState); err != nil {
+		// VM process is spawned — must destroy it to avoid orphan.
+		m.hypervisor.DestroyVM(socketPath, vmPID)
+		m.stopForwarder(agentID)
+		for _, imgPath := range volumeImgPaths {
+			os.Remove(imgPath)
+		}
+		os.Remove(rootfsCopy)
+		os.Remove(sidecarConf)
+		os.Remove(agentDriveImg)
 		return fmt.Errorf("setting agent state to STARTING: %w", err)
 	}
 
@@ -679,18 +709,13 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// Apply network policy BEFORE booting the VM to prevent a race
 	// window where the VM runs without network restrictions.
 	// Check both egress and ingress: even if egress is "full", ingress
-	// restrictions still require nftables rules.
-	needsNftables := (agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull) ||
-		(agent.Spec.Network.Ingress != "" && agent.Spec.Network.Ingress != egressFull)
+	// restrictions still require nftables rules. Reuse the NetworkPolicy
+	// constructed earlier to avoid drift between VMConfig and nftables.
+	needsNftables := netPolicy != nil &&
+		((netPolicy.Egress != "" && netPolicy.Egress != egressFull) ||
+			(netPolicy.Ingress != "" && netPolicy.Ingress != egressFull))
 	if needsNftables {
-		tapDevice := TapDeviceName(agentID)
-		policy := NetworkPolicy{
-			TapDevice: tapDevice,
-			Egress:    agent.Spec.Network.Egress,
-			Allowlist: agent.Spec.Network.EgressAllowlist,
-			Ingress:   agent.Spec.Network.Ingress,
-		}
-		rules := GenerateNftables(policy)
+		rules := GenerateNftables(*netPolicy)
 		if rules != "" {
 			nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer nftCancel()
@@ -705,6 +730,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 					)
 				}
 				m.stopForwarder(agentID)
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
 				os.Remove(rootfsCopy)
 				os.Remove(sidecarConf)
 				os.Remove(agentDriveImg)
@@ -732,6 +760,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			)
 		}
 		m.stopForwarder(agentID)
+		for _, imgPath := range volumeImgPaths {
+			os.Remove(imgPath)
+		}
 		os.Remove(rootfsCopy)
 		os.Remove(sidecarConf)
 		os.Remove(agentDriveImg)
@@ -955,6 +986,12 @@ func (m *Manager) DestroyAgent(ctx context.Context, agentID string) error {
 		}
 	}
 
+	// Remove sidecar.conf from the agent directory.
+	sidecarConf := filepath.Join(m.clusterRoot, "agents", agentID, "sidecar.conf")
+	if err := os.Remove(sidecarConf); err != nil && !os.IsNotExist(err) {
+		m.logger.Debug("error removing sidecar.conf during destroy", "agent_id", agentID, "path", sidecarConf, "error", err)
+	}
+
 	if capturedRootfsCopyPath != "" {
 		if err := os.Remove(capturedRootfsCopyPath); err != nil && !os.IsNotExist(err) {
 			m.logger.Warn("error removing rootfs copy",
@@ -1079,6 +1116,7 @@ func (m *Manager) ReconcileOnStartup() error {
 	m.mu.Lock()
 	m.allocatedMemMB = 0
 	m.allocatedVCPUs = 0
+	m.activeVMs = 0
 	for _, agent := range agents {
 		if agent.VMCID >= m.nextCID {
 			m.nextCID = agent.VMCID + 1
@@ -1088,6 +1126,7 @@ func (m *Manager) ReconcileOnStartup() error {
 			agent.Status == state.AgentStatusStarting || agent.Status == state.AgentStatusCreating {
 			m.allocatedMemMB += agent.MemoryBytes / (1024 * 1024)
 			m.allocatedVCPUs += int64(agent.VCPUs)
+			m.activeVMs++
 		}
 	}
 	m.mu.Unlock()
@@ -1120,7 +1159,9 @@ func (m *Manager) ReconcileOnStartup() error {
 				// Clean up disk artifacts left behind by the dead VM.
 				m.cleanupAgentArtifacts(agent.ID)
 
-				// Atomically transition to FAILED and capture resource values for release.
+				// Capture resource values for release. Resources were definitively
+				// added during rebuild and the VM is definitively dead, so release
+				// them REGARDLESS of whether ModifyAgent succeeds.
 				agentMemMB := agent.MemoryBytes / (1024 * 1024)
 				agentVCPUs := int64(agent.VCPUs)
 				agentCID := agent.VMCID
@@ -1142,7 +1183,8 @@ func (m *Manager) ReconcileOnStartup() error {
 					)
 				}
 
-				// Release resources and CID after persisting the FAILED state.
+				// Release resources and CID unconditionally: the VM is dead and
+				// resources were added during the rebuild loop above.
 				if agentMemMB > 0 || agentVCPUs > 0 {
 					m.releaseResources(agentMemMB, agentVCPUs)
 				}
@@ -1168,7 +1210,9 @@ func (m *Manager) ReconcileOnStartup() error {
 				// Clean up disk artifacts.
 				m.cleanupAgentArtifacts(agent.ID)
 
-				// Atomically transition to FAILED and capture resource values for release.
+				// Capture resource values for release. Resources were definitively
+				// added during rebuild and the VM is definitively dead, so release
+				// them REGARDLESS of whether ModifyAgent succeeds.
 				agentMemMB := agent.MemoryBytes / (1024 * 1024)
 				agentVCPUs := int64(agent.VCPUs)
 				agentCID := agent.VMCID
@@ -1188,7 +1232,8 @@ func (m *Manager) ReconcileOnStartup() error {
 					)
 				}
 
-				// Release resources and CID after persisting the FAILED state.
+				// Release resources and CID unconditionally: the VM is dead and
+				// resources were added during the rebuild loop above.
 				if agentMemMB > 0 || agentVCPUs > 0 {
 					m.releaseResources(agentMemMB, agentVCPUs)
 				}
@@ -1206,7 +1251,8 @@ func (m *Manager) ReconcileOnStartup() error {
 			// Clean up disk artifacts from interrupted creation.
 			m.cleanupAgentArtifacts(agent.ID)
 
-			// Atomically transition to FAILED and capture resource values for release.
+			// Capture resource values for release. Resources were definitively
+			// added during rebuild, so release them REGARDLESS of ModifyAgent success.
 			agentMemMB := agent.MemoryBytes / (1024 * 1024)
 			agentVCPUs := int64(agent.VCPUs)
 			agentCID := agent.VMCID
@@ -1226,7 +1272,7 @@ func (m *Manager) ReconcileOnStartup() error {
 				)
 			}
 
-			// Release resources and CID after persisting the FAILED state.
+			// Release resources and CID unconditionally.
 			if agentMemMB > 0 || agentVCPUs > 0 {
 				m.releaseResources(agentMemMB, agentVCPUs)
 			}
@@ -1242,6 +1288,8 @@ func (m *Manager) ReconcileOnStartup() error {
 			// Clean up any partial disk artifacts.
 			m.cleanupAgentArtifacts(agent.ID)
 
+			// Capture resource values for release. Resources were definitively
+			// added during rebuild, so release them REGARDLESS of ModifyAgent success.
 			agentMemMB := agent.MemoryBytes / (1024 * 1024)
 			agentVCPUs := int64(agent.VCPUs)
 			agentCID := agent.VMCID
@@ -1261,7 +1309,7 @@ func (m *Manager) ReconcileOnStartup() error {
 				)
 			}
 
-			// Release resources and CID after persisting the FAILED state.
+			// Release resources and CID unconditionally.
 			if agentMemMB > 0 || agentVCPUs > 0 {
 				m.releaseResources(agentMemMB, agentVCPUs)
 			}
@@ -1294,9 +1342,15 @@ func (m *Manager) stopForwarder(agentID string) {
 }
 
 // cleanupAgentArtifacts removes all disk artifacts for a given agent: rootfs copy,
-// socket files, agent drive images, and the agent state directory.
+// socket files, agent drive images, sidecar.conf, and the agent state directory.
 func (m *Manager) cleanupAgentArtifacts(agentID string) {
 	stateDir := filepath.Join(m.clusterRoot, ".state", "agents", agentID)
+
+	// Remove sidecar.conf from the agent directory.
+	sidecarConf := filepath.Join(m.clusterRoot, "agents", agentID, "sidecar.conf")
+	if err := os.Remove(sidecarConf); err != nil && !os.IsNotExist(err) {
+		m.logger.Debug("error removing sidecar.conf during cleanup", "agent_id", agentID, "path", sidecarConf, "error", err)
+	}
 
 	// Remove rootfs copy.
 	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
