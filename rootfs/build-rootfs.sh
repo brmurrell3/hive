@@ -68,7 +68,8 @@ if ! command -v docker &>/dev/null; then
 fi
 
 mkdir -p "$STAGEDIR"
-CONTAINER_ID=$(docker create alpine:3.19 /bin/true)
+CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/sh -c "apk add --no-cache iptables iproute2 && /bin/true")
+docker start -a "$CONTAINER_ID" || true
 docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
 docker rm "$CONTAINER_ID" >/dev/null
 
@@ -129,8 +130,11 @@ fi
 if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
     case "$HIVE_EGRESS_MODE" in
         none)
-            # No network device attached, vsock only - nothing to configure
+            # No network device attached, vsock only - restrict INPUT
             echo "Network policy: egress=none (vsock only)"
+            iptables -P INPUT DROP
+            iptables -A INPUT -i lo -j ACCEPT
+            iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
             ;;
         restricted)
             echo "Network policy: egress=restricted"
@@ -143,25 +147,26 @@ if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
                 # Set up iptables for restricted egress
                 iptables -P OUTPUT DROP
                 iptables -P FORWARD DROP
+                iptables -P INPUT DROP
+                iptables -A INPUT -i lo -j ACCEPT
+                iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
                 # Allow loopback
                 iptables -A OUTPUT -o lo -j ACCEPT
 
-                # Allow DNS to localhost
-                iptables -A OUTPUT -d 127.0.0.1 -p udp --dport 53 -j ACCEPT
-                iptables -A OUTPUT -d 127.0.0.1 -p tcp --dport 53 -j ACCEPT
+                # Allow DNS to gateway
+                iptables -A OUTPUT -d 172.16.0.1 -p udp --dport 53 -j ACCEPT
+                iptables -A OUTPUT -d 172.16.0.1 -p tcp --dport 53 -j ACCEPT
 
                 # Allow established connections
                 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
                 # Parse and allow domains from HIVE_EGRESS_ALLOWLIST (JSON array)
                 if [ -n "${HIVE_EGRESS_ALLOWLIST:-}" ]; then
-                    # Simple JSON array parser for allowlisted domains
-                    echo "$HIVE_EGRESS_ALLOWLIST" | tr -d '[]"' | tr ',' '\n' | while read -r domain; do
-                        domain=$(echo "$domain" | tr -d ' ')
+                    echo "$HIVE_EGRESS_ALLOWLIST" | tr -d '[]"' | tr ',' ' ' | tr ' ' '\n' | while read -r domain; do
                         [ -z "$domain" ] && continue
                         # Resolve domain and add iptables rules for each IP
-                        for ip in $(getent hosts "$domain" 2>/dev/null | awk '{print $1}'); do
+                        for ip in $(nslookup "$domain" 2>/dev/null | awk '/^Address: / { print $2 }'); do
                             iptables -A OUTPUT -d "$ip" -j ACCEPT
                         done
                     done
@@ -184,20 +189,24 @@ fi
 # HIVE_VOLUMES is a pipe-delimited list of device:mount_path:access specs.
 # Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
 # (after vda=rootfs and vdb=agent drive).
-if [ -n "${HIVE_VOLUMES:-}" ]; then
-    echo "$HIVE_VOLUMES" | tr '|' '\n' | while read -r volspec; do
-        [ -z "$volspec" ] && continue
+if [ -n "$HIVE_VOLUMES" ]; then
+    OLD_IFS="$IFS"
+    IFS='|'
+    for volspec in $HIVE_VOLUMES; do
+        IFS="$OLD_IFS"
         device=$(echo "$volspec" | cut -d: -f1)
-        mount_path=$(echo "$volspec" | cut -d: -f2)
+        mountpoint=$(echo "$volspec" | cut -d: -f2)
         access=$(echo "$volspec" | cut -d: -f3)
-        mkdir -p "$mount_path"
+        mkdir -p "$mountpoint"
+        mount_opts="rw"
         if [ "$access" = "ro" ]; then
-            mount -t ext4 -o ro "$device" "$mount_path"
-        else
-            mount -t ext4 "$device" "$mount_path"
+            mount_opts="ro"
         fi
-        echo "Mounted shared volume: $device -> $mount_path ($access)"
+        if ! mount -o "$mount_opts" "$device" "$mountpoint"; then
+            echo "ERROR: failed to mount $device at $mountpoint" >&2
+        fi
     done
+    IFS="$OLD_IFS"
 fi
 
 # Build sidecar arguments safely using positional parameters

@@ -51,6 +51,16 @@ func (v *ValidationError) errorOrNil() error {
 
 var hiveIDRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 var secretRefRegex = regexp.MustCompile(`\$\{([A-Z_][A-Z0-9_]*)\}`)
+var envKeyRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var imageRefRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$`)
+
+// blockedEnvKeys are security-sensitive environment variable names that must not be set.
+var blockedEnvKeys = map[string]bool{
+	"LD_PRELOAD":      true,
+	"LD_LIBRARY_PATH": true,
+	"PATH":            true,
+	"HOME":            true,
+}
 
 // dangerousGuestPaths are system paths that must not be used as mount guest paths.
 var dangerousGuestPaths = map[string]bool{
@@ -68,6 +78,23 @@ var dangerousGuestPaths = map[string]bool{
 	"/boot": true,
 	"/root": true,
 	"/home": true,
+}
+
+// dangerousMountHostPaths are host paths that must not be used as mount host paths.
+var dangerousMountHostPaths = map[string]bool{
+	"/":     true,
+	"/etc":  true,
+	"/root": true,
+	"/var":  true,
+	"/usr":  true,
+	"/boot": true,
+	"/dev":  true,
+	"/proc": true,
+	"/sys":  true,
+	"/home": true,
+	"/bin":  true,
+	"/sbin": true,
+	"/lib":  true,
 }
 
 // validMountPathRegex matches safe mount paths (absolute, alphanumeric with /_.-).
@@ -403,6 +430,25 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Validate runtime.command for path traversal.
+	if agent.Spec.Runtime.Command != "" {
+		cmdTokens := strings.Fields(agent.Spec.Runtime.Command)
+		if len(cmdTokens) == 0 {
+			ve.addf("%s: spec.runtime.command is effectively empty (whitespace only)", prefix)
+		} else if strings.Contains(cmdTokens[0], "..") {
+			ve.addf("%s: spec.runtime.command %q contains path traversal (..)", prefix, cmdTokens[0])
+		}
+	}
+
+	// Validate runtime.image for safety.
+	if agent.Spec.Runtime.Image != "" {
+		if strings.Contains(agent.Spec.Runtime.Image, "..") {
+			ve.addf("%s: spec.runtime.image %q contains path traversal (..)", prefix, agent.Spec.Runtime.Image)
+		} else if !imageRefRegex.MatchString(agent.Spec.Runtime.Image) {
+			ve.addf("%s: spec.runtime.image %q contains invalid characters", prefix, agent.Spec.Runtime.Image)
+		}
+	}
+
 	// Validate tier
 	if agent.Spec.Tier != "" {
 		validTiers := map[string]bool{"vm": true, "native": true}
@@ -549,11 +595,24 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			mountNames[m.Name] = true
 			if m.Host == "" {
 				ve.addf("%s: mount %q host path is required", prefix, m.Name)
+			} else if !strings.HasPrefix(m.Host, "/") {
+				ve.addf("%s: mount %q host path must be an absolute path, got %q", prefix, m.Name, m.Host)
 			} else if strings.Contains(m.Host, "..") {
 				ve.addf("%s: mount %q host path %q contains path traversal (..)", prefix, m.Name, m.Host)
+			} else {
+				// Block dangerous host directories.
+				cleanHost := filepath.Clean(m.Host)
+				for dp := range dangerousMountHostPaths {
+					if cleanHost == dp || strings.HasPrefix(cleanHost, dp+"/") {
+						ve.addf("%s: mount %q host path %q is under dangerous host directory %q", prefix, m.Name, m.Host, dp)
+						break
+					}
+				}
 			}
 			if m.Guest == "" {
 				ve.addf("%s: mount %q guest path is required", prefix, m.Name)
+			} else if !strings.HasPrefix(m.Guest, "/") {
+				ve.addf("%s: mount %q guest path must be an absolute path, got %q", prefix, m.Name, m.Guest)
 			} else {
 				// Use prefix match for dangerous guest paths.
 				cleanGuest := filepath.Clean(m.Guest)
@@ -582,13 +641,30 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 
 	// Validate secrets reference existing cluster secrets.
 	if len(agent.Spec.Secrets) > 0 {
+		seenSecretNames := make(map[string]bool)
+		seenSecretEnvs := make(map[string]bool)
 		for _, s := range agent.Spec.Secrets {
 			if s.Name == "" {
 				ve.addf("%s: secret name is required", prefix)
 				continue
 			}
+			if seenSecretNames[s.Name] {
+				ve.addf("%s: duplicate secret name %q", prefix, s.Name)
+			}
+			seenSecretNames[s.Name] = true
 			if s.Env == "" {
 				ve.addf("%s: secret %q env is required", prefix, s.Name)
+			} else {
+				if !envKeyRegex.MatchString(s.Env) {
+					ve.addf("%s: secret %q env %q is not a valid environment variable name", prefix, s.Name, s.Env)
+				}
+				if blockedEnvKeys[s.Env] {
+					ve.addf("%s: secret %q env %q is a blocked security-sensitive environment variable", prefix, s.Name, s.Env)
+				}
+				if seenSecretEnvs[s.Env] {
+					ve.addf("%s: duplicate secret env %q", prefix, s.Env)
+				}
+				seenSecretEnvs[s.Env] = true
 			}
 			// Cross-reference against cluster secrets.
 			if cluster != nil {
@@ -623,6 +699,14 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		validEgress := map[string]bool{"none": true, "restricted": true, "full": true}
 		if !validEgress[agent.Spec.Network.Egress] {
 			ve.addf("%s: spec.network.egress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Egress)
+		}
+	}
+
+	// Validate network ingress.
+	if agent.Spec.Network.Ingress != "" {
+		validIngress := map[string]bool{"none": true, "restricted": true, "full": true}
+		if !validIngress[agent.Spec.Network.Ingress] {
+			ve.addf("%s: spec.network.ingress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Ingress)
 		}
 	}
 
@@ -689,6 +773,12 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			ve.addf("%s: spec.restart.policy must be one of [always, on-failure, never], got %q", prefix, agent.Spec.Restart.Policy)
 		}
 	}
+	if agent.Spec.Restart.MaxRestarts > 10000 {
+		ve.addf("%s: spec.restart.maxRestarts must be <= 10000, got %d", prefix, agent.Spec.Restart.MaxRestarts)
+	}
+	if agent.Spec.Health.MaxFailures > 10000 {
+		ve.addf("%s: spec.health.maxFailures must be <= 10000, got %d", prefix, agent.Spec.Health.MaxFailures)
+	}
 
 	// Validate ingress configuration.
 	if agent.Spec.Ingress.Port != 0 || agent.Spec.Ingress.Path != "" {
@@ -721,6 +811,16 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 	// Cap environment variables per agent to prevent excessive resource usage.
 	if len(agent.Spec.Runtime.Model.Env) > 1000 {
 		ve.addf("%s: spec.runtime.model.env has %d entries, maximum is 1000", prefix, len(agent.Spec.Runtime.Model.Env))
+	}
+
+	// Validate runtime.model.env keys.
+	for envKey := range agent.Spec.Runtime.Model.Env {
+		if !envKeyRegex.MatchString(envKey) {
+			ve.addf("%s: spec.runtime.model.env key %q is not a valid environment variable name", prefix, envKey)
+		}
+		if blockedEnvKeys[envKey] {
+			ve.addf("%s: spec.runtime.model.env key %q is a blocked security-sensitive environment variable", prefix, envKey)
+		}
 	}
 
 	// Rule 6: Validate secret references (${SECRET_NAME}) in runtime.model.env
@@ -824,7 +924,7 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 			ve.addf("%s: shared_volume %q hostPath %q contains path traversal (..)", prefix, vol.Name, vol.HostPath)
 		} else {
 			// Block dangerous host directories that should never be shared into VMs.
-			dangerousHostPaths := []string{"/etc", "/root", "/var", "/usr", "/boot", "/dev", "/proc", "/sys", "/home"}
+			dangerousHostPaths := []string{"/", "/etc", "/root", "/var", "/usr", "/boot", "/dev", "/proc", "/sys", "/home", "/bin", "/sbin", "/lib", "/tmp"}
 			cleanHost := filepath.Clean(vol.HostPath)
 			for _, dp := range dangerousHostPaths {
 				if cleanHost == dp || strings.HasPrefix(cleanHost, dp+"/") {
@@ -842,7 +942,7 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 			continue // already reported above
 		}
 		if sv.Access != "" && !validSharedVolumeAccess[sv.Access] {
-			ve.addf("%s: shared_volume %q access must be one of [ro, rw], got %q", prefix, sv.Name, sv.Access)
+			ve.addf("%s: shared_volume %q access must be one of [ro, rw, read-only, read-write], got %q", prefix, sv.Name, sv.Access)
 		}
 	}
 }

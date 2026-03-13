@@ -182,21 +182,21 @@ func (m *AgentManager) RestartAgent(ctx context.Context, agentID string, spec *t
 }
 
 // Status returns the status of an agent.
-func (m *AgentManager) Status(agentID string) (InstanceStatus, error) {
+func (m *AgentManager) Status(ctx context.Context, agentID string) (InstanceStatus, error) {
 	b, err := m.getBackendForAgent(agentID)
 	if err != nil {
 		return InstanceStatus{State: "unknown"}, err
 	}
-	return b.Status(context.Background(), agentID)
+	return b.Status(ctx, agentID)
 }
 
 // Logs returns a log reader for an agent.
-func (m *AgentManager) Logs(agentID string, opts LogOpts) (io.ReadCloser, error) {
+func (m *AgentManager) Logs(ctx context.Context, agentID string, opts LogOpts) (io.ReadCloser, error) {
 	b, err := m.getBackendForAgent(agentID)
 	if err != nil {
 		return nil, err
 	}
-	return b.Logs(context.Background(), agentID, opts)
+	return b.Logs(ctx, agentID, opts)
 }
 
 // StopVM implements the production.VMAccess interface for graceful shutdown.

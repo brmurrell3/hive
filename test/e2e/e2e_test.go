@@ -23,10 +23,6 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-const (
-	natsPort = 14222
-)
-
 // TestHiveE2E runs the full end-to-end lifecycle test.
 // It builds the real binaries, starts hived as a subprocess with mock Firecracker,
 // then exercises hivectl commands, agent join, capability routing, and health
@@ -36,8 +32,10 @@ func TestHiveE2E(t *testing.T) {
 		t.Skip("skipping e2e test in short mode")
 	}
 
+	natsPort := freePort(t)
+
 	binDir := buildBinaries(t)
-	clusterRoot := createCluster(t)
+	clusterRoot := createCluster(t, natsPort)
 
 	// Pre-seed a join token in state.db before hived starts.
 	rawToken := "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
@@ -282,7 +280,7 @@ func buildBinaries(t *testing.T) string {
 // empty list). Agent manifests are added later via writeAgentManifest.
 //
 // Uses a short path under /tmp to avoid exceeding Unix socket path limits on macOS.
-func createCluster(t *testing.T) string {
+func createCluster(t *testing.T, natsPort int) string {
 	t.Helper()
 
 	// Use a short path to avoid exceeding macOS's 104-byte Unix socket limit.

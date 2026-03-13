@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	goruntime "runtime"
 	"sync"
 
 	"github.com/brmurrell3/hive/internal/backend"
@@ -84,13 +85,17 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 }
 
 func (b *Backend) Destroy(ctx context.Context, id string) error {
-	err := b.vmMgr.DestroyAgent(id)
+	err := b.vmMgr.DestroyAgent(ctx, id)
+	if err != nil {
+		// Keep the instance in the map so the caller can retry.
+		return err
+	}
 
 	b.mu.Lock()
 	delete(b.instances, id)
 	b.mu.Unlock()
 
-	return err
+	return nil
 }
 
 func (b *Backend) Status(ctx context.Context, id string) (backend.InstanceStatus, error) {
@@ -109,17 +114,37 @@ func (b *Backend) Logs(ctx context.Context, id string, opts backend.LogOpts) (io
 }
 
 func (b *Backend) Available() backend.Resources {
-	// Estimate from system resources — this is approximate.
+	cpuCount := goruntime.NumCPU()
+
+	// Use runtime.MemStats for a cross-platform memory estimate.
+	var m goruntime.MemStats
+	goruntime.ReadMemStats(&m)
+	memTotalMB := int64(m.Sys / (1024 * 1024))
+	if memTotalMB < 256 {
+		memTotalMB = 8192 // fallback if reading yields an unreasonably low value
+	}
+
 	return backend.Resources{
-		MemoryMB: 4096,
-		VCPUs:    4,
+		MemoryMB: memTotalMB,
+		VCPUs:    cpuCount,
 		DiskMB:   10240,
 	}
 }
 
 func (b *Backend) Allocated() backend.Resources {
+	b.mu.RLock()
+	tracked := make(map[string]struct{}, len(b.instances))
+	for id := range b.instances {
+		tracked[id] = struct{}{}
+	}
+	b.mu.RUnlock()
+
 	var total backend.Resources
 	for _, agent := range b.store.AllAgents() {
+		// Only count agents actually managed by this backend.
+		if _, ok := tracked[agent.ID]; !ok {
+			continue
+		}
 		if agent.Status == state.AgentStatusRunning ||
 			agent.Status == state.AgentStatusStarting ||
 			agent.Status == state.AgentStatusCreating {

@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -47,9 +48,13 @@ var errChecksumUnavailable = errors.New("checksum file unavailable")
 // variantPattern validates image variant names (alphanumeric and hyphens only).
 var variantPattern = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 
+// versionPattern validates version/tag strings before URL interpolation.
+var versionPattern = regexp.MustCompile(`^(latest|v[0-9]+\.[0-9]+\.[0-9]+.*)$`)
+
 // httpClient is used for all image downloads. It rejects HTTP-downgrade
 // redirects (HTTPS -> HTTP) to prevent man-in-the-middle attacks.
 var httpClient = &http.Client{
+	Timeout: 10 * time.Minute,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
@@ -122,9 +127,20 @@ func (m *ImageManager) EnsureImage(ctx context.Context, variant string) (string,
 	if tag == "" || tag == "dev" {
 		tag = "latest"
 	}
-	compressedFilename := filename + ".gz"
-	downloadURL := fmt.Sprintf("%s/download/%s/%s", GitHubReleasesBaseURL, tag, compressedFilename)
-	checksumURL := fmt.Sprintf("%s/download/%s/%s.sha256", GitHubReleasesBaseURL, tag, compressedFilename)
+
+	// HIGH-3: Validate version/tag before URL interpolation.
+	if !versionPattern.MatchString(tag) {
+		return "", fmt.Errorf("invalid version/tag %q: must match %s", tag, versionPattern.String())
+	}
+
+	var downloadURL, checksumURL string
+	if tag == "latest" {
+		downloadURL = fmt.Sprintf("%s/releases/latest/download/%s.gz", GitHubReleasesBaseURL, filename)
+		checksumURL = fmt.Sprintf("%s/releases/latest/download/checksums.sha256", GitHubReleasesBaseURL)
+	} else {
+		downloadURL = fmt.Sprintf("%s/releases/download/%s/%s.gz", GitHubReleasesBaseURL, tag, filename)
+		checksumURL = fmt.Sprintf("%s/releases/download/%s/checksums.sha256", GitHubReleasesBaseURL, tag)
+	}
 
 	m.logger.Info("downloading rootfs image",
 		"url", downloadURL,
@@ -148,6 +164,11 @@ func (m *ImageManager) EnsureImage(ctx context.Context, variant string) (string,
 	// CRITICAL-1: Distinguish between "checksum unavailable" and "checksum mismatch".
 	if err := m.validateChecksum(ctx, checksumURL, tmpPath); err != nil {
 		if errors.Is(err, errChecksumUnavailable) {
+			// CRITICAL-2: For release versions (start with "v"), checksum must be available.
+			isRelease := strings.HasPrefix(tag, "v")
+			if isRelease {
+				return "", fmt.Errorf("checksum required for release version %s but unavailable: %w", tag, err)
+			}
 			m.logger.Warn("checksum validation skipped: checksum file not available", "error", err)
 		} else {
 			// Checksum mismatch or other verification error is fatal.
@@ -284,6 +305,11 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 // Returns errChecksumUnavailable if the checksum file cannot be fetched (non-fatal).
 // Returns a regular error if the checksum is fetched but does not match (fatal).
 func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePath string) error {
+	// HIGH-1: Validate HTTPS scheme on checksum URL before making the request.
+	if parsedURL, parseErr := url.Parse(checksumURL); parseErr == nil && parsedURL.Scheme != "https" {
+		return fmt.Errorf("refusing non-HTTPS checksum URL: %s", checksumURL)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
 	if err != nil {
 		return fmt.Errorf("%w: creating checksum request: %v", errChecksumUnavailable, err)
@@ -397,8 +423,13 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 		return fmt.Errorf("checking for truncated decompression: %w", probeErr)
 	}
 
+	// HIGH-4: Sync to disk before close to prevent corrupt cached file on crash.
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return fmt.Errorf("syncing %s: %w", dest, err)
+	}
 	if err := out.Close(); err != nil {
-		return fmt.Errorf("closing decompressed file: %w", err)
+		return fmt.Errorf("closing %s: %w", dest, err)
 	}
 
 	return nil

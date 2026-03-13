@@ -73,8 +73,14 @@ func TestFirecrackerBackendSelection(t *testing.T) {
 	})
 }
 
-// TestFirecrackerNetworkPolicyConfig verifies that network policy configuration
-// is correctly validated and written to the agent drive.
+// TestFirecrackerNetworkPolicyConfig verifies that agents with different network
+// policy configurations (egress: none, restricted, full) are accepted by the
+// config validator and start successfully on the process backend.
+//
+// NOTE: The process backend does not enforce network policy (nftables rules are
+// only applied inside Firecracker VMs). This test validates that manifests with
+// network settings are parsed, accepted, and that agents reach RUNNING state.
+// TODO: Add VM-level network enforcement tests that require KVM (/dev/kvm).
 func TestFirecrackerNetworkPolicyConfig(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -96,36 +102,63 @@ func TestFirecrackerNetworkPolicyConfig(t *testing.T) {
 	natsAuthTokenPath := filepath.Join(clusterRoot, ".state", "nats-auth-token")
 	waitForFile(t, natsAuthTokenPath, 15*time.Second)
 
-	t.Run("egress_none_agent_starts", func(t *testing.T) {
+	t.Run("egress_none_agent_starts_and_is_running", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "no-egress-agent")
 		if !strings.Contains(out, "started") {
 			t.Fatalf("expected 'started' in output, got: %s", out)
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "no-egress-agent", 10*time.Second)
+
+		// Verify the agent is listed as RUNNING via hivectl agents list.
+		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
+		if !strings.Contains(listOut, "no-egress-agent") {
+			t.Fatalf("expected no-egress-agent in agents list, got: %s", listOut)
+		}
 	})
 
-	t.Run("egress_restricted_agent_starts", func(t *testing.T) {
+	t.Run("egress_restricted_agent_starts_and_is_running", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "restricted-agent")
 		if !strings.Contains(out, "started") {
 			t.Fatalf("expected 'started' in output, got: %s", out)
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "restricted-agent", 10*time.Second)
+
+		// Verify the agent is listed as RUNNING via hivectl agents list.
+		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
+		if !strings.Contains(listOut, "restricted-agent") {
+			t.Fatalf("expected restricted-agent in agents list, got: %s", listOut)
+		}
+		// Verify agent status JSON shows RUNNING state.
+		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "restricted-agent")
+		assertAgentStatusField(t, statusOut, "restricted-agent", "status", "RUNNING")
 	})
 
-	t.Run("egress_full_agent_starts", func(t *testing.T) {
+	t.Run("egress_full_agent_starts_and_is_running", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "full-egress-agent")
 		if !strings.Contains(out, "started") {
 			t.Fatalf("expected 'started' in output, got: %s", out)
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "full-egress-agent", 10*time.Second)
+
+		// Verify the agent is listed as RUNNING via hivectl agents list.
+		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
+		if !strings.Contains(listOut, "full-egress-agent") {
+			t.Fatalf("expected full-egress-agent in agents list, got: %s", listOut)
+		}
 	})
 }
 
 // TestFirecrackerResourceLimits verifies that resource limits from manifests
-// are properly parsed and applied when creating agents.
+// are properly parsed and stored when creating agents on the process backend.
+//
+// NOTE: The process backend does not enforce resource limits (memory/CPU cgroups
+// are only applied inside Firecracker VMs). This test validates that manifests
+// with resource settings are parsed, that agents reach RUNNING state, and that
+// the stored agent state reflects the configured resource values.
+// TODO: Add VM-level resource enforcement tests that require KVM (/dev/kvm).
 func TestFirecrackerResourceLimits(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -143,17 +176,24 @@ func TestFirecrackerResourceLimits(t *testing.T) {
 	natsAuthTokenPath := filepath.Join(clusterRoot, ".state", "nats-auth-token")
 	waitForFile(t, natsAuthTokenPath, 15*time.Second)
 
-	t.Run("agent_with_resource_limits_starts", func(t *testing.T) {
+	t.Run("agent_with_resource_limits_starts_and_stores_config", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "resource-agent")
 		if !strings.Contains(out, "started") {
 			t.Fatalf("expected 'started' in output, got: %s", out)
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "resource-agent", 10*time.Second)
+
+		// Verify the agent status JSON shows the configured resource values.
+		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "resource-agent")
+		assertAgentStatusField(t, statusOut, "resource-agent", "status", "RUNNING")
+		// 256Mi = 268435456 bytes.
+		assertAgentStatusField(t, statusOut, "resource-agent", "memory_bytes", float64(268435456))
+		assertAgentStatusField(t, statusOut, "resource-agent", "vcpus", float64(2))
 	})
 
-	t.Run("agent_with_default_resources_starts", func(t *testing.T) {
-		// Agent with no explicit resources (should use defaults: 512Mi, 1 vCPU, 1Gi disk).
+	t.Run("agent_with_default_resources_starts_and_stores_config", func(t *testing.T) {
+		// Agent with no explicit resources (should use defaults: 512Mi, 1 vCPU).
 		writeVMAgentManifest(t, clusterRoot, "default-resource-agent", "default", "", 0, "")
 
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "default-resource-agent")
@@ -162,11 +202,24 @@ func TestFirecrackerResourceLimits(t *testing.T) {
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "default-resource-agent", 10*time.Second)
+
+		// Verify the agent status JSON shows RUNNING and default resource values.
+		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "default-resource-agent")
+		assertAgentStatusField(t, statusOut, "default-resource-agent", "status", "RUNNING")
+		// 512Mi = 536870912 bytes (cluster default).
+		assertAgentStatusField(t, statusOut, "default-resource-agent", "memory_bytes", float64(536870912))
+		assertAgentStatusField(t, statusOut, "default-resource-agent", "vcpus", float64(1))
 	})
 }
 
 // TestFirecrackerSharedVolumes verifies that shared volumes are properly
-// validated and configured between team and agent manifests.
+// validated and that agents with volume configurations start successfully
+// on the process backend.
+//
+// NOTE: The process backend does not mount shared volumes (virtio-fs mounts are
+// only configured inside Firecracker VMs). This test validates that manifests
+// with volume settings are parsed, accepted, and that agents reach RUNNING state.
+// TODO: Add VM-level shared volume tests that require KVM (/dev/kvm).
 func TestFirecrackerSharedVolumes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
@@ -181,22 +234,40 @@ func TestFirecrackerSharedVolumes(t *testing.T) {
 	natsAuthTokenPath := filepath.Join(clusterRoot, ".state", "nats-auth-token")
 	waitForFile(t, natsAuthTokenPath, 15*time.Second)
 
-	t.Run("agent_with_shared_volume_starts", func(t *testing.T) {
+	t.Run("agent_with_shared_volume_starts_and_is_running", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "writer-agent")
 		if !strings.Contains(out, "started") {
 			t.Fatalf("expected 'started' in output, got: %s", out)
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "writer-agent", 10*time.Second)
+
+		// Verify the agent shows as RUNNING in hivectl agents list.
+		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
+		if !strings.Contains(listOut, "writer-agent") {
+			t.Fatalf("expected writer-agent in agents list, got: %s", listOut)
+		}
+		// Verify agent status JSON confirms RUNNING state.
+		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "writer-agent")
+		assertAgentStatusField(t, statusOut, "writer-agent", "status", "RUNNING")
 	})
 
-	t.Run("second_agent_with_shared_volume_starts", func(t *testing.T) {
+	t.Run("second_agent_with_shared_volume_starts_and_is_running", func(t *testing.T) {
 		out := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "start", "reader-agent")
 		if !strings.Contains(out, "started") {
 			t.Fatalf("expected 'started' in output, got: %s", out)
 		}
 
 		waitForAgentRunning(t, binDir, clusterRoot, port, "reader-agent", 10*time.Second)
+
+		// Verify the agent shows as RUNNING in hivectl agents list.
+		listOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "list")
+		if !strings.Contains(listOut, "reader-agent") {
+			t.Fatalf("expected reader-agent in agents list, got: %s", listOut)
+		}
+		// Verify agent status JSON confirms RUNNING state.
+		statusOut := runHivectlWithPort(t, binDir, clusterRoot, port, "agents", "status", "reader-agent")
+		assertAgentStatusField(t, statusOut, "reader-agent", "status", "RUNNING")
 	})
 }
 
@@ -665,6 +736,26 @@ func runHivectlWithPort(t *testing.T, binDir, clusterRoot string, port int, args
 	}
 
 	return stdout.String()
+}
+
+// assertAgentStatusField parses the JSON output of "hivectl agents status" and
+// asserts that the given field matches the expected value.
+func assertAgentStatusField(t *testing.T, statusJSON, agentID, field string, expected interface{}) {
+	t.Helper()
+
+	var status map[string]interface{}
+	if err := json.Unmarshal([]byte(statusJSON), &status); err != nil {
+		t.Fatalf("parsing agent status JSON for %s: %v\nraw: %s", agentID, err, statusJSON)
+	}
+
+	got, ok := status[field]
+	if !ok {
+		t.Fatalf("agent %s status missing field %q; full status: %s", agentID, field, statusJSON)
+	}
+
+	if got != expected {
+		t.Fatalf("agent %s: expected %s=%v (%T), got %v (%T)", agentID, field, expected, expected, got, got)
+	}
 }
 
 func runHivectlValidateWithError(t *testing.T, binDir, clusterRoot string) (string, error) {

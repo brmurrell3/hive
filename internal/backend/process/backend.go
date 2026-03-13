@@ -35,12 +35,46 @@ type Backend struct {
 	instances   map[string]*processInstance
 }
 
+// maxBufSize is the maximum number of bytes retained per output buffer (10 MB).
+// Once the limit is reached, additional writes are silently dropped.
+const maxBufSize = 10 * 1024 * 1024
+
+// safeBuf is a thread-safe bytes.Buffer with a maximum size limit.
+// It implements io.Writer so it can be used directly as cmd.Stdout/Stderr.
+type safeBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	remaining := maxBufSize - s.buf.Len()
+	if remaining <= 0 {
+		// Buffer full — silently discard.
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	return s.buf.Write(p)
+}
+
+// Bytes returns a copy of the buffered data, safe for concurrent use.
+func (s *safeBuf) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, s.buf.Len())
+	copy(cp, s.buf.Bytes())
+	return cp
+}
+
 type processInstance struct {
 	id      string
 	agentID string
 	cmd     *exec.Cmd
-	stdout  *bytes.Buffer
-	stderr  *bytes.Buffer
+	stdout  *safeBuf
+	stderr  *safeBuf
 	cancel  context.CancelFunc
 	done    chan struct{}
 	err     error
@@ -167,9 +201,10 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &safeBuf{}
+	stderr := &safeBuf{}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	// Set PENDING state before creating the instance.
 	if b.store != nil {
@@ -186,8 +221,8 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 		id:      agentID,
 		agentID: agentID,
 		cmd:     cmd,
-		stdout:  &stdout,
-		stderr:  &stderr,
+		stdout:  stdout,
+		stderr:  stderr,
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
@@ -286,10 +321,13 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 		inst.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck // best-effort graceful shutdown signal
 	}
 
-	// Wait with timeout, then force kill.
+	// Wait with timeout, then force kill. Also respect the caller's context.
 	select {
 	case <-inst.done:
 		// Process exited gracefully.
+	case <-ctx.Done():
+		inst.cancel() // Context cancelled — force kill immediately.
+		<-inst.done
 	case <-time.After(10 * time.Second):
 		inst.cancel() // Force kill via context cancellation.
 		<-inst.done

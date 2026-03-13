@@ -37,9 +37,12 @@ func GenerateNftables(p NetworkPolicy) string {
 	)
 
 	// Egress chain (traffic leaving the VM).
+	// Uses policy accept so that forwarded traffic for OTHER interfaces is
+	// not affected. An explicit drop rule scoped to this tap device is
+	// appended at the end to deny unmatched egress from this VM.
 	rules = append(rules,
 		"  chain egress {",
-		"    type filter hook forward priority 0; policy drop;",
+		"    type filter hook forward priority 0; policy accept;",
 	)
 
 	switch p.Egress {
@@ -80,12 +83,21 @@ func GenerateNftables(p NetworkPolicy) string {
 		)
 	}
 
+	// Drop remaining traffic from this tap device only; traffic from
+	// other interfaces passes through unaffected.
+	rules = append(rules,
+		fmt.Sprintf("    iifname %q drop", p.TapDevice),
+	)
+
 	rules = append(rules, "  }")
 
 	// Ingress chain (traffic entering the VM).
+	// Uses policy accept so that forwarded traffic for OTHER interfaces is
+	// not affected. An explicit drop rule scoped to this tap device is
+	// appended at the end to deny unmatched ingress to this VM.
 	rules = append(rules,
 		"  chain ingress {",
-		"    type filter hook forward priority 0; policy drop;",
+		"    type filter hook forward priority 0; policy accept;",
 	)
 
 	switch p.Ingress {
@@ -103,6 +115,12 @@ func GenerateNftables(p NetworkPolicy) string {
 			fmt.Sprintf("    oifname %q ct state established,related accept", p.TapDevice),
 		)
 	}
+
+	// Drop remaining traffic destined for this tap device only; traffic
+	// for other interfaces passes through unaffected.
+	rules = append(rules,
+		fmt.Sprintf("    oifname %q drop", p.TapDevice),
+	)
 
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
@@ -163,8 +181,10 @@ func resolveAllowlistHosts(hosts []string) []string {
 	return resolved
 }
 
-// CleanupNftables returns the nft command to remove the table for a tap device.
-func CleanupNftables(tapDevice string) string {
+// CleanupNftables returns the command name and arguments to remove the
+// nftables table for a tap device. The caller can pass these directly to
+// exec.CommandContext(ctx, cmd, args...) without string splitting.
+func CleanupNftables(tapDevice string) (string, []string) {
 	tableName := fmt.Sprintf("hive_%s", strings.ReplaceAll(tapDevice, "-", "_"))
-	return fmt.Sprintf("nft delete table inet %s", tableName)
+	return "nft", []string{"delete", "table", "inet", tableName}
 }

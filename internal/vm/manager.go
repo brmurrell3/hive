@@ -127,6 +127,8 @@ func NewManager(clusterRoot string, store *state.Store, logger *slog.Logger, hyp
 // {clusterRoot}/rootfs/rootfs.ext4 location. This is used when a rootfs image
 // is provided via --rootfs-path or auto-downloaded by the ImageManager.
 func (m *Manager) SetRootfsOverride(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.rootfsOverride = path
 }
 
@@ -134,6 +136,8 @@ func (m *Manager) SetRootfsOverride(path string) {
 // override has been set (via SetRootfsOverride), it is used. Otherwise, the
 // default location {clusterRoot}/rootfs/rootfs.ext4 is returned.
 func (m *Manager) resolveBaseRootfs() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.rootfsOverride != "" {
 		return m.rootfsOverride
 	}
@@ -429,15 +433,28 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		if bytes.ContainsAny(capsJSON, "\n\r") {
 			return fmt.Errorf("capabilities JSON contains newline characters")
 		}
-		confContent += fmt.Sprintf("CAPABILITIES=%s\n", string(capsJSON))
+		confContent += fmt.Sprintf("CAPABILITIES='%s'\n", string(capsJSON))
 	}
 
 	// Resolve shared volumes: look up agent volumes against team shared_volumes,
 	// create ext4 images for each, and build the HIVE_VOLUMES env var for the
 	// guest init script. Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
-	// (after vda=rootfs, vdb=agent drive).
+	// (after vda=rootfs, vdb=agent drive) when an agent drive is present,
+	// or /dev/vdb, /dev/vdc, etc. when no agent drive exists.
 	var volumeMounts []VMVolume
 	var volumeImgPaths []string // track created images for cleanup on failure
+
+	// Determine the guest device letter offset for shared volumes. If an agent
+	// drive will be attached (vdb), volumes start at 'c'; otherwise at 'b'.
+	hasAgentDrive := false
+	if _, statErr := os.Stat(agentDir); statErr == nil {
+		hasAgentDrive = true
+	}
+	volumeDeviceOffset := byte('c')
+	if !hasAgentDrive {
+		volumeDeviceOffset = 'b'
+	}
+
 	if len(agent.Spec.Volumes) > 0 && agent.Metadata.Team != "" {
 		teams, teamsErr := config.LoadTeams(m.clusterRoot)
 		if teamsErr != nil {
@@ -456,9 +473,22 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			svByName[team.Spec.SharedVolumes[i].Name] = &team.Spec.SharedVolumes[i]
 		}
 
-		// Guest block devices: vda=rootfs, vdb=agent, vdc..vdz=shared volumes.
+		// Guest block devices: vda=rootfs, vdb=agent (if present), then shared volumes.
+		// Firecracker supports up to 26 virtio block devices (vda-vdz). With rootfs
+		// on vda and optionally agent on vdb, at most 23-24 volumes are possible.
 		var hiveVolumeParts []string
+		seenMountPaths := make(map[string]bool)
 		for i, vol := range agent.Spec.Volumes {
+			// Guard against exceeding the virtio block device limit (vda-vdz = 26 devices).
+			// vda is rootfs, vdb may be agent drive, leaving at most 23-24 slots.
+			if i >= 23 {
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("agent %s has too many volumes (%d): maximum is 23", agentID, len(agent.Spec.Volumes)))
+			}
+
 			sv, svFound := svByName[vol.Name]
 			if !svFound {
 				for _, imgPath := range volumeImgPaths {
@@ -475,7 +505,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 				readOnly = true
 			}
 
-			guestDevice := fmt.Sprintf("/dev/vd%c", 'c'+i)
+			guestDevice := fmt.Sprintf("/dev/vd%c", volumeDeviceOffset+byte(i))
 			accessStr := "rw"
 			if readOnly {
 				accessStr = "ro"
@@ -506,6 +536,16 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 				os.Remove(rootfsCopy)
 				return m.failAgent(agentState, fmt.Errorf("agent %s volume %q mountPath %q contains invalid characters", agentID, vol.Name, vol.MountPath))
 			}
+
+			// Detect overlapping mount paths.
+			if seenMountPaths[vol.MountPath] {
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("agent %s has duplicate volume mountPath %q", agentID, vol.MountPath))
+			}
+			seenMountPaths[vol.MountPath] = true
 
 			hiveVolumeParts = append(hiveVolumeParts, fmt.Sprintf("%s:%s:%s", guestDevice, vol.MountPath, accessStr))
 		}
@@ -630,9 +670,13 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		}
 	}
 
-	// Apply network egress policy BEFORE booting the VM to prevent a race
+	// Apply network policy BEFORE booting the VM to prevent a race
 	// window where the VM runs without network restrictions.
-	if agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull {
+	// Check both egress and ingress: even if egress is "full", ingress
+	// restrictions still require nftables rules.
+	needsNftables := (agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull) ||
+		(agent.Spec.Network.Ingress != "" && agent.Spec.Network.Ingress != egressFull)
+	if needsNftables {
 		tapDevice := TapDeviceName(agentID)
 		policy := NetworkPolicy{
 			TapDevice: tapDevice,
@@ -666,16 +710,13 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 
 	if err := m.hypervisor.StartVM(socketPath); err != nil {
 		// Clean up nftables rules that were applied before StartVM.
-		if agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull {
+		if needsNftables {
 			tapDevice := TapDeviceName(agentID)
-			cleanupCmd := CleanupNftables(tapDevice)
-			if cleanupCmd != "" {
-				nftCtx2, nftCancel2 := context.WithTimeout(ctx, 30*time.Second)
-				defer nftCancel2()
-				parts := strings.Fields(cleanupCmd)
-				if out, cleanErr := exec.CommandContext(nftCtx2, parts[0], parts[1:]...).CombinedOutput(); cleanErr != nil {
-					m.logger.Debug("nftables cleanup after StartVM failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
-				}
+			nftCmd, nftArgs := CleanupNftables(tapDevice)
+			nftCtx2, nftCancel2 := context.WithTimeout(ctx, 30*time.Second)
+			defer nftCancel2()
+			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
+				m.logger.Debug("nftables cleanup after StartVM failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
 			}
 		}
 		if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
@@ -691,20 +732,33 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		return m.failAgent(agentState, fmt.Errorf("starting VM for agent %s: %w", agentID, err))
 	}
 
+	// VM is now running. Mark resources as committed so the deferred cleanup
+	// does not release CID/resources that belong to the running VM. If any
+	// subsequent step fails, we perform explicit cleanup of the running VM.
+	committed = true
+	cidReleased = true
+
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusRunning); err != nil {
+		// VM is running but state transition failed. Explicitly destroy the VM
+		// and release resources since the deferred function considers them committed.
+		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
+		m.stopForwarder(agentID)
+		m.releaseResources(int64(memoryMB), int64(vcpus))
+		m.releaseCID(cid)
 		return m.failAgent(agentState, err)
 	}
 	agentState.Status = state.AgentStatusRunning
 	agentState.StartedAt = time.Now()
 	agentState.LastTransition = agentState.StartedAt
 	if err := m.store.SetAgent(agentState); err != nil {
+		// VM is running but state persistence failed. Explicitly destroy the VM
+		// and release resources since the deferred function considers them committed.
+		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
+		m.stopForwarder(agentID)
+		m.releaseResources(int64(memoryMB), int64(vcpus))
+		m.releaseCID(cid)
 		return fmt.Errorf("setting agent state to RUNNING: %w", err)
 	}
-
-	// Resources and CID were allocated at the top of this function; mark as
-	// committed so the deferred release is skipped.
-	committed = true
-	cidReleased = true
 
 	m.logger.Info("agent started successfully",
 		"agent_id", agentID,
@@ -763,14 +817,11 @@ func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
 
 	// Clean up nftables rules for this agent's tap device.
 	tapDevice := TapDeviceName(agentID)
-	cleanupCmd := CleanupNftables(tapDevice)
-	if cleanupCmd != "" {
-		nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
-		defer nftCancel()
-		parts := strings.Fields(cleanupCmd)
-		if out, err := exec.CommandContext(nftCtx, parts[0], parts[1:]...).CombinedOutput(); err != nil {
-			m.logger.Debug("nftables cleanup skipped", "agent_id", agentID, "error", err, "output", string(out))
-		}
+	nftCmd, nftArgs := CleanupNftables(tapDevice)
+	nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer nftCancel()
+	if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
+		m.logger.Debug("nftables cleanup skipped", "agent_id", agentID, "error", err, "output", string(out))
 	}
 
 	// Atomically capture and zero resource fields inside ModifyAgent to
@@ -810,7 +861,7 @@ func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
 
 // DestroyAgent stops the agent VM if running, cleans up all artifacts (rootfs
 // copy, socket, state directory), and removes the agent from state.
-func (m *Manager) DestroyAgent(agentID string) error {
+func (m *Manager) DestroyAgent(ctx context.Context, agentID string) error {
 	if err := types.ValidateSubjectComponent("agent_id", agentID); err != nil {
 		return fmt.Errorf("invalid agent ID: %w", err)
 	}
@@ -889,12 +940,11 @@ func (m *Manager) DestroyAgent(agentID string) error {
 
 	// Clean up nftables rules for this agent's tap device.
 	tapDevice := TapDeviceName(agentID)
-	cleanupCmd := CleanupNftables(tapDevice)
-	if cleanupCmd != "" {
-		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	nftCmd, nftArgs := CleanupNftables(tapDevice)
+	{
+		nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer nftCancel()
-		parts := strings.Fields(cleanupCmd)
-		if out, err := exec.CommandContext(nftCtx, parts[0], parts[1:]...).CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
 			m.logger.Debug("nftables cleanup skipped during destroy", "agent_id", agentID, "error", err, "output", string(out))
 		}
 	}
@@ -1054,15 +1104,12 @@ func (m *Manager) ReconcileOnStartup() error {
 
 				// Clean up nftables rules for the dead agent's tap device.
 				tapDevice := TapDeviceName(agent.ID)
-				cleanupCmd := CleanupNftables(tapDevice)
-				if cleanupCmd != "" {
-					nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-					parts := strings.Fields(cleanupCmd)
-					if out, err := exec.CommandContext(nftCtx, parts[0], parts[1:]...).CombinedOutput(); err != nil {
-						m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
-					}
-					nftCancel()
+				nftCmd, nftArgs := CleanupNftables(tapDevice)
+				nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
+					m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
 				}
+				nftCancel()
 
 				// Clean up disk artifacts left behind by the dead VM.
 				m.cleanupAgentArtifacts(agent.ID)
@@ -1105,15 +1152,12 @@ func (m *Manager) ReconcileOnStartup() error {
 
 				// Clean up nftables rules for the orphaned agent.
 				tapDevice := TapDeviceName(agent.ID)
-				cleanupCmd := CleanupNftables(tapDevice)
-				if cleanupCmd != "" {
-					nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-					parts := strings.Fields(cleanupCmd)
-					if out, err := exec.CommandContext(nftCtx, parts[0], parts[1:]...).CombinedOutput(); err != nil {
-						m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
-					}
-					nftCancel()
+				nftCmd, nftArgs := CleanupNftables(tapDevice)
+				nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
+					m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
 				}
+				nftCancel()
 
 				// Clean up disk artifacts.
 				m.cleanupAgentArtifacts(agent.ID)
@@ -1488,13 +1532,23 @@ func createSharedVolumeImage(ctx context.Context, hostDir, imgPath string) error
 		return fmt.Errorf("shared volume host path %q is not a directory", hostDir)
 	}
 
-	// Calculate the size needed (minimum 4MB to fit ext4 metadata).
+	// Walk the directory using WalkDir (not Walk) to avoid following symlinks
+	// during size calculation. Reject any symlinks found inside the directory
+	// because mkfs.ext4 -d would follow them, potentially packaging content
+	// outside the shared volume directory.
 	var totalSize int64
-	walkErr := filepath.Walk(hostDir, func(_ string, fi os.FileInfo, walkEntryErr error) error {
+	walkErr := filepath.WalkDir(hostDir, func(path string, d os.DirEntry, walkEntryErr error) error {
 		if walkEntryErr != nil {
 			return walkEntryErr
 		}
-		if !fi.IsDir() {
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("shared volume directory contains symlink %q which is not allowed for security reasons", path)
+		}
+		if !d.IsDir() {
+			fi, fiErr := d.Info()
+			if fiErr != nil {
+				return fiErr
+			}
 			totalSize += fi.Size()
 		}
 		return nil
@@ -1513,6 +1567,20 @@ func createSharedVolumeImage(ctx context.Context, hostDir, imgPath string) error
 	imgSizeMB := (totalSize/(1024*1024) + 4)
 	if imgSizeMB < 4 {
 		imgSizeMB = 4
+	}
+
+	// TOCTOU guard: verify that the host directory path has not been replaced
+	// by a symlink between the initial Lstat check and the mkfs.ext4 call.
+	resolvedDir, evalErr := filepath.EvalSymlinks(hostDir)
+	if evalErr != nil {
+		return fmt.Errorf("evaluating symlinks on shared volume host path %q: %w", hostDir, evalErr)
+	}
+	absHostDir, absErr := filepath.Abs(hostDir)
+	if absErr != nil {
+		return fmt.Errorf("resolving absolute path for shared volume host path %q: %w", hostDir, absErr)
+	}
+	if resolvedDir != absHostDir {
+		return fmt.Errorf("shared volume host path %q resolves to %q (expected %q): possible symlink TOCTOU attack", hostDir, resolvedDir, absHostDir)
 	}
 
 	sizeBlocks := fmt.Sprintf("%dk", imgSizeMB*1024)

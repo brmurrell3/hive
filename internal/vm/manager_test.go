@@ -253,7 +253,7 @@ func TestDestroyAgent_RunningAgent(t *testing.T) {
 		t.Fatalf("expected 1 running VM before destroy, got %d", mock.RunningCount())
 	}
 
-	if err := mgr.DestroyAgent("destroy-me"); err != nil {
+	if err := mgr.DestroyAgent(context.Background(), "destroy-me"); err != nil {
 		t.Fatalf("DestroyAgent: %v", err)
 	}
 
@@ -294,7 +294,7 @@ func TestDestroyAgent_RemovesArtifacts(t *testing.T) {
 		t.Fatalf("rootfs copy should exist after start: %v", err)
 	}
 
-	if err := mgr.DestroyAgent("artifact-agent"); err != nil {
+	if err := mgr.DestroyAgent(context.Background(), "artifact-agent"); err != nil {
 		t.Fatalf("DestroyAgent: %v", err)
 	}
 
@@ -331,7 +331,7 @@ func TestDestroyAgent_StoppedAgent(t *testing.T) {
 		t.Fatalf("StopAgent: %v", err)
 	}
 
-	if err := mgr.DestroyAgent("stopped-destroy"); err != nil {
+	if err := mgr.DestroyAgent(context.Background(), "stopped-destroy"); err != nil {
 		t.Fatalf("DestroyAgent: %v", err)
 	}
 
@@ -343,7 +343,7 @@ func TestDestroyAgent_StoppedAgent(t *testing.T) {
 func TestDestroyAgent_NotFound(t *testing.T) {
 	mgr, _, _ := testManager(t)
 
-	err := mgr.DestroyAgent("ghost")
+	err := mgr.DestroyAgent(context.Background(), "ghost")
 	if err == nil {
 		t.Fatal("expected error destroying nonexistent agent, got nil")
 	}

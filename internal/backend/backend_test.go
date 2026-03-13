@@ -614,7 +614,7 @@ func TestAgentManager_Status_Running(t *testing.T) {
 		t.Fatalf("StartAgent: %v", err)
 	}
 
-	status, err := mgr.Status("status-agent")
+	status, err := mgr.Status(context.Background(), "status-agent")
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
@@ -628,7 +628,7 @@ func TestAgentManager_Status_UnknownAgent(t *testing.T) {
 	r := NewRegistry()
 	mgr := NewAgentManager(r, "firecracker", testLogger())
 
-	status, err := mgr.Status("ghost")
+	status, err := mgr.Status(context.Background(), "ghost")
 	if err == nil {
 		t.Fatal("Status: expected error for unknown agent, got nil")
 	}
@@ -653,7 +653,7 @@ func TestAgentManager_Status_BackendError(t *testing.T) {
 	}
 
 	b.StatusErr = errors.New("cgroups unavailable")
-	_, err := mgr.Status("status-err")
+	_, err := mgr.Status(context.Background(), "status-err")
 	if err == nil {
 		t.Fatal("Status: expected error from backend, got nil")
 	}
@@ -679,7 +679,7 @@ func TestAgentManager_Logs_Success(t *testing.T) {
 		t.Fatalf("StartAgent: %v", err)
 	}
 
-	rc, err := mgr.Logs("log-agent", LogOpts{Tail: 10})
+	rc, err := mgr.Logs(context.Background(), "log-agent", LogOpts{Tail: 10})
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
@@ -699,7 +699,7 @@ func TestAgentManager_Logs_UnknownAgent(t *testing.T) {
 	r := NewRegistry()
 	mgr := NewAgentManager(r, "firecracker", testLogger())
 
-	_, err := mgr.Logs("ghost", LogOpts{})
+	_, err := mgr.Logs(context.Background(), "ghost", LogOpts{})
 	if err == nil {
 		t.Fatal("Logs: expected error for unknown agent, got nil")
 	}
@@ -721,7 +721,7 @@ func TestAgentManager_Logs_BackendError(t *testing.T) {
 	}
 
 	b.LogsErr = errors.New("log file missing")
-	_, err := mgr.Logs("log-err", LogOpts{})
+	_, err := mgr.Logs(context.Background(), "log-err", LogOpts{})
 	if err == nil {
 		t.Fatal("Logs: expected error from backend, got nil")
 	}
