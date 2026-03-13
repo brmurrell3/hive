@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ import (
 	"github.com/brmurrell3/hive/internal/state"
 	"github.com/brmurrell3/hive/internal/types"
 )
+
+// validMountPathRegex matches safe mount paths (absolute, alphanumeric with /_.-) at runtime.
+var runtimeValidMountPathRegex = regexp.MustCompile(`^/[a-zA-Z0-9/_.-]+$`)
 
 // Hypervisor is the interface for VM operations. Implementations include
 // FirecrackerHypervisor (real KVM) and MockHypervisor (for testing).
@@ -411,7 +415,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			if bytes.ContainsAny(allowlistJSON, "\n\r") {
 				return fmt.Errorf("egress allowlist JSON contains newline characters")
 			}
-			confContent += fmt.Sprintf("HIVE_EGRESS_ALLOWLIST=%s\n", string(allowlistJSON))
+			confContent += fmt.Sprintf("HIVE_EGRESS_ALLOWLIST='%s'\n", string(allowlistJSON))
 		}
 	}
 
@@ -467,7 +471,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			readOnly := vol.Access == "ro"
 			// If the team shared_volume specifies read-only access, the agent
 			// cannot override it to read-write.
-			if sv.Access == "ro" {
+			if sv.Access == "ro" || sv.Access == "read-only" {
 				readOnly = true
 			}
 
@@ -493,6 +497,15 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 				HostPath: volImgPath, // Firecracker gets the ext4 image path
 				ReadOnly: readOnly,
 			})
+
+			// Validate mountPath at runtime to prevent format injection in HIVE_VOLUMES.
+			if !runtimeValidMountPathRegex.MatchString(vol.MountPath) {
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("agent %s volume %q mountPath %q contains invalid characters", agentID, vol.Name, vol.MountPath))
+			}
 
 			hiveVolumeParts = append(hiveVolumeParts, fmt.Sprintf("%s:%s:%s", guestDevice, vol.MountPath, accessStr))
 		}
@@ -542,7 +555,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// Build network policy for the VM if egress is configured.
 	var netPolicy *NetworkPolicy
 	if agent.Spec.Network.Egress != "" {
-		tapDevice := fmt.Sprintf("tap-%s", agentID)
+		tapDevice := TapDeviceName(agentID)
 		netPolicy = &NetworkPolicy{
 			TapDevice: tapDevice,
 			Egress:    agent.Spec.Network.Egress,
@@ -617,7 +630,54 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		}
 	}
 
+	// Apply network egress policy BEFORE booting the VM to prevent a race
+	// window where the VM runs without network restrictions.
+	if agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull {
+		tapDevice := TapDeviceName(agentID)
+		policy := NetworkPolicy{
+			TapDevice: tapDevice,
+			Egress:    agent.Spec.Network.Egress,
+			Allowlist: agent.Spec.Network.EgressAllowlist,
+			Ingress:   agent.Spec.Network.Ingress,
+		}
+		rules := GenerateNftables(policy)
+		if rules != "" {
+			nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer nftCancel()
+			nftCmd := exec.CommandContext(nftCtx, "nft", "-f", "-")
+			nftCmd.Stdin = strings.NewReader(rules)
+			if out, nftErr := nftCmd.CombinedOutput(); nftErr != nil {
+				// Fatal: refuse to start the VM without network policy.
+				if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
+					m.logger.Warn("failed to destroy VM after nftables failure",
+						"agent_id", agentID,
+						"error", destroyErr,
+					)
+				}
+				m.stopForwarder(agentID)
+				os.Remove(rootfsCopy)
+				os.Remove(sidecarConf)
+				os.Remove(agentDriveImg)
+				return m.failAgent(agentState, fmt.Errorf("applying nftables rules for agent %s: %w (output: %s)", agentID, nftErr, string(out)))
+			}
+			m.logger.Info("nftables rules applied", "agent_id", agentID, "egress", agent.Spec.Network.Egress)
+		}
+	}
+
 	if err := m.hypervisor.StartVM(socketPath); err != nil {
+		// Clean up nftables rules that were applied before StartVM.
+		if agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull {
+			tapDevice := TapDeviceName(agentID)
+			cleanupCmd := CleanupNftables(tapDevice)
+			if cleanupCmd != "" {
+				nftCtx2, nftCancel2 := context.WithTimeout(ctx, 30*time.Second)
+				defer nftCancel2()
+				parts := strings.Fields(cleanupCmd)
+				if out, cleanErr := exec.CommandContext(nftCtx2, parts[0], parts[1:]...).CombinedOutput(); cleanErr != nil {
+					m.logger.Debug("nftables cleanup after StartVM failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
+				}
+			}
+		}
 		if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
 			m.logger.Warn("failed to destroy VM after StartVM failure",
 				"agent_id", agentID,
@@ -645,34 +705,6 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// committed so the deferred release is skipped.
 	committed = true
 	cidReleased = true
-
-	// Apply network egress policy if configured.
-	if agent.Spec.Network.Egress != "" && agent.Spec.Network.Egress != egressFull {
-		tapDevice := fmt.Sprintf("tap-%s", agentID)
-		policy := NetworkPolicy{
-			TapDevice: tapDevice,
-			Egress:    agent.Spec.Network.Egress,
-			Allowlist: agent.Spec.Network.EgressAllowlist,
-			Ingress:   agent.Spec.Network.Ingress,
-		}
-		rules := GenerateNftables(policy)
-		if rules != "" {
-			nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
-			defer nftCancel()
-			nftCmd := exec.CommandContext(nftCtx, "nft", "-f", "-")
-			nftCmd.Stdin = strings.NewReader(rules)
-			if out, err := nftCmd.CombinedOutput(); err != nil {
-				m.logger.Warn("failed to apply nftables rules",
-					"agent_id", agentID,
-					"error", err,
-					"output", string(out),
-				)
-				// Non-fatal: agent runs without network policy
-			} else {
-				m.logger.Info("nftables rules applied", "agent_id", agentID, "egress", agent.Spec.Network.Egress)
-			}
-		}
-	}
 
 	m.logger.Info("agent started successfully",
 		"agent_id", agentID,
@@ -730,7 +762,7 @@ func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
 	}
 
 	// Clean up nftables rules for this agent's tap device.
-	tapDevice := fmt.Sprintf("tap-%s", agentID)
+	tapDevice := TapDeviceName(agentID)
 	cleanupCmd := CleanupNftables(tapDevice)
 	if cleanupCmd != "" {
 		nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -856,7 +888,7 @@ func (m *Manager) DestroyAgent(agentID string) error {
 	}
 
 	// Clean up nftables rules for this agent's tap device.
-	tapDevice := fmt.Sprintf("tap-%s", agentID)
+	tapDevice := TapDeviceName(agentID)
 	cleanupCmd := CleanupNftables(tapDevice)
 	if cleanupCmd != "" {
 		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1021,7 +1053,7 @@ func (m *Manager) ReconcileOnStartup() error {
 				)
 
 				// Clean up nftables rules for the dead agent's tap device.
-				tapDevice := fmt.Sprintf("tap-%s", agent.ID)
+				tapDevice := TapDeviceName(agent.ID)
 				cleanupCmd := CleanupNftables(tapDevice)
 				if cleanupCmd != "" {
 					nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1072,7 +1104,7 @@ func (m *Manager) ReconcileOnStartup() error {
 				)
 
 				// Clean up nftables rules for the orphaned agent.
-				tapDevice := fmt.Sprintf("tap-%s", agent.ID)
+				tapDevice := TapDeviceName(agent.ID)
 				cleanupCmd := CleanupNftables(tapDevice)
 				if cleanupCmd != "" {
 					nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1444,10 +1476,13 @@ func createSharedVolumeImage(ctx context.Context, hostDir, imgPath string) error
 		return f.Close()
 	}
 
-	// Verify the host directory exists.
-	info, statErr := os.Stat(hostDir)
+	// Verify the host directory exists. Use Lstat to detect symlinks.
+	info, statErr := os.Lstat(hostDir)
 	if statErr != nil {
 		return fmt.Errorf("shared volume host path %q: %w", hostDir, statErr)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("shared volume host_path %q is a symlink, which is not allowed for security", hostDir)
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("shared volume host path %q is not a directory", hostDir)

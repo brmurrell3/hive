@@ -267,9 +267,16 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 			logger.Warn("/dev/kvm not available — Firecracker requires KVM, falling back to mock hypervisor",
 				"error", err)
 			useMock = true
-		} else if _, err := exec.LookPath("firecracker"); err != nil {
-			logger.Warn("firecracker binary not found in PATH, falling back to mock hypervisor")
+		} else if f, err := os.OpenFile("/dev/kvm", os.O_WRONLY, 0); err != nil {
+			logger.Warn("/dev/kvm is not writable, falling back to mock hypervisor",
+				"error", err)
 			useMock = true
+		} else {
+			f.Close()
+			if _, err := exec.LookPath("firecracker"); err != nil {
+				logger.Warn("firecracker binary not found in PATH, falling back to mock hypervisor")
+				useMock = true
+			}
 		}
 	}
 	if useMock {
@@ -326,7 +333,7 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 		logger.Warn("KVM/Firecracker unavailable: falling back to process backend for all agents")
 	}
 	agentMgr := backend.NewAgentManager(backendRegistry, defaultBackend, logger)
-	if forceProcessBackend {
+	if forceProcessBackend || useMock {
 		agentMgr.SetForceProcess(true)
 	}
 

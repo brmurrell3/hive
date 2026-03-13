@@ -110,7 +110,14 @@ func (m *AgentManager) StartAgent(ctx context.Context, spec *types.AgentManifest
 	}
 
 	// Track which backend owns this agent.
+	// Re-check under the write lock to close the TOCTOU window between
+	// the RLock existence check above and this assignment.
 	m.mu.Lock()
+	if _, exists := m.agentBackends[agentID]; exists {
+		m.mu.Unlock()
+		_ = b.Destroy(ctx, agentID)
+		return fmt.Errorf("agent %s was concurrently started", agentID)
+	}
 	m.agentBackends[agentID] = b.Name()
 	m.mu.Unlock()
 

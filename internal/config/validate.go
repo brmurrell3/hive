@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -68,6 +69,9 @@ var dangerousGuestPaths = map[string]bool{
 	"/root": true,
 	"/home": true,
 }
+
+// validMountPathRegex matches safe mount paths (absolute, alphanumeric with /_.-).
+var validMountPathRegex = regexp.MustCompile(`^/[a-zA-Z0-9/_.\-]+$`)
 
 // ingressPathInvalidChars matches characters not allowed in ingress paths.
 var ingressPathInvalidChars = regexp.MustCompile(`[^a-zA-Z0-9/_\-.]`)
@@ -421,12 +425,18 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 
 	// Validate resources
 	if agent.Spec.Resources.Memory != "" {
-		if _, err := ParseMemory(agent.Spec.Resources.Memory); err != nil {
+		memBytes, err := ParseMemory(agent.Spec.Resources.Memory)
+		if err != nil {
 			ve.addf("%s: spec.resources.memory %q is invalid: %v", prefix, agent.Spec.Resources.Memory, err)
+		} else if memBytes > 1024*1024*1024*1024 { // 1 TiB upper bound
+			ve.addf("%s: spec.resources.memory %q exceeds maximum of 1TiB", prefix, agent.Spec.Resources.Memory)
 		}
 	}
 	if agent.Spec.Resources.VCPUs < 0 {
 		ve.addf("%s: spec.resources.vcpus must be non-negative, got %d", prefix, agent.Spec.Resources.VCPUs)
+	}
+	if agent.Spec.Resources.VCPUs > 256 {
+		ve.addf("%s: spec.resources.vcpus exceeds maximum of 256, got %d", prefix, agent.Spec.Resources.VCPUs)
 	}
 
 	// Validate capabilities (rule 7: unique names within agent)
@@ -464,6 +474,10 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		if agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
 			ve.addf("%s: volumes are only valid for vm tier", prefix)
 		}
+		// Enforce maximum volume count (vdc through vdz = 23 drives available).
+		if len(agent.Spec.Volumes) > 23 {
+			ve.addf("%s: spec.volumes has %d entries, maximum is 23 (vdc through vdz)", prefix, len(agent.Spec.Volumes))
+		}
 		if agent.Metadata.Team == "" {
 			ve.addf("%s: volumes require metadata.team to be set (volumes reference team shared_volumes)", prefix)
 		} else if team, ok := teams[agent.Metadata.Team]; ok {
@@ -494,15 +508,24 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 						ve.addf("%s: volume %q references team shared_volume %q which has no hostPath", prefix, vol.Name, sv.Name)
 					}
 				}
-				// MountPath must be an absolute path.
+				// MountPath must be an absolute path with safe characters only.
 				if vol.MountPath == "" {
 					ve.addf("%s: volume %q mountPath is required", prefix, vol.Name)
 				} else if !strings.HasPrefix(vol.MountPath, "/") {
 					ve.addf("%s: volume %q mountPath must be an absolute path, got %q", prefix, vol.Name, vol.MountPath)
 				} else if strings.Contains(vol.MountPath, "..") {
 					ve.addf("%s: volume %q mountPath %q contains path traversal (..)", prefix, vol.Name, vol.MountPath)
-				} else if dangerousGuestPaths[vol.MountPath] {
-					ve.addf("%s: volume %q mountPath %q is a dangerous system path", prefix, vol.Name, vol.MountPath)
+				} else if !validMountPathRegex.MatchString(vol.MountPath) {
+					ve.addf("%s: volume %q mountPath %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, vol.Name, vol.MountPath)
+				} else {
+					// Use prefix match for dangerous guest paths (e.g. /etc/foo is also dangerous).
+					cleanMount := filepath.Clean(vol.MountPath)
+					for dp := range dangerousGuestPaths {
+						if cleanMount == dp || strings.HasPrefix(cleanMount, dp+"/") {
+							ve.addf("%s: volume %q mountPath %q is under dangerous system path %q", prefix, vol.Name, vol.MountPath, dp)
+							break
+						}
+					}
 				}
 				// Access must be "ro" or "rw" (default "rw").
 				if vol.Access != "" && !validVolumeAccess[vol.Access] {
@@ -532,8 +555,13 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			if m.Guest == "" {
 				ve.addf("%s: mount %q guest path is required", prefix, m.Name)
 			} else {
-				if dangerousGuestPaths[m.Guest] {
-					ve.addf("%s: mount %q guest path %q is a dangerous system path", prefix, m.Name, m.Guest)
+				// Use prefix match for dangerous guest paths.
+				cleanGuest := filepath.Clean(m.Guest)
+				for dp := range dangerousGuestPaths {
+					if cleanGuest == dp || strings.HasPrefix(cleanGuest, dp+"/") {
+						ve.addf("%s: mount %q guest path %q is under dangerous system path %q", prefix, m.Name, m.Guest, dp)
+						break
+					}
 				}
 				if strings.Contains(m.Guest, "..") {
 					ve.addf("%s: mount %q guest path %q contains path traversal (..)", prefix, m.Name, m.Guest)
@@ -601,6 +629,11 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 	// Validate egress_allowlist is only used with restricted egress.
 	if len(agent.Spec.Network.EgressAllowlist) > 0 && agent.Spec.Network.Egress != "restricted" {
 		ve.addf("%s: spec.network.egress_allowlist is only valid when egress is \"restricted\"", prefix)
+	}
+
+	// Validate egress_allowlist size limit.
+	if len(agent.Spec.Network.EgressAllowlist) > 100 {
+		ve.addf("%s: spec.network.egress_allowlist has %d entries, maximum is 100", prefix, len(agent.Spec.Network.EgressAllowlist))
 	}
 
 	// Validate egress_allowlist entries are valid hostnames or IPs.
@@ -789,6 +822,16 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 			ve.addf("%s: shared_volume %q hostPath must be an absolute path, got %q", prefix, vol.Name, vol.HostPath)
 		} else if strings.Contains(vol.HostPath, "..") {
 			ve.addf("%s: shared_volume %q hostPath %q contains path traversal (..)", prefix, vol.Name, vol.HostPath)
+		} else {
+			// Block dangerous host directories that should never be shared into VMs.
+			dangerousHostPaths := []string{"/etc", "/root", "/var", "/usr", "/boot", "/dev", "/proc", "/sys", "/home"}
+			cleanHost := filepath.Clean(vol.HostPath)
+			for _, dp := range dangerousHostPaths {
+				if cleanHost == dp || strings.HasPrefix(cleanHost, dp+"/") {
+					ve.addf("%s: shared_volume %q hostPath %q is under dangerous host directory %q", prefix, vol.Name, vol.HostPath, dp)
+					break
+				}
+			}
 		}
 	}
 

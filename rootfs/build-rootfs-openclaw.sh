@@ -54,6 +54,7 @@ WORKDIR=$(mktemp -d)
 STAGEDIR="$WORKDIR/rootfs"
 
 cleanup() {
+    [ -n "${CONTAINER_ID:-}" ] && docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -72,7 +73,7 @@ mkdir -p "$STAGEDIR"
 # Build a temporary image that includes Node.js 20 from Alpine repos.
 # Alpine 3.19 ships nodejs-20 in its main repository.
 CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/')}" alpine:3.19 /bin/sh -c "
-    apk add --no-cache nodejs-current npm
+    apk add --no-cache nodejs npm
 ")
 docker start -a "$CONTAINER_ID" || true
 docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
@@ -89,7 +90,7 @@ if [ ! -f "$STAGEDIR/usr/bin/node" ]; then
     # Install Node.js using a Docker run with bind mount
     docker run --rm --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/')}" \
         -v "$STAGEDIR:/rootfs" alpine:3.19 \
-        /bin/sh -c "apk add --no-cache --root /rootfs --initdb nodejs-current npm"
+        /bin/sh -c "apk add --no-cache --root /rootfs --initdb nodejs npm"
 fi
 
 # Strip unnecessary files to keep image size down
@@ -152,34 +153,89 @@ if [ -f /agent/sidecar.conf ]; then
     . /agent/sidecar.conf
 fi
 
-# Build sidecar arguments
-SIDECAR_ARGS="--agent-id ${AGENT_ID:-unknown} --team-id ${TEAM_ID:-} --nats-url ${NATS_URL:-nats://127.0.0.1:4222} --workspace /agent --vsock --vsock-port ${VSOCK_PORT:-4222}"
+# Network policy enforcement
+if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
+    case "$HIVE_EGRESS_MODE" in
+        none)
+            # No network device attached, vsock only - nothing to configure
+            echo "Network policy: egress=none (vsock only)"
+            ;;
+        restricted)
+            echo "Network policy: egress=restricted"
+            # Configure network interface if present
+            if ip link show eth0 >/dev/null 2>&1; then
+                ip addr add 172.16.0.2/24 dev eth0
+                ip link set eth0 up
+                ip route add default via 172.16.0.1
 
-# Pass NATS token only if set (avoids word-splitting when empty)
-if [ -n "${NATS_TOKEN:-}" ]; then
-    SIDECAR_ARGS="${SIDECAR_ARGS} --nats-token ${NATS_TOKEN}"
+                # Set up iptables for restricted egress
+                iptables -P OUTPUT DROP
+                iptables -P FORWARD DROP
+
+                # Allow loopback
+                iptables -A OUTPUT -o lo -j ACCEPT
+
+                # Allow DNS to localhost
+                iptables -A OUTPUT -d 127.0.0.1 -p udp --dport 53 -j ACCEPT
+                iptables -A OUTPUT -d 127.0.0.1 -p tcp --dport 53 -j ACCEPT
+
+                # Allow established connections
+                iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+                # Parse and allow domains from HIVE_EGRESS_ALLOWLIST (JSON array)
+                if [ -n "${HIVE_EGRESS_ALLOWLIST:-}" ]; then
+                    # Simple JSON array parser for allowlisted domains
+                    echo "$HIVE_EGRESS_ALLOWLIST" | tr -d '[]"' | tr ',' '\n' | while read -r domain; do
+                        domain=$(echo "$domain" | tr -d ' ')
+                        [ -z "$domain" ] && continue
+                        # Resolve domain and add iptables rules for each IP
+                        for ip in $(getent hosts "$domain" 2>/dev/null | awk '{print $1}'); do
+                            iptables -A OUTPUT -d "$ip" -j ACCEPT
+                        done
+                    done
+                fi
+            fi
+            ;;
+        full)
+            echo "Network policy: egress=full"
+            # Configure network interface if present
+            if ip link show eth0 >/dev/null 2>&1; then
+                ip addr add 172.16.0.2/24 dev eth0
+                ip link set eth0 up
+                ip route add default via 172.16.0.1
+            fi
+            ;;
+    esac
 fi
 
-# Pass runtime command if set (starts the agent workload process)
-if [ -n "${RUNTIME_CMD:-}" ]; then
-    SIDECAR_ARGS="${SIDECAR_ARGS} --runtime-cmd ${RUNTIME_CMD}"
+# Mount shared volumes (virtiofs-via-block-device)
+# HIVE_VOLUMES is a pipe-delimited list of device:mount_path:access specs.
+# Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
+# (after vda=rootfs and vdb=agent drive).
+if [ -n "${HIVE_VOLUMES:-}" ]; then
+    echo "$HIVE_VOLUMES" | tr '|' '\n' | while read -r volspec; do
+        [ -z "$volspec" ] && continue
+        device=$(echo "$volspec" | cut -d: -f1)
+        mount_path=$(echo "$volspec" | cut -d: -f2)
+        access=$(echo "$volspec" | cut -d: -f3)
+        mkdir -p "$mount_path"
+        if [ "$access" = "ro" ]; then
+            mount -t ext4 -o ro "$device" "$mount_path"
+        else
+            mount -t ext4 "$device" "$mount_path"
+        fi
+        echo "Mounted shared volume: $device -> $mount_path ($access)"
+    done
 fi
 
-# Pass runtime arguments if set
-if [ -n "${RUNTIME_ARGS:-}" ]; then
-    SIDECAR_ARGS="${SIDECAR_ARGS} --runtime-args ${RUNTIME_ARGS}"
-fi
-
-# Pass capabilities JSON if set (registers with capability router)
-if [ -n "${CAPABILITIES:-}" ]; then
-    SIDECAR_ARGS="${SIDECAR_ARGS} --capabilities '${CAPABILITIES}'"
-fi
-
-# Start sidecar with per-agent config from the agent drive
-# eval is used so that embedded single quotes (e.g. around capabilities JSON)
-# are interpreted as shell quoting, preventing word-splitting of JSON values.
-# sidecar.conf is generated by the control plane and is not user-controlled input.
-eval exec /usr/local/bin/hive-sidecar ${SIDECAR_ARGS}
+# Build sidecar arguments safely using positional parameters
+set -- --agent-id "${AGENT_ID:-unknown}" --team-id "${TEAM_ID:-}" \
+       --nats-url "${NATS_URL:-nats://127.0.0.1:4222}" \
+       --workspace /agent --vsock --vsock-port "${VSOCK_PORT:-4222}"
+[ -n "${NATS_TOKEN:-}" ] && set -- "$@" --nats-token "${NATS_TOKEN}"
+[ -n "${RUNTIME_CMD:-}" ] && set -- "$@" --runtime-cmd "${RUNTIME_CMD}"
+[ -n "${CAPABILITIES:-}" ] && set -- "$@" --capabilities "${CAPABILITIES}"
+exec /usr/local/bin/hive-sidecar "$@"
 INITEOF
 chmod 755 "$STAGEDIR/init"
 
