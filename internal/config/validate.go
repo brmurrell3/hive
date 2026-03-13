@@ -464,20 +464,49 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		if agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
 			ve.addf("%s: volumes are only valid for vm tier", prefix)
 		}
-		if agent.Metadata.Team != "" {
-			if team, ok := teams[agent.Metadata.Team]; ok {
-				svNames := make(map[string]bool)
-				for _, sv := range team.Spec.SharedVolumes {
-					svNames[sv.Name] = true
+		if agent.Metadata.Team == "" {
+			ve.addf("%s: volumes require metadata.team to be set (volumes reference team shared_volumes)", prefix)
+		} else if team, ok := teams[agent.Metadata.Team]; ok {
+			svByName := make(map[string]*types.SharedVolume)
+			for i := range team.Spec.SharedVolumes {
+				svByName[team.Spec.SharedVolumes[i].Name] = &team.Spec.SharedVolumes[i]
+			}
+			validVolumeAccess := map[string]bool{"ro": true, "rw": true}
+			volNames := make(map[string]bool)
+			for _, vol := range agent.Spec.Volumes {
+				// Volume name must be non-empty.
+				if vol.Name == "" {
+					ve.addf("%s: volume name is required", prefix)
+					continue
 				}
-				validVolumeAccess := map[string]bool{"read-only": true, "read-write": true}
-				for _, vol := range agent.Spec.Volumes {
-					if !svNames[vol.Name] {
-						ve.addf("%s: volume %q references nonexistent shared_volume in team %q", prefix, vol.Name, agent.Metadata.Team)
+				// Volume name must be unique within the agent.
+				if volNames[vol.Name] {
+					ve.addf("%s: duplicate volume name %q", prefix, vol.Name)
+				}
+				volNames[vol.Name] = true
+				// Volume name must reference an existing team shared_volume.
+				sv, svExists := svByName[vol.Name]
+				if !svExists {
+					ve.addf("%s: volume %q references nonexistent shared_volume in team %q", prefix, vol.Name, agent.Metadata.Team)
+				} else {
+					// Validate the team shared_volume has a hostPath.
+					if sv.HostPath == "" {
+						ve.addf("%s: volume %q references team shared_volume %q which has no hostPath", prefix, vol.Name, sv.Name)
 					}
-					if vol.Access != "" && !validVolumeAccess[vol.Access] {
-						ve.addf("%s: volume %q access must be one of [read-only, read-write], got %q", prefix, vol.Name, vol.Access)
-					}
+				}
+				// MountPath must be an absolute path.
+				if vol.MountPath == "" {
+					ve.addf("%s: volume %q mountPath is required", prefix, vol.Name)
+				} else if !strings.HasPrefix(vol.MountPath, "/") {
+					ve.addf("%s: volume %q mountPath must be an absolute path, got %q", prefix, vol.Name, vol.MountPath)
+				} else if strings.Contains(vol.MountPath, "..") {
+					ve.addf("%s: volume %q mountPath %q contains path traversal (..)", prefix, vol.Name, vol.MountPath)
+				} else if dangerousGuestPaths[vol.MountPath] {
+					ve.addf("%s: volume %q mountPath %q is a dangerous system path", prefix, vol.Name, vol.MountPath)
+				}
+				// Access must be "ro" or "rw" (default "rw").
+				if vol.Access != "" && !validVolumeAccess[vol.Access] {
+					ve.addf("%s: volume %q access must be one of [ro, rw], got %q", prefix, vol.Name, vol.Access)
 				}
 			}
 		}
@@ -566,6 +595,22 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		validEgress := map[string]bool{"none": true, "restricted": true, "full": true}
 		if !validEgress[agent.Spec.Network.Egress] {
 			ve.addf("%s: spec.network.egress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Egress)
+		}
+	}
+
+	// Validate egress_allowlist is only used with restricted egress.
+	if len(agent.Spec.Network.EgressAllowlist) > 0 && agent.Spec.Network.Egress != "restricted" {
+		ve.addf("%s: spec.network.egress_allowlist is only valid when egress is \"restricted\"", prefix)
+	}
+
+	// Validate egress_allowlist entries are valid hostnames or IPs.
+	for _, entry := range agent.Spec.Network.EgressAllowlist {
+		if entry == "" {
+			ve.addf("%s: spec.network.egress_allowlist contains empty entry", prefix)
+			continue
+		}
+		if !isValidAllowlistEntry(entry) {
+			ve.addf("%s: spec.network.egress_allowlist entry %q is not a valid hostname, IP, or CIDR", prefix, entry)
 		}
 	}
 
@@ -725,23 +770,36 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 		}
 	}
 
-	// Validate shared volume name uniqueness.
+	// Validate shared volume name uniqueness, non-empty names, and hostPath requirements.
 	volumeNames := make(map[string]bool)
 	for _, vol := range team.Spec.SharedVolumes {
+		if vol.Name == "" {
+			ve.addf("%s: shared_volume name is required", prefix)
+			continue
+		}
 		if volumeNames[vol.Name] {
 			ve.addf("%s: duplicate shared volume name: %s", prefix, vol.Name)
 		}
 		volumeNames[vol.Name] = true
+
+		// HostPath is required for shared volumes.
+		if vol.HostPath == "" {
+			ve.addf("%s: shared_volume %q hostPath is required", prefix, vol.Name)
+		} else if !strings.HasPrefix(vol.HostPath, "/") {
+			ve.addf("%s: shared_volume %q hostPath must be an absolute path, got %q", prefix, vol.Name, vol.HostPath)
+		} else if strings.Contains(vol.HostPath, "..") {
+			ve.addf("%s: shared_volume %q hostPath %q contains path traversal (..)", prefix, vol.Name, vol.HostPath)
+		}
 	}
 
-	// Validate shared_volumes access values and host path safety.
-	validSharedVolumeAccess := map[string]bool{"read-only": true, "read-write": true}
+	// Validate shared_volumes access values.
+	validSharedVolumeAccess := map[string]bool{"ro": true, "rw": true, "read-only": true, "read-write": true}
 	for _, sv := range team.Spec.SharedVolumes {
-		if sv.Access != "" && !validSharedVolumeAccess[sv.Access] {
-			ve.addf("%s: shared_volume %q access must be one of [read-only, read-write], got %q", prefix, sv.Name, sv.Access)
+		if sv.Name == "" {
+			continue // already reported above
 		}
-		if sv.HostPath != "" && strings.Contains(sv.HostPath, "..") {
-			ve.addf("%s: shared_volume %q hostPath %q contains path traversal (..)", prefix, sv.Name, sv.HostPath)
+		if sv.Access != "" && !validSharedVolumeAccess[sv.Access] {
+			ve.addf("%s: shared_volume %q access must be one of [ro, rw], got %q", prefix, sv.Name, sv.Access)
 		}
 	}
 }
@@ -899,4 +957,25 @@ func ParseDiskSize(s string) (int64, error) {
 	}
 
 	return result, nil
+}
+
+// hostnameRegex matches valid DNS hostnames (RFC 952/1123).
+var hostnameRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
+// isValidAllowlistEntry checks that the given entry is a valid IP address,
+// CIDR block, or DNS hostname suitable for use in an egress allowlist.
+func isValidAllowlistEntry(entry string) bool {
+	// Check if it's a valid IP address.
+	if net.ParseIP(entry) != nil {
+		return true
+	}
+	// Check if it's a valid CIDR block.
+	if _, _, err := net.ParseCIDR(entry); err == nil {
+		return true
+	}
+	// Check if it's a valid hostname (max 253 chars per RFC 1035).
+	if len(entry) > 253 {
+		return false
+	}
+	return hostnameRegex.MatchString(entry)
 }

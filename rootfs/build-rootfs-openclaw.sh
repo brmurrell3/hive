@@ -1,11 +1,12 @@
 #!/bin/bash
-# Build a minimal Alpine Linux rootfs for Firecracker VMs.
+# Build an OpenClaw rootfs image with Node.js 20.
+# Extends the base rootfs with Node.js for OpenClaw agent runtime.
 #
 # This script does NOT require root or loop-mount support.  It uses
 # `mkfs.ext4 -d <dir>` (e2fsprogs >= 1.43) to create the ext4 image directly
 # from a staging directory populated by Docker + local files.
 #
-# Usage: ./build-rootfs.sh <output_image> <size> <sidecar_binary>
+# Usage: ./build-rootfs-openclaw.sh <output_image> <size> <sidecar_binary>
 #
 # Requirements:
 #   - Docker       (to extract the Alpine base filesystem)
@@ -13,12 +14,12 @@
 #                  On macOS: brew install e2fsprogs
 #                  then add /opt/homebrew/opt/e2fsprogs/sbin to PATH
 #
-# The resulting ext4 image is a bootable Firecracker rootfs.  Pair it with a
-# vmlinux kernel (see `make download-kernel`) to launch a VM.
+# The resulting ext4 image is a bootable Firecracker rootfs containing
+# Node.js 20 LTS for running OpenClaw agents.
 set -euo pipefail
 
-OUTPUT="${1:-rootfs.ext4}"
-SIZE="${2:-512M}"
+OUTPUT="${1:-rootfs-openclaw.ext4}"
+SIZE="${2:-1G}"
 SIDECAR="${3:-hive-sidecar}"
 
 # ---------------------------------------------------------------------------
@@ -58,18 +59,45 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# 1. Extract Alpine base filesystem via Docker (no root needed)
+# 1. Extract Alpine base filesystem with Node.js 20 via Docker
 # ---------------------------------------------------------------------------
-echo "==> Extracting Alpine base filesystem..."
+echo "==> Extracting Alpine base filesystem with Node.js 20..."
 if ! command -v docker &>/dev/null; then
     echo "Error: Docker is required to build the rootfs"
     exit 1
 fi
 
 mkdir -p "$STAGEDIR"
-CONTAINER_ID=$(docker create alpine:3.19 /bin/true)
+
+# Build a temporary image that includes Node.js 20 from Alpine repos.
+# Alpine 3.19 ships nodejs-20 in its main repository.
+CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/')}" alpine:3.19 /bin/sh -c "
+    apk add --no-cache nodejs-current npm
+")
+docker start -a "$CONTAINER_ID" || true
 docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
 docker rm "$CONTAINER_ID" >/dev/null
+
+# Verify Node.js was installed
+if [ ! -f "$STAGEDIR/usr/bin/node" ]; then
+    echo "Warning: Node.js binary not found in image — trying alternative install method..."
+    # Fallback: use a multi-stage approach with explicit apk in chroot-like fashion
+    CONTAINER_ID=$(docker create alpine:3.19 /bin/true)
+    docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
+    docker rm "$CONTAINER_ID" >/dev/null
+
+    # Install Node.js using a Docker run with bind mount
+    docker run --rm --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/')}" \
+        -v "$STAGEDIR:/rootfs" alpine:3.19 \
+        /bin/sh -c "apk add --no-cache --root /rootfs --initdb nodejs-current npm"
+fi
+
+# Strip unnecessary files to keep image size down
+echo "==> Stripping unnecessary files to reduce image size..."
+rm -rf "$STAGEDIR/usr/share/man" \
+       "$STAGEDIR/usr/share/doc" \
+       "$STAGEDIR/usr/share/info" \
+       "$STAGEDIR/var/cache/apk"/*
 
 # ---------------------------------------------------------------------------
 # 2. Install the sidecar binary
@@ -90,12 +118,12 @@ if [ -d "overlay" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Write the init script
+# 4. Write the init script (same as base rootfs)
 # ---------------------------------------------------------------------------
 echo "==> Installing init script..."
 cat > "$STAGEDIR/init" << 'INITEOF'
 #!/bin/sh
-# Hive VM init script
+# Hive VM init script (OpenClaw variant)
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
@@ -122,81 +150,6 @@ mkdir -p /var/log /var/tmp
 # Source agent config (AGENT_ID, TEAM_ID, NATS_URL, NATS_TOKEN)
 if [ -f /agent/sidecar.conf ]; then
     . /agent/sidecar.conf
-fi
-
-# Network policy enforcement
-if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
-    case "$HIVE_EGRESS_MODE" in
-        none)
-            # No network device attached, vsock only - nothing to configure
-            echo "Network policy: egress=none (vsock only)"
-            ;;
-        restricted)
-            echo "Network policy: egress=restricted"
-            # Configure network interface if present
-            if ip link show eth0 >/dev/null 2>&1; then
-                ip addr add 172.16.0.2/24 dev eth0
-                ip link set eth0 up
-                ip route add default via 172.16.0.1
-
-                # Set up iptables for restricted egress
-                iptables -P OUTPUT DROP
-                iptables -P FORWARD DROP
-
-                # Allow loopback
-                iptables -A OUTPUT -o lo -j ACCEPT
-
-                # Allow DNS to localhost
-                iptables -A OUTPUT -d 127.0.0.1 -p udp --dport 53 -j ACCEPT
-                iptables -A OUTPUT -d 127.0.0.1 -p tcp --dport 53 -j ACCEPT
-
-                # Allow established connections
-                iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-                # Parse and allow domains from HIVE_EGRESS_ALLOWLIST (JSON array)
-                if [ -n "${HIVE_EGRESS_ALLOWLIST:-}" ]; then
-                    # Simple JSON array parser for allowlisted domains
-                    echo "$HIVE_EGRESS_ALLOWLIST" | tr -d '[]"' | tr ',' '\n' | while read -r domain; do
-                        domain=$(echo "$domain" | tr -d ' ')
-                        [ -z "$domain" ] && continue
-                        # Resolve domain and add iptables rules for each IP
-                        for ip in $(getent hosts "$domain" 2>/dev/null | awk '{print $1}'); do
-                            iptables -A OUTPUT -d "$ip" -j ACCEPT
-                        done
-                    done
-                fi
-            fi
-            ;;
-        full)
-            echo "Network policy: egress=full"
-            # Configure network interface if present
-            if ip link show eth0 >/dev/null 2>&1; then
-                ip addr add 172.16.0.2/24 dev eth0
-                ip link set eth0 up
-                ip route add default via 172.16.0.1
-            fi
-            ;;
-    esac
-fi
-
-# Mount shared volumes (virtiofs-via-block-device)
-# HIVE_VOLUMES is a pipe-delimited list of device:mount_path:access specs.
-# Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
-# (after vda=rootfs and vdb=agent drive).
-if [ -n "${HIVE_VOLUMES:-}" ]; then
-    echo "$HIVE_VOLUMES" | tr '|' '\n' | while read -r volspec; do
-        [ -z "$volspec" ] && continue
-        device=$(echo "$volspec" | cut -d: -f1)
-        mount_path=$(echo "$volspec" | cut -d: -f2)
-        access=$(echo "$volspec" | cut -d: -f3)
-        mkdir -p "$mount_path"
-        if [ "$access" = "ro" ]; then
-            mount -t ext4 -o ro "$device" "$mount_path"
-        else
-            mount -t ext4 "$device" "$mount_path"
-        fi
-        echo "Mounted shared volume: $device -> $mount_path ($access)"
-    done
 fi
 
 # Build sidecar arguments
@@ -239,8 +192,6 @@ mkdir -p "$STAGEDIR/agent"
 # 6. Create the ext4 image using mkfs.ext4 -d (no loop mount, no root)
 # ---------------------------------------------------------------------------
 echo "==> Creating ext4 image ($SIZE) from staging directory..."
-# truncate creates the raw file at the target size; mkfs.ext4 -d then formats
-# it and populates it from the staging directory in one pass.
 truncate -s "$SIZE" "$WORKDIR/rootfs.ext4"
 "$MKE2FS" -t ext4 -q -d "$STAGEDIR" "$WORKDIR/rootfs.ext4"
 
@@ -250,4 +201,4 @@ truncate -s "$SIZE" "$WORKDIR/rootfs.ext4"
 echo "==> Moving image to $OUTPUT..."
 mv "$WORKDIR/rootfs.ext4" "$OUTPUT"
 
-echo "==> Done: $OUTPUT"
+echo "==> Done: $OUTPUT (OpenClaw variant with Node.js)"

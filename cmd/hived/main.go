@@ -110,6 +110,8 @@ func main() {
 	clusterRoot := flag.String("cluster-root", ".", "Path to the cluster root directory")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	forceProcessBackend := flag.Bool("force-process-backend", false, "Force all agents to use process backend, ignoring tier: vm config")
+	rootfsPath := flag.String("rootfs-path", "", "Path to prebuilt rootfs image (overrides auto-download)")
 	flag.Parse()
 
 	if *showVersion {
@@ -123,13 +125,13 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	if err := run(*clusterRoot, logger); err != nil {
+	if err := run(*clusterRoot, logger, *forceProcessBackend, *rootfsPath); err != nil {
 		logger.Error("hived failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(clusterRoot string, logger *slog.Logger) error {
+func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, rootfsPath string) error {
 	// Top-level context cancelled on shutdown; child subsystems should derive
 	// from this so they stop when hived shuts down.
 	runCtx, runCancel := context.WithCancel(context.Background())
@@ -288,6 +290,16 @@ func run(clusterRoot string, logger *slog.Logger) error {
 		natsPort = 4222
 	}
 	vmMgr := vm.NewManager(absRoot, store, logger, hyp, uint32(natsPort), ns.AuthToken(), cfg.Spec.VM.TotalMemoryMB, cfg.Spec.VM.TotalVCPUs)
+
+	// Resolve rootfs image path: explicit flag > local file > auto-download.
+	resolvedRootfs, err := resolveRootfsPath(runCtx, rootfsPath, absRoot, logger)
+	if err != nil {
+		logger.Warn("rootfs auto-download failed; VMs will use default path", "error", err)
+	} else if resolvedRootfs != "" {
+		vmMgr.SetRootfsOverride(resolvedRootfs)
+		logger.Info("rootfs image resolved", "path", resolvedRootfs)
+	}
+
 	if err := vmMgr.ReconcileOnStartup(); err != nil {
 		logger.Error("startup reconciliation failed: VM state may be inconsistent with the state store; "+
 			"stale VMs or resource leaks may persist until the next reconciliation cycle",
@@ -303,7 +315,20 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	if err := backendRegistry.Register(procBack); err != nil {
 		return fmt.Errorf("registering process backend: %w", err)
 	}
-	agentMgr := backend.NewAgentManager(backendRegistry, "firecracker", logger)
+	// Determine the default backend. If --force-process-backend is set, or if
+	// KVM is not available (useMock is true), fall back to the process backend.
+	defaultBackend := "firecracker"
+	if forceProcessBackend {
+		defaultBackend = "process"
+		logger.Info("--force-process-backend set: all agents will use process backend")
+	} else if useMock {
+		defaultBackend = "process"
+		logger.Warn("KVM/Firecracker unavailable: falling back to process backend for all agents")
+	}
+	agentMgr := backend.NewAgentManager(backendRegistry, defaultBackend, logger)
+	if forceProcessBackend {
+		agentMgr.SetForceProcess(true)
+	}
 
 	// Load agent manifests to determine correct backend for each agent.
 	startupAgents, startupAgentsErr := config.LoadAgents(absRoot)
@@ -1387,6 +1412,43 @@ func (h *controlHandler) handleCapabilitiesDescribe(msg *nats.Msg) {
 
 		h.respondError(msg, fmt.Sprintf("capability %q not found", capReq.Name))
 	})
+}
+
+// resolveRootfsPath determines the rootfs image path using the following
+// precedence: (1) explicit --rootfs-path flag, (2) local file at the standard
+// location in the cluster root, (3) auto-download via ImageManager.
+// Returns the resolved path and any error. An empty string with no error means
+// no override is needed (the VM manager will use its default path).
+func resolveRootfsPath(ctx context.Context, flagPath, clusterRoot string, logger *slog.Logger) (string, error) {
+	// 1. Explicit --rootfs-path flag takes precedence.
+	if flagPath != "" {
+		abs, err := filepath.Abs(flagPath)
+		if err != nil {
+			return "", fmt.Errorf("resolving rootfs path: %w", err)
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return "", fmt.Errorf("rootfs image not found at %s: %w", abs, err)
+		}
+		logger.Info("using explicit rootfs path", "path", abs)
+		return abs, nil
+	}
+
+	// 2. Check if a local rootfs exists at the standard location.
+	localRootfs := filepath.Join(clusterRoot, "rootfs", "rootfs.ext4")
+	if _, err := os.Stat(localRootfs); err == nil {
+		logger.Info("using local rootfs image", "path", localRootfs)
+		return "", nil // empty string = use the default path in the VM manager
+	}
+
+	// 3. Auto-download via ImageManager.
+	logger.Info("no local rootfs found, attempting auto-download")
+	imgMgr := vm.NewImageManager("", version, logger)
+	imagePath, err := imgMgr.EnsureImage(ctx, "base")
+	if err != nil {
+		return "", fmt.Errorf("auto-downloading rootfs image: %w", err)
+	}
+
+	return imagePath, nil
 }
 
 // sdNotify sends READY=1 to systemd's notification socket if NOTIFY_SOCKET

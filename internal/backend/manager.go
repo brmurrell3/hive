@@ -25,6 +25,7 @@ type AgentManager struct {
 	logger         *slog.Logger
 	mu             sync.RWMutex
 	agentBackends  map[string]string // agentID -> backend name
+	forceProcess   bool              // when true, always use "process" backend regardless of manifest
 }
 
 // NewAgentManager creates a new AgentManager with the given backend registry.
@@ -39,8 +40,29 @@ func NewAgentManager(registry *Registry, defaultBackend string, logger *slog.Log
 	}
 }
 
+// SetForceProcess enables or disables forced process backend mode.
+// When enabled, resolveBackend always returns the "process" backend
+// regardless of the agent manifest's runtime.backend field.
+func (m *AgentManager) SetForceProcess(force bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forceProcess = force
+}
+
 // resolveBackend determines which backend to use for the given agent manifest.
 func (m *AgentManager) resolveBackend(spec *types.AgentManifest) (Backend, error) {
+	m.mu.RLock()
+	force := m.forceProcess
+	m.mu.RUnlock()
+
+	if force {
+		m.logger.Warn("force-process-backend active: overriding backend to process",
+			"agent_id", spec.Metadata.ID,
+			"configured_backend", spec.Spec.Runtime.Backend,
+		)
+		return m.registry.Get("process")
+	}
+
 	backendName := spec.Spec.Runtime.Backend
 	if backendName == "" {
 		backendName = m.defaultBackend

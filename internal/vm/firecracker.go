@@ -286,6 +286,29 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		}
 	}
 
+	// Configure shared volume drives. Each volume is an ext4 image created
+	// from the team's shared directory. They appear as /dev/vdc, /dev/vdd, etc.
+	// inside the guest (after rootfs on /dev/vda and agent drive on /dev/vdb).
+	for i, vol := range cfg.Volumes {
+		driveID := fmt.Sprintf("shared-%d", i)
+		drive := firecrackerDrive{
+			DriveID:      driveID,
+			PathOnHost:   vol.HostPath,
+			IsRootDevice: false,
+			IsReadOnly:   vol.ReadOnly,
+		}
+		if err := apiPut(client, cfg.SocketPath, fmt.Sprintf("/drives/%s", driveID), drive); err != nil {
+			f.mu.Lock()
+			if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+				delete(f.processes, cfg.SocketPath)
+			}
+			f.mu.Unlock()
+			_ = cmd.Process.Kill()
+			waitForReap(fp, 5*time.Second)
+			return 0, fmt.Errorf("configuring shared volume drive %q: %w", vol.Name, err)
+		}
+	}
+
 	// Configure the machine (vCPUs, memory).
 	machineCfg := firecrackerMachineConfig{
 		VCPUCount:  cfg.VCPUs,

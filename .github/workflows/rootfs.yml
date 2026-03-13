@@ -1,0 +1,80 @@
+name: Build Rootfs Images
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Image variant to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - base
+          - openclaw
+
+permissions:
+  contents: write
+
+jobs:
+  build-rootfs:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build hive-sidecar
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -o hive-sidecar ./cmd/hive-sidecar/
+
+      - name: Install e2fsprogs
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Build base rootfs
+        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'base' || github.event_name == 'release'
+        run: |
+          cd rootfs
+          chmod +x build-rootfs.sh
+          ./build-rootfs.sh hive-rootfs-${{ matrix.arch }}.ext4 512M ../hive-sidecar
+          gzip -9 hive-rootfs-${{ matrix.arch }}.ext4
+          sha256sum hive-rootfs-${{ matrix.arch }}.ext4.gz > hive-rootfs-${{ matrix.arch }}.ext4.gz.sha256
+
+      - name: Build OpenClaw rootfs
+        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'openclaw' || github.event_name == 'release'
+        run: |
+          cd rootfs
+          chmod +x build-rootfs-openclaw.sh
+          ./build-rootfs-openclaw.sh hive-rootfs-openclaw-${{ matrix.arch }}.ext4 1G ../hive-sidecar
+          gzip -9 hive-rootfs-openclaw-${{ matrix.arch }}.ext4
+          sha256sum hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz > hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz.sha256
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd rootfs
+          for f in *.ext4.gz *.sha256; do
+            [ -f "$f" ] && gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
+          done
+
+      - name: Upload artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.arch }}
+          path: rootfs/*.ext4.gz*

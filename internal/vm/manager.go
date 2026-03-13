@@ -45,6 +45,13 @@ type Hypervisor interface {
 	IsRunning(pid int) bool
 }
 
+// VMVolume represents a shared volume drive to be attached to the VM.
+type VMVolume struct {
+	Name     string // logical name of the volume
+	HostPath string // path to the ext4 image on the host
+	ReadOnly bool   // whether the volume is read-only inside the guest
+}
+
 // VMConfig holds the configuration for creating a new Firecracker VM.
 type VMConfig struct {
 	AgentID        string
@@ -53,8 +60,11 @@ type VMConfig struct {
 	KernelPath     string
 	MemoryMB       int
 	VCPUs          int
+	DiskMB         int            // disk size in megabytes for the agent drive image
 	CID            uint32
-	AgentDrivePath string // path to ext4 disk image for agent files
+	AgentDrivePath string         // path to ext4 disk image for agent files
+	NetworkPolicy  *NetworkPolicy // nil means egress: full (default)
+	Volumes        []VMVolume     // optional shared volume drives
 }
 
 // MaxSocketPathLen is the maximum length (in bytes) allowed for derived Unix
@@ -75,6 +85,7 @@ type Manager struct {
 	nextCID                  uint32
 	forwarders               map[string]*VsockForwarder // agentID -> VsockForwarder
 	skipSocketPathValidation bool                       // set to true in tests with mock hypervisors
+	rootfsOverride           string                     // if set, use this rootfs image instead of {clusterRoot}/rootfs/rootfs.ext4
 
 	// Resource accounting
 	totalMemoryMB  int64    // Total memory available for VMs (0 = unlimited)
@@ -106,6 +117,23 @@ func NewManager(clusterRoot string, store *state.Store, logger *slog.Logger, hyp
 		totalMemoryMB: totalMemoryMB,
 		totalVCPUs:    totalVCPUs,
 	}
+}
+
+// SetRootfsOverride sets a custom rootfs image path that overrides the default
+// {clusterRoot}/rootfs/rootfs.ext4 location. This is used when a rootfs image
+// is provided via --rootfs-path or auto-downloaded by the ImageManager.
+func (m *Manager) SetRootfsOverride(path string) {
+	m.rootfsOverride = path
+}
+
+// resolveBaseRootfs returns the path to the base rootfs image. If a rootfs
+// override has been set (via SetRootfsOverride), it is used. Otherwise, the
+// default location {clusterRoot}/rootfs/rootfs.ext4 is returned.
+func (m *Manager) resolveBaseRootfs() string {
+	if m.rootfsOverride != "" {
+		return m.rootfsOverride
+	}
+	return filepath.Join(m.clusterRoot, "rootfs", "rootfs.ext4")
 }
 
 // allocateCID returns the next available unique CID for virtio-vsock.
@@ -228,7 +256,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	}
 
 	// Resolve resource values from the manifest (no lock needed, pure computation).
-	memoryMB, vcpus, err := m.resolveResources(agent)
+	memoryMB, vcpus, diskMB, err := m.resolveResources(agent)
 	if err != nil {
 		return fmt.Errorf("resolving resources for agent %s: %w", agentID, err)
 	}
@@ -321,7 +349,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 
 	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
 	kernelPath := filepath.Join(m.clusterRoot, "rootfs", "vmlinux")
-	baseRootfs := filepath.Join(m.clusterRoot, "rootfs", "rootfs.ext4")
+	baseRootfs := m.resolveBaseRootfs()
 	agentDir := filepath.Join(m.clusterRoot, "agents", agentID)
 	agentDriveImg := filepath.Join(stateDir, "agent-drive.img")
 
@@ -365,6 +393,28 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		confContent += fmt.Sprintf("RUNTIME_CMD=%s\n", rtType)
 	}
 
+	// Pass network egress mode so the VM init script can enforce network policy.
+	if agent.Spec.Network.Egress != "" {
+		egressMode := agent.Spec.Network.Egress
+		if strings.ContainsAny(egressMode, "\n\r'\"\\$`") {
+			return fmt.Errorf("invalid egress mode contains special characters: %s", egressMode)
+		}
+		confContent += fmt.Sprintf("HIVE_EGRESS_MODE=%s\n", egressMode)
+
+		// Pass allowlist as JSON array when egress is restricted.
+		if egressMode == "restricted" && len(agent.Spec.Network.EgressAllowlist) > 0 {
+			allowlistJSON, jsonErr := json.Marshal(agent.Spec.Network.EgressAllowlist)
+			if jsonErr != nil {
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("marshaling egress allowlist for %s: %w", agentID, jsonErr))
+			}
+			if bytes.ContainsAny(allowlistJSON, "\n\r") {
+				return fmt.Errorf("egress allowlist JSON contains newline characters")
+			}
+			confContent += fmt.Sprintf("HIVE_EGRESS_ALLOWLIST=%s\n", string(allowlistJSON))
+		}
+	}
+
 	// Pass capabilities as a JSON array so the sidecar can register them.
 	if len(agent.Spec.Capabilities) > 0 {
 		capsJSON, jsonErr := json.Marshal(agent.Spec.Capabilities)
@@ -378,7 +428,84 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		confContent += fmt.Sprintf("CAPABILITIES=%s\n", string(capsJSON))
 	}
 
+	// Resolve shared volumes: look up agent volumes against team shared_volumes,
+	// create ext4 images for each, and build the HIVE_VOLUMES env var for the
+	// guest init script. Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
+	// (after vda=rootfs, vdb=agent drive).
+	var volumeMounts []VMVolume
+	var volumeImgPaths []string // track created images for cleanup on failure
+	if len(agent.Spec.Volumes) > 0 && agent.Metadata.Team != "" {
+		teams, teamsErr := config.LoadTeams(m.clusterRoot)
+		if teamsErr != nil {
+			os.Remove(rootfsCopy)
+			return m.failAgent(agentState, fmt.Errorf("loading teams for volume resolution: %w", teamsErr))
+		}
+		team, teamFound := teams[agent.Metadata.Team]
+		if !teamFound {
+			os.Remove(rootfsCopy)
+			return m.failAgent(agentState, fmt.Errorf("team %q not found for agent %s volume resolution", agent.Metadata.Team, agentID))
+		}
+
+		// Build lookup map of team shared volumes.
+		svByName := make(map[string]*types.SharedVolume)
+		for i := range team.Spec.SharedVolumes {
+			svByName[team.Spec.SharedVolumes[i].Name] = &team.Spec.SharedVolumes[i]
+		}
+
+		// Guest block devices: vda=rootfs, vdb=agent, vdc..vdz=shared volumes.
+		var hiveVolumeParts []string
+		for i, vol := range agent.Spec.Volumes {
+			sv, svFound := svByName[vol.Name]
+			if !svFound {
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("agent %s volume %q references nonexistent team shared_volume", agentID, vol.Name))
+			}
+
+			readOnly := vol.Access == "ro"
+			// If the team shared_volume specifies read-only access, the agent
+			// cannot override it to read-write.
+			if sv.Access == "ro" {
+				readOnly = true
+			}
+
+			guestDevice := fmt.Sprintf("/dev/vd%c", 'c'+i)
+			accessStr := "rw"
+			if readOnly {
+				accessStr = "ro"
+			}
+
+			// Create an ext4 image from the shared volume's host_path directory.
+			volImgPath := filepath.Join(stateDir, fmt.Sprintf("shared-vol-%d.img", i))
+			if err := createSharedVolumeImage(ctx, sv.HostPath, volImgPath); err != nil {
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("creating shared volume image for %s vol %q: %w", agentID, vol.Name, err))
+			}
+			volumeImgPaths = append(volumeImgPaths, volImgPath)
+
+			volumeMounts = append(volumeMounts, VMVolume{
+				Name:     vol.Name,
+				HostPath: volImgPath, // Firecracker gets the ext4 image path
+				ReadOnly: readOnly,
+			})
+
+			hiveVolumeParts = append(hiveVolumeParts, fmt.Sprintf("%s:%s:%s", guestDevice, vol.MountPath, accessStr))
+		}
+
+		if len(hiveVolumeParts) > 0 {
+			confContent += fmt.Sprintf("HIVE_VOLUMES=%s\n", strings.Join(hiveVolumeParts, "|"))
+		}
+	}
+
 	if err := os.WriteFile(sidecarConf, []byte(confContent), 0600); err != nil {
+		for _, imgPath := range volumeImgPaths {
+			os.Remove(imgPath)
+		}
 		os.Remove(rootfsCopy)
 		return m.failAgent(agentState, fmt.Errorf("writing sidecar.conf for %s: %w", agentID, err))
 	}
@@ -386,7 +513,10 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// Create ext4 disk image from agent directory for Firecracker drive API.
 	var agentDrivePath string
 	if _, err := os.Stat(agentDir); err == nil {
-		if err := createAgentDriveImage(ctx, agentDir, agentDriveImg); err != nil {
+		if err := createAgentDriveImage(ctx, agentDir, agentDriveImg, diskMB); err != nil {
+			for _, imgPath := range volumeImgPaths {
+				os.Remove(imgPath)
+			}
 			os.Remove(rootfsCopy)
 			os.Remove(sidecarConf)
 			os.Remove(agentDriveImg)
@@ -399,12 +529,27 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	var cidErr error
 	cid, cidErr = m.allocateCID()
 	if cidErr != nil {
+		for _, imgPath := range volumeImgPaths {
+			os.Remove(imgPath)
+		}
 		os.Remove(rootfsCopy)
 		os.Remove(sidecarConf)
 		os.Remove(agentDriveImg)
 		return m.failAgent(agentState, fmt.Errorf("allocating CID for agent %s: %w", agentID, cidErr))
 	}
 	cidReleased = false // CID now allocated; deferred cleanup will release on failure
+
+	// Build network policy for the VM if egress is configured.
+	var netPolicy *NetworkPolicy
+	if agent.Spec.Network.Egress != "" {
+		tapDevice := fmt.Sprintf("tap-%s", agentID)
+		netPolicy = &NetworkPolicy{
+			TapDevice: tapDevice,
+			Egress:    agent.Spec.Network.Egress,
+			Allowlist: agent.Spec.Network.EgressAllowlist,
+			Ingress:   agent.Spec.Network.Ingress,
+		}
+	}
 
 	vmCfg := VMConfig{
 		AgentID:        agentID,
@@ -413,8 +558,11 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		KernelPath:     kernelPath,
 		MemoryMB:       memoryMB,
 		VCPUs:          vcpus,
+		DiskMB:         diskMB,
 		CID:            cid,
 		AgentDrivePath: agentDrivePath,
+		NetworkPolicy:  netPolicy,
+		Volumes:        volumeMounts,
 	}
 
 	vmPID, err := m.hypervisor.CreateVM(vmCfg)
@@ -1092,6 +1240,17 @@ func (m *Manager) cleanupAgentArtifacts(agentID string) {
 		m.logger.Debug("error removing agent drive image during cleanup", "agent_id", agentID, "path", agentDriveImg, "error", err)
 	}
 
+	// Remove shared volume images (shared-vol-0.img, shared-vol-1.img, ...).
+	volMatches, volGlobErr := filepath.Glob(filepath.Join(stateDir, "shared-vol-*.img"))
+	if volGlobErr != nil {
+		m.logger.Warn("filepath.Glob failed during shared volume cleanup", "pattern", "shared-vol-*.img", "error", volGlobErr)
+	}
+	for _, volImg := range volMatches {
+		if err := os.Remove(volImg); err != nil && !os.IsNotExist(err) {
+			m.logger.Debug("error removing shared volume image during cleanup", "agent_id", agentID, "path", volImg, "error", err)
+		}
+	}
+
 	// Remove firecracker log file.
 	logFile := filepath.Join(stateDir, "firecracker.log")
 	if err := os.Remove(logFile); err != nil && !os.IsNotExist(err) {
@@ -1122,20 +1281,22 @@ func (m *Manager) StopAllForwarders() {
 	}
 }
 
-// resolveResources extracts memory (in MB) and vCPU count from the agent
-// manifest, using defaults if not specified.
-func (m *Manager) resolveResources(agent *types.AgentManifest) (memoryMB int, vcpus int, err error) {
-	memoryMB = 512 // default
-	vcpus = 1      // default
+// resolveResources extracts memory (in MB), vCPU count, and disk size (in MB)
+// from the agent manifest, using defaults if not specified.
+// Defaults: 512 MiB memory, 1 vCPU, 1 GiB disk.
+func (m *Manager) resolveResources(agent *types.AgentManifest) (memoryMB int, vcpus int, diskMB int, err error) {
+	memoryMB = 512
+	vcpus = 1
+	diskMB = 1024
 
 	if agent.Spec.Resources.Memory != "" {
-		bytes, parseErr := config.ParseMemory(agent.Spec.Resources.Memory)
+		memBytes, parseErr := config.ParseMemory(agent.Spec.Resources.Memory)
 		if parseErr != nil {
-			return 0, 0, fmt.Errorf("parsing memory %q: %w", agent.Spec.Resources.Memory, parseErr)
+			return 0, 0, 0, fmt.Errorf("parsing memory %q: %w", agent.Spec.Resources.Memory, parseErr)
 		}
-		memoryMB = int(bytes / (1024 * 1024))
+		memoryMB = int(memBytes / (1024 * 1024))
 		if memoryMB <= 0 {
-			return 0, 0, fmt.Errorf("memory %d bytes resolves to 0 MiB", bytes)
+			return 0, 0, 0, fmt.Errorf("memory %d bytes resolves to 0 MiB", memBytes)
 		}
 	}
 
@@ -1143,14 +1304,28 @@ func (m *Manager) resolveResources(agent *types.AgentManifest) (memoryMB int, vc
 		vcpus = agent.Spec.Resources.VCPUs
 	}
 
-	if vcpus > 256 {
-		return 0, 0, fmt.Errorf("VCPUs %d exceeds maximum of 256", vcpus)
-	}
-	if memoryMB > 1024*1024 { // 1 TiB
-		return 0, 0, fmt.Errorf("memory %d MiB exceeds maximum of 1 TiB", memoryMB)
+	if agent.Spec.Resources.Disk != "" {
+		diskBytes, parseErr := config.ParseDiskSize(agent.Spec.Resources.Disk)
+		if parseErr != nil {
+			return 0, 0, 0, fmt.Errorf("parsing disk %q: %w", agent.Spec.Resources.Disk, parseErr)
+		}
+		diskMB = int(diskBytes / (1024 * 1024))
+		if diskMB <= 0 {
+			return 0, 0, 0, fmt.Errorf("disk %d bytes resolves to 0 MiB", diskBytes)
+		}
 	}
 
-	return memoryMB, vcpus, nil
+	if vcpus > 256 {
+		return 0, 0, 0, fmt.Errorf("VCPUs %d exceeds maximum of 256", vcpus)
+	}
+	if memoryMB > 1024*1024 {
+		return 0, 0, 0, fmt.Errorf("memory %d MiB exceeds maximum of 1 TiB", memoryMB)
+	}
+	if diskMB > 10*1024*1024 {
+		return 0, 0, 0, fmt.Errorf("disk %d MiB exceeds maximum of 10 TiB", diskMB)
+	}
+
+	return memoryMB, vcpus, diskMB, nil
 }
 
 // failAgent transitions an agent to the FAILED state with an error message.
@@ -1180,7 +1355,7 @@ func (m *Manager) failAgent(agentState *state.AgentState, cause error) error {
 // empty placeholder file is created instead. The mock hypervisor used in tests
 // never reads the drive image, so this is safe for development and CI on
 // non-Linux platforms.
-func createAgentDriveImage(ctx context.Context, agentDir, imgPath string) error {
+func createAgentDriveImage(ctx context.Context, agentDir, imgPath string, diskMB int) error {
 	mkfsPath, err := exec.LookPath("mkfs.ext4")
 	if err != nil {
 		// mkfs.ext4 is not available (e.g. macOS). Create an empty placeholder
@@ -1212,14 +1387,19 @@ func createAgentDriveImage(ctx context.Context, agentDir, imgPath string) error 
 		return fmt.Errorf("calculating agent directory size: %w", walkErr)
 	}
 
-	// Enforce an upper bound on the agent drive image size (1 GB).
-	const maxAgentDriveSize int64 = 1 << 30 // 1 GiB
-	if totalSize > maxAgentDriveSize {
-		return fmt.Errorf("agent directory too large for drive image: %d bytes (max %d bytes)", totalSize, maxAgentDriveSize)
+	// Enforce an upper bound: the configured disk size is the hard limit.
+	maxDriveBytes := int64(diskMB) * 1024 * 1024
+	if totalSize > maxDriveBytes {
+		return fmt.Errorf("agent directory too large for drive image: %d bytes (max %d bytes from spec.resources.disk)", totalSize, maxDriveBytes)
 	}
 
-	// Add padding for ext4 metadata and overhead (at least 4MB).
-	imgSizeMB := (totalSize/(1024*1024) + 4)
+	// Use the configured disk size. Ensure at least 4 MB for ext4 metadata,
+	// and at least enough for directory contents plus overhead.
+	imgSizeMB := int64(diskMB)
+	contentSizeMB := totalSize/(1024*1024) + 4 // contents + ext4 overhead
+	if contentSizeMB > imgSizeMB {
+		imgSizeMB = contentSizeMB
+	}
 	if imgSizeMB < 4 {
 		imgSizeMB = 4
 	}
@@ -1233,6 +1413,80 @@ func createAgentDriveImage(ctx context.Context, agentDir, imgPath string) error 
 	if out, runErr := mkfs.CombinedOutput(); runErr != nil {
 		os.Remove(imgPath)
 		return fmt.Errorf("mkfs.ext4 -d: %s: %w", string(out), runErr)
+	}
+
+	return nil
+}
+
+// createSharedVolumeImage creates an ext4 disk image from a shared volume's
+// host directory. The image can be attached as an additional Firecracker drive.
+//
+// This uses mkfs.ext4 -d to populate the filesystem from the source directory
+// without requiring mount/umount (which need root or CAP_SYS_ADMIN).
+//
+// Note: Firecracker does not support true virtiofs pass-through. Shared volumes
+// are packaged as ext4 block device images. Changes inside the VM are written
+// to the image, not synced back to the host directory in real time. For true
+// live sharing between host and guest, a virtiofsd daemon would be needed.
+func createSharedVolumeImage(ctx context.Context, hostDir, imgPath string) error {
+	mkfsPath, err := exec.LookPath("mkfs.ext4")
+	if err != nil {
+		// mkfs.ext4 is not available (e.g. macOS). Create an empty placeholder
+		// so that the rest of the startup path can proceed.
+		slog.Warn("mkfs.ext4 not found in PATH; creating empty shared volume placeholder",
+			"host_dir", hostDir,
+			"img_path", imgPath,
+		)
+		f, createErr := os.Create(imgPath)
+		if createErr != nil {
+			return fmt.Errorf("creating shared volume placeholder: %w", createErr)
+		}
+		return f.Close()
+	}
+
+	// Verify the host directory exists.
+	info, statErr := os.Stat(hostDir)
+	if statErr != nil {
+		return fmt.Errorf("shared volume host path %q: %w", hostDir, statErr)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("shared volume host path %q is not a directory", hostDir)
+	}
+
+	// Calculate the size needed (minimum 4MB to fit ext4 metadata).
+	var totalSize int64
+	walkErr := filepath.Walk(hostDir, func(_ string, fi os.FileInfo, walkEntryErr error) error {
+		if walkEntryErr != nil {
+			return walkEntryErr
+		}
+		if !fi.IsDir() {
+			totalSize += fi.Size()
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return fmt.Errorf("calculating shared volume directory size: %w", walkErr)
+	}
+
+	// Enforce an upper bound on the shared volume image size (2 GB).
+	const maxSharedVolSize int64 = 2 << 30 // 2 GiB
+	if totalSize > maxSharedVolSize {
+		return fmt.Errorf("shared volume directory too large: %d bytes (max %d bytes)", totalSize, maxSharedVolSize)
+	}
+
+	// Add padding for ext4 metadata and overhead (at least 4MB).
+	imgSizeMB := (totalSize/(1024*1024) + 4)
+	if imgSizeMB < 4 {
+		imgSizeMB = 4
+	}
+
+	sizeBlocks := fmt.Sprintf("%dk", imgSizeMB*1024)
+	mkfsCtx, mkfsCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer mkfsCancel()
+	mkfs := exec.CommandContext(mkfsCtx, mkfsPath, "-q", "-F", "-d", hostDir, imgPath, sizeBlocks)
+	if out, runErr := mkfs.CombinedOutput(); runErr != nil {
+		os.Remove(imgPath)
+		return fmt.Errorf("mkfs.ext4 -d (shared volume): %s: %w", string(out), runErr)
 	}
 
 	return nil

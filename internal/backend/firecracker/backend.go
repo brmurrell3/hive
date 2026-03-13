@@ -120,9 +120,21 @@ func (b *Backend) Available() backend.Resources {
 func (b *Backend) Allocated() backend.Resources {
 	var total backend.Resources
 	for _, agent := range b.store.AllAgents() {
-		if agent.Status == state.AgentStatusRunning {
-			total.MemoryMB += 256 // default estimate
-			total.VCPUs++
+		if agent.Status == state.AgentStatusRunning ||
+			agent.Status == state.AgentStatusStarting ||
+			agent.Status == state.AgentStatusCreating {
+			// Use actual resource values from agent state (set during StartAgent).
+			// MemoryBytes is stored in bytes; convert to MB for the Resources struct.
+			if agent.MemoryBytes > 0 {
+				total.MemoryMB += agent.MemoryBytes / (1024 * 1024)
+			} else {
+				total.MemoryMB += 512 // fallback default if not recorded
+			}
+			if agent.VCPUs > 0 {
+				total.VCPUs += agent.VCPUs
+			} else {
+				total.VCPUs++ // fallback default: 1 vCPU
+			}
 		}
 	}
 	return total
