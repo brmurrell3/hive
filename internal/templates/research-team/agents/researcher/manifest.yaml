@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: researcher
+  team: research-team
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: research-topic
+      description: "Research a topic and produce raw findings. Orchestrates synthesizer for final output."
+      inputs:
+        - name: topic
+          type: string
+          description: "The topic to research"
+        - name: depth
+          type: string
+          description: "Research depth: basic or deep"
+          required: false
+      outputs:
+        - name: findings
+          type: string
+          description: "Raw research findings"
+        - name: sources_count
+          type: int
+          description: "Number of sources consulted"
+        - name: depth
+          type: string
+          description: "Depth level used for research"

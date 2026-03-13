@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: code-reviewer
+  team: ci-pipeline
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: review-code
+      description: "Review source code for bugs, style issues, and improvements. Returns structured findings."
+      inputs:
+        - name: file_path
+          type: string
+          description: "Path to file or directory to review"
+        - name: diff
+          type: string
+          description: "Git diff to review (optional, takes precedence over file_path)"
+          required: false
+      outputs:
+        - name: review
+          type: string
+          description: "Structured review with findings"
+        - name: severity
+          type: string
+          description: "Overall severity: info, warning, or critical"
+        - name: findings_count
+          type: int
+          description: "Number of individual findings"

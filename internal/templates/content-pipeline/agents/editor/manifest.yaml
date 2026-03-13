@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: editor
+  team: content-pipeline
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: edit-content
+      description: "Edit content for style consistency and clarity."
+      inputs:
+        - name: content
+          type: string
+          description: "The content to edit"
+        - name: style
+          type: string
+          description: "Style guide: ap, chicago, or casual"
+          required: false
+      outputs:
+        - name: edited_content
+          type: string
+          description: "The edited content"
+        - name: changes_made
+          type: int
+          description: "Number of edits applied"
+        - name: style
+          type: string
+          description: "The style guide applied"

@@ -1,0 +1,26 @@
+{
+  "name": "@hive/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for building Hive agents",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx --test test/agent.test.ts",
+    "test:js": "tsc && node --test dist/test/agent.test.js",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: transformer
+  team: data-processor
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: transform-data
+      description: "Apply transformations to data such as normalization, deduplication, or filtering."
+      inputs:
+        - name: data
+          type: string
+          description: "JSON string of data records to transform"
+        - name: operations
+          type: string
+          description: "Comma-separated list of operations (e.g., normalize,deduplicate,filter)"
+          required: false
+      outputs:
+        - name: data
+          type: string
+          description: "Transformed data as JSON"
+        - name: records_count
+          type: int
+          description: "Number of records after transformation"
+        - name: operations_applied
+          type: string
+          description: "List of operations that were applied"

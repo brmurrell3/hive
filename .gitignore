@@ -38,3 +38,6 @@ VALIDATE.sh
 
 # Deployment configs (contain user-specific secrets/settings)
 deploy/
+
+# Node modules
+node_modules/

@@ -1,0 +1,31 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: synthesizer
+  team: research-team
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: synthesize-findings
+      description: "Synthesize research findings into a formatted output (summary, report, or briefing)."
+      inputs:
+        - name: findings
+          type: string
+          description: "Raw research findings to synthesize"
+        - name: format
+          type: string
+          description: "Output format: summary, report, or briefing"
+          required: false
+      outputs:
+        - name: synthesis
+          type: string
+          description: "Formatted synthesis of the findings"
+        - name: format
+          type: string
+          description: "The format used for synthesis"
+        - name: word_count
+          type: int
+          description: "Word count of the synthesis"

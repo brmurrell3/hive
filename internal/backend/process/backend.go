@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"sync"
@@ -27,10 +28,11 @@ import (
 
 // Backend implements backend.Backend for local processes.
 type Backend struct {
-	logger    *slog.Logger
-	store     *state.Store
-	mu        sync.RWMutex
-	instances map[string]*processInstance
+	logger      *slog.Logger
+	store       *state.Store
+	clusterRoot string // absolute path to the cluster root directory
+	mu          sync.RWMutex
+	instances   map[string]*processInstance
 }
 
 type processInstance struct {
@@ -50,12 +52,20 @@ func (i *processInstance) Backend() string { return "process" }
 
 // New creates a new process backend. The store parameter is optional (may be
 // nil) for backward compatibility; when non-nil the backend writes agent
-// status transitions into the state store.
-func New(logger *slog.Logger, store *state.Store) *Backend {
+// status transitions into the state store. The clusterRoot parameter is
+// optional (may be empty) and is required for OpenClaw runtime support;
+// when set it provides the base path for agent source directories and
+// workspace state.
+func New(logger *slog.Logger, store *state.Store, clusterRoot ...string) *Backend {
+	root := ""
+	if len(clusterRoot) > 0 {
+		root = clusterRoot[0]
+	}
 	return &Backend{
-		logger:    logger,
-		store:     store,
-		instances: make(map[string]*processInstance),
+		logger:      logger,
+		store:       store,
+		clusterRoot: root,
+		instances:   make(map[string]*processInstance),
 	}
 }
 
@@ -73,16 +83,50 @@ func (b *Backend) Capabilities() backend.BackendCaps {
 
 func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backend.Instance, error) {
 	agentID := spec.Metadata.ID
-	runtimeCmd := spec.Spec.Runtime.Command
-	if runtimeCmd == "" {
-		return nil, fmt.Errorf("agent %q has no runtime command specified", agentID)
-	}
 
-	parts := strings.Fields(runtimeCmd)
-	cmdName := parts[0]
+	var cmdName string
 	var cmdArgs []string
-	if len(parts) > 1 {
-		cmdArgs = parts[1:]
+	var openclawPort int
+
+	if isOpenClawRuntime(spec) {
+		// OpenClaw runtime path: use the openclaw binary instead of
+		// the manifest's runtime.command.
+		if b.clusterRoot == "" {
+			return nil, fmt.Errorf("agent %q uses openclaw runtime but process backend has no cluster root configured", agentID)
+		}
+
+		binaryPath, err := findOpenClawBinary()
+		if err != nil {
+			return nil, fmt.Errorf("agent %q: %w", agentID, err)
+		}
+
+		workspacePath, port, err := prepareOpenClawWorkspace(b.clusterRoot, agentID, spec)
+		if err != nil {
+			return nil, fmt.Errorf("agent %q: %w", agentID, err)
+		}
+
+		configPath := filepath.Join(workspacePath, "openclaw.json")
+		cmdName = binaryPath
+		cmdArgs = []string{"--config", configPath}
+		openclawPort = port
+
+		b.logger.Info("openclaw workspace prepared",
+			"agent_id", agentID,
+			"workspace", workspacePath,
+			"gateway_port", port,
+		)
+	} else {
+		// Standard process runtime path.
+		runtimeCmd := spec.Spec.Runtime.Command
+		if runtimeCmd == "" {
+			return nil, fmt.Errorf("agent %q has no runtime command specified", agentID)
+		}
+
+		parts := strings.Fields(runtimeCmd)
+		cmdName = parts[0]
+		if len(parts) > 1 {
+			cmdArgs = parts[1:]
+		}
 	}
 
 	procCtx, cancel := context.WithCancel(context.Background())
@@ -108,6 +152,14 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	}
 	if v := os.Getenv("HIVE_CALLBACK_PORT"); v != "" {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_CALLBACK_PORT=%s", v))
+	}
+
+	// Add OpenClaw-specific env vars.
+	// NOTE: The sidecar bridges capability invocations to the OpenClaw
+	// gateway via HTTP at this port. That integration is handled separately
+	// in the sidecar package.
+	if openclawPort > 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_OPENCLAW_PORT=%d", openclawPort))
 	}
 
 	// Add model env vars.
@@ -155,7 +207,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	b.instances[agentID] = inst
 	b.mu.Unlock()
 
-	b.logger.Info("process instance created", "agent_id", agentID, "cmd", runtimeCmd)
+	b.logger.Info("process instance created", "agent_id", agentID, "cmd", cmdName)
 	return inst, nil
 }
 

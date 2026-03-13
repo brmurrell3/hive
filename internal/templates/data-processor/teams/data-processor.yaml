@@ -1,0 +1,9 @@
+apiVersion: hive/v1
+kind: Team
+metadata:
+  id: data-processor
+spec:
+  lead: ingestor
+  communication:
+    persistent: true
+    historyDepth: 50

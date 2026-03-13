@@ -11,12 +11,16 @@ import (
 	"strings"
 )
 
-//go:embed all:init all:ci-pipeline
+//go:embed all:init all:ci-pipeline all:research-team all:content-pipeline all:data-processor all:monitor
 var embeddedFS embed.FS
 
 // templateDescriptions maps template names to one-line descriptions.
 var templateDescriptions = map[string]string{
-	"ci-pipeline": "Three-agent CI/CD pipeline: code review, testing, and security scanning",
+	"ci-pipeline":      "Three-agent CI/CD pipeline: code review, testing, and security scanning",
+	"research-team":    "Two-agent research team: topic research and findings synthesis",
+	"content-pipeline": "Three-agent content pipeline: drafting, editing, and fact-checking",
+	"data-processor":   "Three-agent data pipeline: ingestion, transformation, and validation",
+	"monitor":          "Two-agent monitoring system: target watching and alerting",
 }
 
 // ListTemplates returns available template names with descriptions.

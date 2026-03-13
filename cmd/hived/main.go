@@ -299,7 +299,7 @@ func run(clusterRoot string, logger *slog.Logger) error {
 	if err := backendRegistry.Register(fcBack); err != nil {
 		return fmt.Errorf("registering firecracker backend: %w", err)
 	}
-	procBack := procbackend.New(logger, store)
+	procBack := procbackend.New(logger, store, absRoot)
 	if err := backendRegistry.Register(procBack); err != nil {
 		return fmt.Errorf("registering process backend: %w", err)
 	}
@@ -1330,9 +1330,10 @@ func (h *controlHandler) handleCapabilitiesList(msg *nats.Msg) {
 		registry := h.store.GetCapabilityRegistry()
 
 		type capEntry struct {
-			Name    string `json:"name"`
-			AgentID string `json:"agent_id"`
-			Team    string `json:"team,omitempty"`
+			Name        string `json:"name"`
+			AgentID     string `json:"agent_id"`
+			Team        string `json:"team,omitempty"`
+			Description string `json:"description,omitempty"`
 		}
 
 		// Snapshot agent IDs for deterministic, safe iteration.
@@ -1346,9 +1347,10 @@ func (h *controlHandler) handleCapabilitiesList(msg *nats.Msg) {
 			entry := registry.Agents[agentID]
 			for _, cap := range entry.Capabilities {
 				result = append(result, capEntry{
-					Name:    cap.Name,
-					AgentID: agentID,
-					Team:    entry.TeamID,
+					Name:        cap.Name,
+					AgentID:     agentID,
+					Team:        entry.TeamID,
+					Description: cap.Description,
 				})
 			}
 		}

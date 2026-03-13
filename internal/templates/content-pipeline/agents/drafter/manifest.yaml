@@ -1,0 +1,35 @@
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: drafter
+  team: content-pipeline
+spec:
+  tier: native
+  runtime:
+    type: custom
+    command: "./entrypoint.sh"
+  capabilities:
+    - name: draft-content
+      description: "Draft content on a topic with configurable tone and length. Orchestrates editor and fact-checker."
+      inputs:
+        - name: topic
+          type: string
+          description: "The topic to write about"
+        - name: tone
+          type: string
+          description: "Writing tone: professional, casual, or technical"
+          required: false
+        - name: length
+          type: string
+          description: "Content length: short, medium, or long"
+          required: false
+      outputs:
+        - name: content
+          type: string
+          description: "The drafted content"
+        - name: word_count
+          type: int
+          description: "Word count of the draft"
+        - name: tone
+          type: string
+          description: "The tone used for drafting"
