@@ -41,3 +41,10 @@ deploy/
 
 # Node modules
 node_modules/
+
+# Python build artifacts
+__pycache__/
+*.egg-info/
+
+# TypeScript build output
+dist/
