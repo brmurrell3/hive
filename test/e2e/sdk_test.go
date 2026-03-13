@@ -343,10 +343,15 @@ func main() {
 	binPath := filepath.Join(srcDir, "go-test-agent")
 	cmd := exec.Command("go", "build", "-o", binPath, ".")
 	cmd.Dir = srcDir
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("GOPATH=%s", os.Getenv("GOPATH")),
-		"CGO_ENABLED=0",
-	)
+	buildEnv := append(os.Environ(), "CGO_ENABLED=0")
+	// Only set GOPATH explicitly if it is already set in the environment.
+	// Setting GOPATH="" breaks module-mode builds because Go needs
+	// GOPATH/pkg/mod for the module cache. When unset, Go uses its default
+	// ($HOME/go) which is correct.
+	if gp := os.Getenv("GOPATH"); gp != "" {
+		buildEnv = append(buildEnv, fmt.Sprintf("GOPATH=%s", gp))
+	}
+	cmd.Env = buildEnv
 
 	// The test agent imports from the main module, so we need a go.mod that
 	// replaces the module path to the local checkout.

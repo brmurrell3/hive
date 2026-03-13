@@ -20,6 +20,7 @@ type NetworkPolicy struct {
 	Egress    string   // "none", "restricted", "full"
 	Allowlist []string // hostnames/IPs allowed when egress is "restricted"
 	Ingress   string   // "none", "restricted", "full"
+	GatewayIP string   // host-side IP of the TAP interface (used to scope DNS rules)
 }
 
 // GenerateNftables produces nftables rules for the given policy.
@@ -51,11 +52,21 @@ func GenerateNftables(p NetworkPolicy) string {
 			fmt.Sprintf("    iifname %q accept", p.TapDevice),
 		)
 	case "restricted":
-		// Allow DNS always.
-		rules = append(rules,
-			fmt.Sprintf("    iifname %q udp dport 53 accept", p.TapDevice),
-			fmt.Sprintf("    iifname %q tcp dport 53 accept", p.TapDevice),
-		)
+		// Allow DNS scoped to the gateway IP (host-side of TAP) to prevent
+		// DNS traffic from reaching arbitrary destinations. If no gateway IP
+		// is configured, fall back to unscoped rules for backward compatibility.
+		if p.GatewayIP != "" {
+			directive := nftAddrDirective(p.GatewayIP)
+			rules = append(rules,
+				fmt.Sprintf("    iifname %q %s %s udp dport 53 accept", p.TapDevice, directive, p.GatewayIP),
+				fmt.Sprintf("    iifname %q %s %s tcp dport 53 accept", p.TapDevice, directive, p.GatewayIP),
+			)
+		} else {
+			rules = append(rules,
+				fmt.Sprintf("    iifname %q udp dport 53 accept", p.TapDevice),
+				fmt.Sprintf("    iifname %q tcp dport 53 accept", p.TapDevice),
+			)
+		}
 		// Allow NATS (4222).
 		rules = append(rules,
 			fmt.Sprintf("    iifname %q tcp dport 4222 accept", p.TapDevice),
@@ -68,7 +79,7 @@ func GenerateNftables(p NetworkPolicy) string {
 				continue // skip invalid entries silently (logged at call site)
 			}
 			rules = append(rules,
-				fmt.Sprintf("    iifname %q ip daddr %s accept", p.TapDevice, host),
+				fmt.Sprintf("    iifname %q %s %s accept", p.TapDevice, nftAddrDirective(host), host),
 			)
 		}
 		// Allow established/related connections.
@@ -138,6 +149,16 @@ func validateAllowlistHost(host string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid allowlist host %q: must be IP or CIDR", host)
+}
+
+// nftAddrDirective returns the correct nftables address family directive for
+// the given IP or CIDR. IPv6 addresses (containing ':') use "ip6 daddr",
+// while IPv4 addresses use "ip daddr".
+func nftAddrDirective(addr string) string {
+	if strings.Contains(addr, ":") {
+		return "ip6 daddr"
+	}
+	return "ip daddr"
 }
 
 // TapDeviceName returns a deterministic tap device name for an agent that

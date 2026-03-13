@@ -64,20 +64,21 @@ var blockedEnvKeys = map[string]bool{
 
 // dangerousGuestPaths are system paths that must not be used as mount guest paths.
 var dangerousGuestPaths = map[string]bool{
-	"/":     true,
-	"/etc":  true,
-	"/usr":  true,
-	"/bin":  true,
-	"/sbin": true,
-	"/lib":  true,
-	"/dev":  true,
-	"/proc": true,
-	"/sys":  true,
-	"/tmp":  true,
-	"/var":  true,
-	"/boot": true,
-	"/root": true,
-	"/home": true,
+	"/":      true,
+	"/etc":   true,
+	"/usr":   true,
+	"/bin":   true,
+	"/sbin":  true,
+	"/lib":   true,
+	"/dev":   true,
+	"/proc":  true,
+	"/sys":   true,
+	"/tmp":   true,
+	"/var":   true,
+	"/boot":  true,
+	"/root":  true,
+	"/home":  true,
+	"/agent": true,
 }
 
 // dangerousMountHostPaths are host paths that must not be used as mount host paths.
@@ -586,6 +587,12 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		mountNames := make(map[string]bool)
 		rwGuests := make(map[string]bool)
 		validMountModes := map[string]bool{"ro": true, "rw": true}
+		// Collect cleaned guest paths for prefix-overlap detection.
+		type mountGuestEntry struct {
+			name      string
+			cleanPath string
+		}
+		var guestPaths []mountGuestEntry
 		for _, m := range agent.Spec.Mounts {
 			if m.Name == "" {
 				ve.addf("%s: mount name is required", prefix)
@@ -625,6 +632,8 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 				if strings.Contains(m.Guest, "..") {
 					ve.addf("%s: mount %q guest path %q contains path traversal (..)", prefix, m.Name, m.Guest)
 				}
+				// Track for prefix-overlap detection.
+				guestPaths = append(guestPaths, mountGuestEntry{name: m.Name, cleanPath: cleanGuest})
 			}
 			if m.Mode != "" && !validMountModes[m.Mode] {
 				ve.addf("%s: mount %q mode must be one of [ro, rw], got %q", prefix, m.Name, m.Mode)
@@ -635,6 +644,21 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 					ve.addf("%s: mount %q overlapping rw mount on guest path %q", prefix, m.Name, m.Guest)
 				}
 				rwGuests[m.Guest] = true
+			}
+		}
+		// Detect prefix-overlapping mount paths (e.g. /data and /data/secrets).
+		for i := 0; i < len(guestPaths); i++ {
+			for j := i + 1; j < len(guestPaths); j++ {
+				a, b := guestPaths[i], guestPaths[j]
+				if a.cleanPath == b.cleanPath {
+					// Exact duplicates are already caught by the rw check above;
+					// report here for any mode combination.
+					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
+				} else if strings.HasPrefix(b.cleanPath, a.cleanPath+"/") {
+					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, b.cleanPath, b.name, a.cleanPath, a.name)
+				} else if strings.HasPrefix(a.cleanPath, b.cleanPath+"/") {
+					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
+				}
 			}
 		}
 	}

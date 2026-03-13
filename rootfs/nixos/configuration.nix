@@ -168,32 +168,28 @@ in
         . /agent/sidecar.conf
       fi
 
-      EXTRA_ARGS=""
+      # Build arguments safely using positional parameters to avoid eval injection.
+      set -- --agent-id "$AGENT_ID" --team-id "$TEAM_ID" \
+             --nats-url "$NATS_URL" \
+             --workspace /agent --vsock --vsock-port "$VSOCK_PORT"
 
       if [ -n "''${RUNTIME_CMD:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --runtime-cmd ''${RUNTIME_CMD}"
+          set -- "$@" --runtime-cmd "''${RUNTIME_CMD}"
       fi
 
       if [ -n "''${RUNTIME_ARGS:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --runtime-args ''${RUNTIME_ARGS}"
+          set -- "$@" --runtime-args "''${RUNTIME_ARGS}"
       fi
 
       if [ -n "''${CAPABILITIES:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --capabilities '''''${CAPABILITIES}'"
+          set -- "$@" --capabilities "''${CAPABILITIES}"
       fi
 
       if [ -n "''${NATS_TOKEN:-}" ]; then
-          EXTRA_ARGS="$EXTRA_ARGS --nats-token ''${NATS_TOKEN}"
+          set -- "$@" --nats-token "''${NATS_TOKEN}"
       fi
 
-      eval exec /opt/hive/sidecar \
-        --agent-id "$AGENT_ID" \
-        --team-id "$TEAM_ID" \
-        --nats-url "$NATS_URL" \
-        --workspace /agent \
-        --vsock \
-        --vsock-port "$VSOCK_PORT" \
-        $EXTRA_ARGS
+      exec /opt/hive/sidecar "$@"
     '';
 
     serviceConfig = {

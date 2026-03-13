@@ -6,6 +6,7 @@ package vm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,6 +92,13 @@ type firecrackerMachineConfig struct {
 	VCPUCount  int  `json:"vcpu_count"`
 	MemSizeMiB int  `json:"mem_size_mib"`
 	Smt        bool `json:"smt"`
+}
+
+// firecrackerNetworkInterface is the network interface configuration.
+type firecrackerNetworkInterface struct {
+	IfaceID     string `json:"iface_id"`
+	GuestMAC    string `json:"guest_mac"`
+	HostDevName string `json:"host_dev_name"`
 }
 
 // firecrackerVsock is the vsock device configuration.
@@ -324,6 +332,27 @@ func (f *FirecrackerHypervisor) CreateVM(cfg VMConfig) (int, error) {
 		_ = cmd.Process.Kill()
 		waitForReap(fp, 5*time.Second)
 		return 0, fmt.Errorf("configuring machine: %w", err)
+	}
+
+	// Configure the network interface if a network policy with a TAP device
+	// is provided. This attaches the host TAP device to the guest as eth0 with
+	// a deterministic MAC address derived from the agent ID.
+	if cfg.NetworkPolicy != nil && cfg.NetworkPolicy.TapDevice != "" {
+		netIface := firecrackerNetworkInterface{
+			IfaceID:     "eth0",
+			GuestMAC:    deterministicMAC(cfg.AgentID),
+			HostDevName: cfg.NetworkPolicy.TapDevice,
+		}
+		if err := apiPut(client, cfg.SocketPath, "/network-interfaces/eth0", netIface); err != nil {
+			f.mu.Lock()
+			if current, ok := f.processes[cfg.SocketPath]; ok && current == fp {
+				delete(f.processes, cfg.SocketPath)
+			}
+			f.mu.Unlock()
+			_ = cmd.Process.Kill()
+			waitForReap(fp, 5*time.Second)
+			return 0, fmt.Errorf("configuring network interface: %w", err)
+		}
 	}
 
 	// Configure vsock for host-guest communication.
@@ -579,6 +608,15 @@ func isProcessGone(err error) bool {
 		return true
 	}
 	return err.Error() == "os: process already finished"
+}
+
+// deterministicMAC generates a deterministic locally-administered MAC address
+// from an identifier string. The MAC uses the 06:XX:XX:XX:XX:XX pattern where
+// 06 sets the locally-administered + unicast bits, and the remaining 5 bytes
+// are derived from a SHA-256 hash of the identifier.
+func deterministicMAC(identifier string) string {
+	h := sha256.Sum256([]byte(identifier))
+	return fmt.Sprintf("06:%02x:%02x:%02x:%02x:%02x", h[0], h[1], h[2], h[3], h[4])
 }
 
 // cleanupSocket removes the API socket and vsock files.

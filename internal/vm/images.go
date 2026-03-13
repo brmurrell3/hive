@@ -133,13 +133,16 @@ func (m *ImageManager) EnsureImage(ctx context.Context, variant string) (string,
 		return "", fmt.Errorf("invalid version/tag %q: must match %s", tag, versionPattern.String())
 	}
 
+	gzFilename := filename + ".gz"
+	checksumFilename := gzFilename + ".sha256"
+
 	var downloadURL, checksumURL string
 	if tag == "latest" {
-		downloadURL = fmt.Sprintf("%s/releases/latest/download/%s.gz", GitHubReleasesBaseURL, filename)
-		checksumURL = fmt.Sprintf("%s/releases/latest/download/checksums.sha256", GitHubReleasesBaseURL)
+		downloadURL = fmt.Sprintf("%s/latest/download/%s", GitHubReleasesBaseURL, gzFilename)
+		checksumURL = fmt.Sprintf("%s/latest/download/%s", GitHubReleasesBaseURL, checksumFilename)
 	} else {
-		downloadURL = fmt.Sprintf("%s/releases/download/%s/%s.gz", GitHubReleasesBaseURL, tag, filename)
-		checksumURL = fmt.Sprintf("%s/releases/download/%s/checksums.sha256", GitHubReleasesBaseURL, tag)
+		downloadURL = fmt.Sprintf("%s/download/%s/%s", GitHubReleasesBaseURL, tag, gzFilename)
+		checksumURL = fmt.Sprintf("%s/download/%s/%s", GitHubReleasesBaseURL, tag, checksumFilename)
 	}
 
 	m.logger.Info("downloading rootfs image",
@@ -162,7 +165,7 @@ func (m *ImageManager) EnsureImage(ctx context.Context, variant string) (string,
 	}
 
 	// CRITICAL-1: Distinguish between "checksum unavailable" and "checksum mismatch".
-	if err := m.validateChecksum(ctx, checksumURL, tmpPath); err != nil {
+	if err := m.validateChecksum(ctx, checksumURL, tmpPath, gzFilename); err != nil {
 		if errors.Is(err, errChecksumUnavailable) {
 			// CRITICAL-2: For release versions (start with "v"), checksum must be available.
 			isRelease := strings.HasPrefix(tag, "v")
@@ -213,7 +216,11 @@ func (m *ImageManager) downloadFile(ctx context.Context, rawURL, destPath string
 	}
 
 	// CRITICAL-2: Validate the initial URL scheme before making the request.
-	if parsedURL, parseErr := url.Parse(rawURL); parseErr == nil && parsedURL.Scheme != "https" {
+	parsedURL, parseErr := url.Parse(rawURL)
+	if parseErr != nil {
+		return fmt.Errorf("invalid download URL %q: %w", rawURL, parseErr)
+	}
+	if parsedURL.Scheme != "https" {
 		return fmt.Errorf("refusing non-HTTPS download URL: %s", rawURL)
 	}
 
@@ -300,13 +307,18 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 }
 
 // validateChecksum downloads a SHA-256 checksum file and compares it against
-// the computed hash of the given file.
+// the computed hash of the given file. targetFilename is the expected filename
+// to match when the checksum file contains multiple entries.
 //
 // Returns errChecksumUnavailable if the checksum file cannot be fetched (non-fatal).
 // Returns a regular error if the checksum is fetched but does not match (fatal).
-func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePath string) error {
+func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePath, targetFilename string) error {
 	// HIGH-1: Validate HTTPS scheme on checksum URL before making the request.
-	if parsedURL, parseErr := url.Parse(checksumURL); parseErr == nil && parsedURL.Scheme != "https" {
+	parsedChecksum, parseErr := url.Parse(checksumURL)
+	if parseErr != nil {
+		return fmt.Errorf("invalid checksum URL %q: %w", checksumURL, parseErr)
+	}
+	if parsedChecksum.Scheme != "https" {
 		return fmt.Errorf("refusing non-HTTPS checksum URL: %s", checksumURL)
 	}
 
@@ -333,13 +345,50 @@ func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePa
 		return fmt.Errorf("%w: reading checksum: %v", errChecksumUnavailable, err)
 	}
 
-	// Parse the expected hash: take the first whitespace-delimited field.
+	// Parse the expected hash from the checksum file content.
+	// Supports two formats:
+	//   1. Single hash only (no filename): use it directly.
+	//   2. Multi-line with "<hash>  <filename>" entries: match targetFilename.
 	checksumStr := strings.TrimSpace(string(checksumData))
-	fields := strings.Fields(checksumStr)
-	if len(fields) == 0 {
+	if checksumStr == "" {
 		return fmt.Errorf("empty checksum file")
 	}
-	expectedHash := strings.ToLower(fields[0])
+
+	var expectedHash string
+	lines := strings.Split(checksumStr, "\n")
+	if len(lines) == 1 {
+		fields := strings.Fields(lines[0])
+		if len(fields) == 1 {
+			// Single hash, no filename — use directly.
+			expectedHash = strings.ToLower(fields[0])
+		} else if len(fields) >= 2 {
+			// Single line with hash and filename — verify filename matches.
+			fname := strings.TrimPrefix(fields[1], "*")
+			if fname != targetFilename {
+				return fmt.Errorf("checksum file entry %q does not match target %q", fname, targetFilename)
+			}
+			expectedHash = strings.ToLower(fields[0])
+		}
+	} else {
+		// Multi-line: find the line matching targetFilename.
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				fname := strings.TrimPrefix(fields[1], "*")
+				if fname == targetFilename {
+					expectedHash = strings.ToLower(fields[0])
+					break
+				}
+			}
+		}
+		if expectedHash == "" {
+			return fmt.Errorf("checksum file does not contain entry for %q", targetFilename)
+		}
+	}
 
 	// Validate hex format.
 	if len(expectedHash) != 64 {

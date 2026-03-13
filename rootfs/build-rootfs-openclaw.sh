@@ -75,7 +75,10 @@ mkdir -p "$STAGEDIR"
 CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/sh -c "
     apk add --no-cache nodejs npm iptables iproute2
 ")
-docker start -a "$CONTAINER_ID" || true
+if ! docker start -a "$CONTAINER_ID"; then
+    echo "Error: docker start failed for container $CONTAINER_ID" >&2
+    exit 1
+fi
 docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
 docker rm "$CONTAINER_ID" >/dev/null
 

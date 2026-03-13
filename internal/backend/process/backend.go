@@ -7,8 +7,10 @@
 package process
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,18 +49,28 @@ type safeBuf struct {
 	buf bytes.Buffer
 }
 
+// Write implements io.Writer. This intentionally violates the io.Writer
+// contract by always returning len(p), nil even when data is truncated.
+// This is necessary because safeBuf is used as cmd.Stdout/Stderr —
+// returning n < len(p) or a non-nil error would cause exec.Command to
+// abort the child process prematurely. Truncation beyond maxBufSize is
+// an acceptable trade-off for keeping the process alive.
 func (s *safeBuf) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	n := len(p) // always report full write to caller
 	remaining := maxBufSize - s.buf.Len()
 	if remaining <= 0 {
 		// Buffer full — silently discard.
-		return len(p), nil
+		return n, nil
 	}
 	if len(p) > remaining {
 		p = p[:remaining]
 	}
-	return s.buf.Write(p)
+	// Ignore the bytes-written count from the underlying buffer; we
+	// always report n (original len) to avoid aborting the child process.
+	_, _ = s.buf.Write(p)
+	return n, nil
 }
 
 // Bytes returns a copy of the buffered data, safe for concurrent use.
@@ -282,6 +295,15 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 			ID:     id,
 			Status: state.AgentStatusRunning,
 		}); err != nil {
+			// Process is running but we failed to record that fact.
+			// Kill the process to avoid a zombie that the caller
+			// doesn't know about.
+			b.logger.Error("store write failed after process started; killing process to avoid zombie",
+				"agent_id", id, "error", err)
+			inst.cancel()
+			// Wait for the process to exit so we don't leak it.
+			_ = inst.cmd.Wait()
+			close(inst.done)
 			return fmt.Errorf("setting agent %q to RUNNING: %w", id, err)
 		}
 	}
@@ -316,21 +338,26 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 		}
 	}
 
-	// Send SIGTERM first for graceful shutdown.
-	if inst.cmd.Process != nil {
+	// If the process was never started (cmd.Process is nil), the Wait
+	// goroutine was never launched and inst.done will never close. In that
+	// case, just cancel the context and skip waiting.
+	if inst.cmd.Process == nil {
+		inst.cancel()
+	} else {
+		// Send SIGTERM first for graceful shutdown.
 		inst.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck // best-effort graceful shutdown signal
-	}
 
-	// Wait with timeout, then force kill. Also respect the caller's context.
-	select {
-	case <-inst.done:
-		// Process exited gracefully.
-	case <-ctx.Done():
-		inst.cancel() // Context cancelled — force kill immediately.
-		<-inst.done
-	case <-time.After(10 * time.Second):
-		inst.cancel() // Force kill via context cancellation.
-		<-inst.done
+		// Wait with timeout, then force kill. Also respect the caller's context.
+		select {
+		case <-inst.done:
+			// Process exited gracefully.
+		case <-ctx.Done():
+			inst.cancel() // Context cancelled — force kill immediately.
+			<-inst.done
+		case <-time.After(10 * time.Second):
+			inst.cancel() // Force kill via context cancellation.
+			<-inst.done
+		}
 	}
 
 	if b.store != nil {
@@ -405,17 +432,76 @@ func (b *Backend) Logs(ctx context.Context, id string, opts backend.LogOpts) (io
 	return io.NopCloser(bytes.NewReader(combined)), nil
 }
 
+// systemMemoryMB returns the total physical system RAM in megabytes.
+// It uses platform-specific methods:
+//   - Linux:  parses /proc/meminfo for MemTotal
+//   - macOS:  reads hw.memsize via syscall.Sysctl
+//
+// Returns 0 if detection fails so the caller can apply a fallback.
+func systemMemoryMB() int64 {
+	switch goruntime.GOOS {
+	case "linux":
+		return linuxMemoryMB()
+	case "darwin":
+		return darwinMemoryMB()
+	default:
+		return 0
+	}
+}
+
+// linuxMemoryMB parses /proc/meminfo to extract MemTotal in MB.
+func linuxMemoryMB() int64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		// Format: "MemTotal:       16384000 kB"
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kB, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kB / 1024 // kB -> MB
+	}
+	return 0
+}
+
+// darwinMemoryMB reads hw.memsize via syscall.Sysctl to get total RAM in MB.
+func darwinMemoryMB() int64 {
+	val, err := syscall.Sysctl("hw.memsize")
+	if err != nil || len(val) == 0 {
+		return 0
+	}
+	// syscall.Sysctl returns a raw byte string; hw.memsize is a uint64 in
+	// host byte order (little-endian on all supported Apple hardware).
+	b := []byte(val)
+	// The kernel may or may not include a trailing NUL byte.
+	// Ensure we have at least 8 bytes for the uint64.
+	if len(b) < 8 {
+		return 0
+	}
+	memBytes := binary.LittleEndian.Uint64(b[:8])
+	return int64(memBytes / (1024 * 1024))
+}
+
 func (b *Backend) Available() backend.Resources {
-	// Use runtime to get actual system info.
-	// Try to read actual CPU count
 	cpuCount := goruntime.NumCPU()
 
-	// For memory, use a simple cross-platform approach
-	var m goruntime.MemStats
-	goruntime.ReadMemStats(&m)
-	memTotal := int64(m.Sys / (1024 * 1024))
+	// Detect actual system RAM using platform-specific methods.
+	memTotal := systemMemoryMB()
 	if memTotal < 256 {
-		memTotal = 8192 // fallback if reading fails
+		memTotal = 8192 // fallback if detection fails or returns unreasonably low value
 	}
 
 	return backend.Resources{

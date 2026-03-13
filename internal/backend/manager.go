@@ -137,13 +137,23 @@ func (m *AgentManager) StartAgent(ctx context.Context, spec *types.AgentManifest
 	return nil
 }
 
-// StopAgent stops a running agent.
+// StopAgent stops a running agent and removes it from the agentBackends map
+// so that a subsequent StartAgent call (e.g., health-monitor restart) can
+// re-create the agent without hitting the "already managed" guard.
 func (m *AgentManager) StopAgent(ctx context.Context, agentID string) error {
 	b, err := m.getBackendForAgent(agentID)
 	if err != nil {
 		return err
 	}
-	return b.Stop(ctx, agentID)
+	if err := b.Stop(ctx, agentID); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	delete(m.agentBackends, agentID)
+	m.mu.Unlock()
+
+	return nil
 }
 
 // DestroyAgent destroys an agent and releases all resources.

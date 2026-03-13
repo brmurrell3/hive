@@ -421,6 +421,14 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			}
 			confContent += fmt.Sprintf("HIVE_EGRESS_ALLOWLIST='%s'\n", string(allowlistJSON))
 		}
+
+		// In restricted egress mode, the guest needs DNS resolution pointed at
+		// the gateway (host side of the TAP interface at 172.16.0.1) so that
+		// /etc/resolv.conf can be configured by the init script. Without this,
+		// domain-based allowlist entries cannot be resolved inside the guest.
+		if egressMode == "restricted" || egressMode == "none" {
+			confContent += "HIVE_DNS_SERVER=172.16.0.1\n"
+		}
 	}
 
 	// Pass capabilities as a JSON array so the sidecar can register them.
@@ -439,21 +447,15 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// Resolve shared volumes: look up agent volumes against team shared_volumes,
 	// create ext4 images for each, and build the HIVE_VOLUMES env var for the
 	// guest init script. Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
-	// (after vda=rootfs, vdb=agent drive) when an agent drive is present,
-	// or /dev/vdb, /dev/vdc, etc. when no agent drive exists.
+	// (after vda=rootfs, vdb=agent drive). The agent drive is always present
+	// because agentDir is created by MkdirAll above, so volumes start at 'c'.
 	var volumeMounts []VMVolume
 	var volumeImgPaths []string // track created images for cleanup on failure
 
-	// Determine the guest device letter offset for shared volumes. If an agent
-	// drive will be attached (vdb), volumes start at 'c'; otherwise at 'b'.
-	hasAgentDrive := false
-	if _, statErr := os.Stat(agentDir); statErr == nil {
-		hasAgentDrive = true
-	}
+	// Guest block device layout: vda=rootfs, vdb=agent drive, then shared
+	// volumes start at vdc. The agent directory (and thus agent drive) is
+	// always present because MkdirAll(agentDir) was called above.
 	volumeDeviceOffset := byte('c')
-	if !hasAgentDrive {
-		volumeDeviceOffset = 'b'
-	}
 
 	if len(agent.Spec.Volumes) > 0 && agent.Metadata.Team != "" {
 		teams, teamsErr := config.LoadTeams(m.clusterRoot)
@@ -551,7 +553,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		}
 
 		if len(hiveVolumeParts) > 0 {
-			confContent += fmt.Sprintf("HIVE_VOLUMES=%s\n", strings.Join(hiveVolumeParts, "|"))
+			confContent += fmt.Sprintf("HIVE_VOLUMES=\"%s\"\n", strings.Join(hiveVolumeParts, "|"))
 		}
 	}
 
@@ -648,6 +650,10 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// guest can connect to NATS immediately upon boot. The forwarder listens
 	// on the Firecracker vsock UDS path with the port suffix and forwards
 	// connections to the local NATS server.
+	//
+	// The forwarder must use a long-lived context (not the request-scoped ctx)
+	// because it needs to remain active for the entire VM lifecycle. It is
+	// explicitly stopped via Stop() when the agent is destroyed.
 	if m.natsPort > 0 {
 		vsockUDSPath := socketPath + ".vsock"
 		fwd := NewVsockForwarder(
@@ -656,7 +662,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			fmt.Sprintf("127.0.0.1:%d", m.natsPort),
 			m.logger.With("agent_id", agentID),
 		)
-		if err := fwd.Start(ctx); err != nil {
+		if err := fwd.Start(context.Background()); err != nil {
 			m.logger.Warn("failed to start vsock forwarder, VM will lack NATS connectivity",
 				"agent_id", agentID,
 				"error", err,
