@@ -247,7 +247,8 @@ func TestNextGatewayPort_Concurrent(t *testing.T) {
 }
 
 func TestPrepareOpenClawWorkspace(t *testing.T) {
-	t.Parallel()
+	// This test modifies global state (port allocator) via resetGatewayPort,
+	// so it must not run in parallel with other tests that use the allocator.
 	resetGatewayPort()
 	defer resetGatewayPort()
 

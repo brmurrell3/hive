@@ -197,6 +197,13 @@ in
       RestartSec = "5s";
       WorkingDirectory = "/opt/hive";
 
+      # Systemd hardening directives
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      PrivateTmp = true;
+      NoNewPrivileges = true;
+      ReadWritePaths = [ "/workspace" "/volumes" ];
+
       # Sidecar environment — values here are defaults; the control plane
       # can override them via the agent drive or environment file.
       Environment = [

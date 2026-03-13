@@ -66,10 +66,11 @@ jobs:
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           cd rootfs
           for f in *.ext4.gz *.sha256; do
-            [ -f "$f" ] && gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
+            [ -f "$f" ] && gh release upload "$TAG_NAME" "$f" --clobber
           done
 
       - name: Upload artifacts

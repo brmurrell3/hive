@@ -64,6 +64,15 @@ func TestSDKPythonAgent(t *testing.T) {
 		if err := json.Unmarshal([]byte(output), &report); err != nil {
 			t.Fatalf("trigger output is not valid JSON: %v\noutput: %s", err, output)
 		}
+
+		// Verify the trigger report indicates success.
+		if status, ok := report["status"].(string); ok && status == "error" {
+			t.Fatalf("trigger returned error status: %s", prettyJSON(t, report))
+		}
+		// Verify the report is not empty (contains actual results).
+		if len(report) == 0 {
+			t.Fatal("trigger returned empty report")
+		}
 		t.Logf("trigger report:\n%s", prettyJSON(t, report))
 	})
 
@@ -174,7 +183,9 @@ spec:
 
 	// teams/sdk-test.yaml
 	teamsDir := filepath.Join(root, "teams")
-	os.MkdirAll(teamsDir, 0755)
+	if err := os.MkdirAll(teamsDir, 0755); err != nil {
+		t.Fatalf("creating teams dir: %v", err)
+	}
 	teamYAML := `apiVersion: hive/v1
 kind: Team
 metadata:
@@ -189,7 +200,9 @@ spec:
 
 	// agents/python-echo-agent/
 	agentDir := filepath.Join(root, "agents", "python-echo-agent")
-	os.MkdirAll(agentDir, 0755)
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		t.Fatalf("creating agent dir: %v", err)
+	}
 
 	agentManifest := `apiVersion: hive/v1
 kind: Agent
@@ -269,7 +282,9 @@ spec:
 	writeTestFile(t, filepath.Join(root, "cluster.yaml"), clusterYAML)
 
 	teamsDir := filepath.Join(root, "teams")
-	os.MkdirAll(teamsDir, 0755)
+	if err := os.MkdirAll(teamsDir, 0755); err != nil {
+		t.Fatalf("creating teams dir: %v", err)
+	}
 	teamYAML := `apiVersion: hive/v1
 kind: Team
 metadata:
@@ -283,7 +298,9 @@ spec:
 	writeTestFile(t, filepath.Join(teamsDir, "gosdk-test.yaml"), teamYAML)
 
 	agentDir := filepath.Join(root, "agents", "go-echo-agent")
-	os.MkdirAll(agentDir, 0755)
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		t.Fatalf("creating agent dir: %v", err)
+	}
 
 	agentManifest := fmt.Sprintf(`apiVersion: hive/v1
 kind: Agent

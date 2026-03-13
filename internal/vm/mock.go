@@ -56,7 +56,8 @@ func (m *MockHypervisor) CreateVM(_ context.Context, cfg VMConfig) (int, error) 
 }
 
 // StartVM simulates VM boot by marking the stored PID as running.
-func (m *MockHypervisor) StartVM(socketPath string) error {
+// FC-C2: Accepts context.Context to match the updated Hypervisor interface.
+func (m *MockHypervisor) StartVM(_ context.Context, socketPath string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

@@ -19,6 +19,7 @@
       };
     in
     {
+      # `nix build` with no fragment produces the rootfs image via `default`.
       packages = forAllSystems (system:
         let
           nixosSystem = mkNixosSystem system;
@@ -33,11 +34,11 @@
 
           # The complete NixOS system closure (useful for debugging).
           toplevel = nixosSystem.config.system.build.toplevel;
+
+          # Default package for `nix build .`
+          default = nixosSystem.config.system.build.rootfsImage;
         }
       );
-
-      # `nix build` with no fragment produces the rootfs image.
-      defaultPackage = forAllSystems (system: self.packages.${system}.rootfs);
 
       # Expose the full NixOS configuration for inspection / extension.
       nixosConfigurations = builtins.listToAttrs (map (system: {

@@ -8,8 +8,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 )
+
+// tapDevicePattern validates tap device names: alphanumeric, underscore, and
+// hyphen only, 1-15 characters (IFNAMSIZ limit minus NUL terminator).
+var tapDevicePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
 const egressFull = "full"
 
@@ -28,6 +33,16 @@ type NetworkPolicy struct {
 func GenerateNftables(p NetworkPolicy) (string, error) {
 	if p.TapDevice == "" {
 		return "", nil
+	}
+
+	// NET-H2: Validate TapDevice to prevent nftables injection.
+	if !tapDevicePattern.MatchString(p.TapDevice) {
+		return "", fmt.Errorf("invalid TapDevice %q: must match %s", p.TapDevice, tapDevicePattern.String())
+	}
+
+	// NET-C2: Validate GatewayIP before nftables rule generation.
+	if p.GatewayIP != "" && net.ParseIP(p.GatewayIP) == nil {
+		return "", fmt.Errorf("invalid GatewayIP %q", p.GatewayIP)
 	}
 
 	var rules []string
@@ -67,10 +82,17 @@ func GenerateNftables(p NetworkPolicy) (string, error) {
 				fmt.Sprintf("    iifname %q tcp dport 53 accept", p.TapDevice),
 			)
 		}
-		// Allow NATS (4222).
-		rules = append(rules,
-			fmt.Sprintf("    iifname %q tcp dport 4222 accept", p.TapDevice),
-		)
+		// NET-C1: Allow NATS (4222) scoped to GatewayIP when available.
+		if p.GatewayIP != "" {
+			directive := nftAddrDirective(p.GatewayIP)
+			rules = append(rules,
+				fmt.Sprintf("    iifname %q %s %s tcp dport 4222 accept", p.TapDevice, directive, p.GatewayIP),
+			)
+		} else {
+			rules = append(rules,
+				fmt.Sprintf("    iifname %q tcp dport 4222 accept", p.TapDevice),
+			)
+		}
 		// Resolve hostnames to IPs before generating rules.
 		resolvedHosts, resolveErr := resolveAllowlistHosts(p.Allowlist)
 		if resolveErr != nil {
@@ -90,11 +112,24 @@ func GenerateNftables(p NetworkPolicy) (string, error) {
 			fmt.Sprintf("    iifname %q ct state established,related accept", p.TapDevice),
 		)
 	case "none":
-		// Only allow NATS so the agent can communicate with the control plane.
+		// NET-C1: Only allow NATS so the agent can communicate with the control plane,
+		// scoped to GatewayIP when available.
+		if p.GatewayIP != "" {
+			directive := nftAddrDirective(p.GatewayIP)
+			rules = append(rules,
+				fmt.Sprintf("    iifname %q %s %s tcp dport 4222 accept", p.TapDevice, directive, p.GatewayIP),
+			)
+		} else {
+			rules = append(rules,
+				fmt.Sprintf("    iifname %q tcp dport 4222 accept", p.TapDevice),
+			)
+		}
 		rules = append(rules,
-			fmt.Sprintf("    iifname %q tcp dport 4222 accept", p.TapDevice),
 			fmt.Sprintf("    iifname %q ct state established,related accept", p.TapDevice),
 		)
+	default:
+		// NET-H1: Reject unrecognized egress values.
+		return "", fmt.Errorf("unrecognized egress policy %q: must be \"full\", \"restricted\", or \"none\"", p.Egress)
 	}
 
 	// Drop remaining traffic from this tap device only; traffic from
@@ -130,6 +165,9 @@ func GenerateNftables(p NetworkPolicy) (string, error) {
 		rules = append(rules,
 			fmt.Sprintf("    oifname %q tcp sport 4222 ct state established,related accept", p.TapDevice),
 		)
+	default:
+		// NET-H1: Reject unrecognized ingress values.
+		return "", fmt.Errorf("unrecognized ingress policy %q: must be \"full\", \"restricted\", \"\", or \"none\"", p.Ingress)
 	}
 
 	// Drop remaining traffic destined for this tap device only; traffic

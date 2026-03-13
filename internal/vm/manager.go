@@ -36,7 +36,7 @@ type Hypervisor interface {
 	CreateVM(ctx context.Context, cfg VMConfig) (int, error)
 
 	// StartVM boots a previously created VM via its API socket.
-	StartVM(socketPath string) error
+	StartVM(ctx context.Context, socketPath string) error
 
 	// StopVM sends a graceful shutdown signal. It sends SIGTERM then waits
 	// up to 5 seconds before sending SIGKILL.
@@ -293,6 +293,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	committed := false
 	cidReleased := true // set to false after CID is allocated
 	stateDirCreated := false
+	agentStatePersisted := false // tracks whether SetAgent has been called
 	var stateDir string
 	var cid uint32
 	defer func() {
@@ -304,6 +305,20 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		}
 		if !committed && stateDirCreated && stateDir != "" {
 			os.RemoveAll(stateDir)
+		}
+		// If agent state was persisted (CREATING) but we never committed,
+		// mark the agent as FAILED so it doesn't remain stuck in CREATING.
+		if !committed && agentStatePersisted {
+			agentState := m.store.GetAgent(agentID)
+			if agentState != nil && agentState.Status != state.AgentStatusFailed {
+				agentState.Status = state.AgentStatusFailed
+				agentState.Error = "agent creation did not complete"
+				agentState.LastTransition = time.Now()
+				if setErr := m.store.SetAgent(agentState); setErr != nil {
+					m.logger.Error("failed to mark uncommitted agent as FAILED in deferred cleanup",
+						"agent_id", agentID, "error", setErr)
+				}
+			}
 		}
 	}()
 
@@ -320,6 +335,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	if err := m.store.SetAgent(agentState); err != nil {
 		return fmt.Errorf("setting initial agent state: %w", err)
 	}
+	agentStatePersisted = true
 
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusCreating); err != nil {
 		return m.failAgent(agentState, err)
@@ -389,8 +405,12 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		return fmt.Errorf("NATS token contains newline characters")
 	}
 
-	confContent := fmt.Sprintf("AGENT_ID=%s\nTEAM_ID=%s\nNATS_URL=nats://127.0.0.1:%d\nNATS_TOKEN=%s\nVSOCK_PORT=%d\n",
-		agentID, agent.Metadata.Team, natsPort, m.natsToken, natsPort)
+	// Shell-escape single quotes in values for safe embedding in single-quoted strings.
+	escapedAgentID := strings.ReplaceAll(agentID, "'", "'\\''")
+	escapedTeamID := strings.ReplaceAll(agent.Metadata.Team, "'", "'\\''")
+	escapedNatsToken := strings.ReplaceAll(m.natsToken, "'", "'\\''")
+	confContent := fmt.Sprintf("AGENT_ID='%s'\nTEAM_ID='%s'\nNATS_URL='nats://127.0.0.1:%d'\nNATS_TOKEN='%s'\nVSOCK_PORT='%d'\n",
+		escapedAgentID, escapedTeamID, natsPort, escapedNatsToken, natsPort)
 
 	// Pass the runtime command so the sidecar starts the agent workload.
 	if agent.Spec.Runtime.Type != "" {
@@ -733,7 +753,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			return m.failAgent(agentState, fmt.Errorf("generating nftables rules for agent %s: %w", agentID, nftGenErr))
 		}
 		if rules != "" {
-			nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
+			nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer nftCancel()
 			nftCmd := exec.CommandContext(nftCtx, "nft", "-f", "-")
 			nftCmd.Stdin = strings.NewReader(rules)
@@ -758,12 +778,12 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		}
 	}
 
-	if err := m.hypervisor.StartVM(socketPath); err != nil {
+	if err := m.hypervisor.StartVM(ctx, socketPath); err != nil {
 		// Clean up nftables rules that were applied before StartVM.
 		if needsNftables {
 			tapDevice := TapDeviceName(agentID)
 			nftCmd, nftArgs := CleanupNftables(tapDevice)
-			nftCtx2, nftCancel2 := context.WithTimeout(ctx, 30*time.Second)
+			nftCtx2, nftCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 			defer nftCancel2()
 			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
 				m.logger.Debug("nftables cleanup after StartVM failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
@@ -792,8 +812,19 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	cidReleased = true
 
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusRunning); err != nil {
-		// VM is running but state transition failed. Explicitly destroy the VM
-		// and release resources since the deferred function considers them committed.
+		// VM is running but state transition failed. Clean up nftables rules
+		// before destroying the VM to avoid leaked firewall rules.
+		if needsNftables {
+			tapDevice := TapDeviceName(agentID)
+			nftCmd, nftArgs := CleanupNftables(tapDevice)
+			nftCtx2, nftCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
+				m.logger.Debug("nftables cleanup after CheckTransition failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
+			}
+			nftCancel2()
+		}
+		// Explicitly destroy the VM and release resources since the deferred
+		// function considers them committed.
 		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
 		m.stopForwarder(agentID)
 		m.releaseResources(int64(memoryMB), int64(vcpus))
@@ -804,13 +835,24 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	agentState.StartedAt = time.Now()
 	agentState.LastTransition = agentState.StartedAt
 	if err := m.store.SetAgent(agentState); err != nil {
-		// VM is running but state persistence failed. Explicitly destroy the VM
-		// and release resources since the deferred function considers them committed.
+		// VM is running but state persistence failed. Clean up nftables rules
+		// before destroying the VM to avoid leaked firewall rules.
+		if needsNftables {
+			tapDevice := TapDeviceName(agentID)
+			nftCmd, nftArgs := CleanupNftables(tapDevice)
+			nftCtx2, nftCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
+				m.logger.Debug("nftables cleanup after SetAgent RUNNING failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
+			}
+			nftCancel2()
+		}
+		// Explicitly destroy the VM and release resources since the deferred
+		// function considers them committed.
 		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
 		m.stopForwarder(agentID)
 		m.releaseResources(int64(memoryMB), int64(vcpus))
 		m.releaseCID(cid)
-		return fmt.Errorf("setting agent state to RUNNING: %w", err)
+		return m.failAgent(agentState, fmt.Errorf("setting agent state to RUNNING: %w", err))
 	}
 
 	m.logger.Info("agent started successfully",
@@ -865,13 +907,41 @@ func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
 	m.stopForwarder(agentID)
 
 	if err := m.hypervisor.StopVM(agentState.VMSocketPath, agentState.VMPID); err != nil {
-		return m.failAgent(agentState, fmt.Errorf("stopping VM for agent %s: %w", agentID, err))
+		m.failAgent(agentState, fmt.Errorf("stopping VM for agent %s: %w", agentID, err))
+		// StopVM failed; failAgent marks the agent as FAILED but doesn't release
+		// resources. Capture and release the agent's memory/vCPU/CID allocations
+		// to prevent resource leaks.
+		var failReleaseMem int64
+		var failReleaseVCPUs int64
+		var failReleaseCID uint32
+		if modErr := m.store.ModifyAgent(agentID, func(a *state.AgentState) error {
+			failReleaseMem = a.MemoryBytes / (1024 * 1024)
+			failReleaseVCPUs = int64(a.VCPUs)
+			failReleaseCID = a.VMCID
+			a.MemoryBytes = 0
+			a.VCPUs = 0
+			a.VMCID = 0
+			return nil
+		}); modErr != nil {
+			// ModifyAgent failed; fall back to the snapshot values.
+			failReleaseMem = agentState.MemoryBytes / (1024 * 1024)
+			failReleaseVCPUs = int64(agentState.VCPUs)
+			failReleaseCID = agentState.VMCID
+		}
+		if failReleaseMem > 0 || failReleaseVCPUs > 0 {
+			m.releaseResources(failReleaseMem, failReleaseVCPUs)
+		}
+		if failReleaseCID >= 3 {
+			m.releaseCID(failReleaseCID)
+		}
+		return fmt.Errorf("stopping VM for agent %s: %w", agentID, err)
 	}
 
 	// Clean up nftables rules for this agent's tap device.
+	// Use context.Background() so cleanup succeeds even if the caller's context is cancelled.
 	tapDevice := TapDeviceName(agentID)
 	nftCmd, nftArgs := CleanupNftables(tapDevice)
-	nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
+	nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer nftCancel()
 	if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
 		m.logger.Debug("nftables cleanup skipped", "agent_id", agentID, "error", err, "output", string(out))
@@ -967,6 +1037,9 @@ func (m *Manager) DestroyAgent(ctx context.Context, agentID string) error {
 		capturedRootfsCopyPath = agentState.RootfsCopyPath
 		capturedPID = agentState.VMPID
 		capturedStatus = string(agentState.Status)
+		releaseMem = agentState.MemoryBytes / (1024 * 1024)
+		releaseVCPUs = int64(agentState.VCPUs)
+		releaseCID = agentState.VMCID
 	}
 
 	// Release resources and CID outside the ModifyAgent callback to avoid
@@ -992,10 +1065,11 @@ func (m *Manager) DestroyAgent(ctx context.Context, agentID string) error {
 	}
 
 	// Clean up nftables rules for this agent's tap device.
+	// Use context.Background() so cleanup succeeds even if the caller's context is cancelled.
 	tapDevice := TapDeviceName(agentID)
 	nftCmd, nftArgs := CleanupNftables(tapDevice)
 	{
-		nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
+		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer nftCancel()
 		if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
 			m.logger.Debug("nftables cleanup skipped during destroy", "agent_id", agentID, "error", err, "output", string(out))
@@ -1524,14 +1598,37 @@ func createAgentDriveImage(ctx context.Context, agentDir, imgPath string, diskMB
 		return f.Close()
 	}
 
+	// Verify the agent directory is not a symlink. Use Lstat to detect symlinks.
+	rootInfo, rootStatErr := os.Lstat(agentDir)
+	if rootStatErr != nil {
+		return fmt.Errorf("agent directory %q: %w", agentDir, rootStatErr)
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("agent directory %q is a symlink, which is not allowed for security", agentDir)
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("agent directory %q is not a directory", agentDir)
+	}
+
 	// Calculate the size needed (minimum 4MB to fit ext4 metadata).
+	// Walk the directory using WalkDir (not Walk) to avoid following symlinks
+	// during size calculation. Reject any symlinks found inside the directory
+	// because mkfs.ext4 -d would follow them, potentially packaging content
+	// outside the agent directory.
 	var totalSize int64
-	walkErr := filepath.Walk(agentDir, func(_ string, info os.FileInfo, walkEntryErr error) error {
+	walkErr := filepath.WalkDir(agentDir, func(path string, d os.DirEntry, walkEntryErr error) error {
 		if walkEntryErr != nil {
 			return walkEntryErr
 		}
-		if !info.IsDir() {
-			totalSize += info.Size()
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("agent directory contains symlink %q which is not allowed for security reasons", path)
+		}
+		if !d.IsDir() {
+			fi, fiErr := d.Info()
+			if fiErr != nil {
+				return fiErr
+			}
+			totalSize += fi.Size()
 		}
 		return nil
 	})

@@ -182,35 +182,41 @@ func (m *AgentManager) DestroyAgent(ctx context.Context, agentID string) error {
 }
 
 // RestartAgent tears down any existing instance for the agent and starts a
-// fresh one. It removes the agent from tracking under a single lock hold,
-// then calls Stop/Destroy outside the lock, and finally delegates to
-// StartAgent for the new instance.
+// fresh one. It calls Stop/Destroy on the existing backend first, only
+// removing the agent from tracking after Destroy succeeds (BE-H3). If
+// Destroy fails, the tracking entry is kept so the agent can be retried.
 func (m *AgentManager) RestartAgent(ctx context.Context, spec *types.AgentManifest) error {
 	agentID := spec.Metadata.ID
 	m.logger.Info("restarting agent", "agent_id", agentID)
 
-	m.mu.Lock()
+	m.mu.RLock()
 	backendName, exists := m.agentBackends[agentID]
-	if exists {
-		delete(m.agentBackends, agentID)
-	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	if exists {
-		if b, err := m.registry.Get(backendName); err == nil {
-			if stopErr := b.Stop(ctx, agentID); stopErr != nil {
-				m.logger.Warn("error stopping agent during restart",
-					"agent_id", agentID,
-					"error", stopErr,
-				)
-			}
-			if destroyErr := b.Destroy(ctx, agentID); destroyErr != nil {
-				m.logger.Warn("error destroying agent during restart",
-					"agent_id", agentID,
-					"error", destroyErr,
-				)
-			}
+		b, err := m.registry.Get(backendName)
+		if err != nil {
+			return fmt.Errorf("resolving backend %q for agent %s during restart: %w", backendName, agentID, err)
 		}
+
+		if stopErr := b.Stop(ctx, agentID); stopErr != nil {
+			m.logger.Warn("error stopping agent during restart",
+				"agent_id", agentID,
+				"error", stopErr,
+			)
+		}
+		if destroyErr := b.Destroy(ctx, agentID); destroyErr != nil {
+			m.logger.Warn("error destroying agent during restart, keeping tracking entry",
+				"agent_id", agentID,
+				"error", destroyErr,
+			)
+			return fmt.Errorf("destroying agent %s during restart: %w", agentID, destroyErr)
+		}
+
+		// Only remove tracking after Destroy succeeds.
+		m.mu.Lock()
+		delete(m.agentBackends, agentID)
+		m.mu.Unlock()
 	}
 
 	return m.StartAgent(ctx, spec)

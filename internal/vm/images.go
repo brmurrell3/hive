@@ -272,6 +272,14 @@ func (m *ImageManager) downloadFile(ctx context.Context, rawURL, destPath string
 		if _, err := io.Copy(out, body); err != nil {
 			return fmt.Errorf("writing to %s: %w", destPath, err)
 		}
+		// IMG-H1: Without Content-Length, the LimitReader silently stops at
+		// maxImageDownloadSize. Probe for additional data to detect truncation.
+		probe := make([]byte, 1)
+		if n, probeErr := resp.Body.Read(probe); n > 0 {
+			return fmt.Errorf("download of %s truncated: data exceeds maximum size (%d bytes)", rawURL, maxImageDownloadSize)
+		} else if probeErr != nil && probeErr != io.EOF {
+			return fmt.Errorf("probing for truncated download of %s: %w", rawURL, probeErr)
+		}
 	}
 
 	if err := out.Close(); err != nil {

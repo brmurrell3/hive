@@ -500,12 +500,18 @@ spec:
 	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
 		t.Fatalf("creating rootfs dir: %v", err)
 	}
-	os.WriteFile(filepath.Join(rootfsDir, "vmlinux"), []byte("fake-kernel"), 0644)     //nolint:errcheck
-	os.WriteFile(filepath.Join(rootfsDir, "rootfs.ext4"), []byte("fake-rootfs"), 0644) //nolint:errcheck
+	if err := os.WriteFile(filepath.Join(rootfsDir, "vmlinux"), []byte("fake-kernel"), 0644); err != nil {
+		t.Fatalf("writing fake kernel: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfsDir, "rootfs.ext4"), []byte("fake-rootfs"), 0644); err != nil {
+		t.Fatalf("writing fake rootfs: %v", err)
+	}
 
 	// Default team.
 	teamsDir := filepath.Join(root, "teams")
-	os.MkdirAll(teamsDir, 0755) //nolint:errcheck
+	if err := os.MkdirAll(teamsDir, 0755); err != nil {
+		t.Fatalf("creating teams dir: %v", err)
+	}
 	teamManifest := `apiVersion: hive/v1
 kind: Team
 metadata:
@@ -513,7 +519,9 @@ metadata:
 spec:
   lead: vm-agent
 `
-	os.WriteFile(filepath.Join(teamsDir, "default.yaml"), []byte(teamManifest), 0644) //nolint:errcheck
+	if err := os.WriteFile(filepath.Join(teamsDir, "default.yaml"), []byte(teamManifest), 0644); err != nil {
+		t.Fatalf("writing team manifest: %v", err)
+	}
 
 	return root
 }
@@ -529,7 +537,9 @@ func createFirecrackerClusterWithSharedVolumes(t *testing.T, port int) string {
 		t.Fatalf("creating shared dir: %v", err)
 	}
 	// Write a test file in the shared directory.
-	os.WriteFile(filepath.Join(sharedDir, "test.txt"), []byte("shared content"), 0644) //nolint:errcheck
+	if err := os.WriteFile(filepath.Join(sharedDir, "test.txt"), []byte("shared content"), 0644); err != nil {
+		t.Fatalf("writing shared test file: %v", err)
+	}
 
 	// Update team manifest with shared volumes.
 	teamsDir := filepath.Join(root, "teams")
@@ -543,7 +553,9 @@ spec:
     - name: data
       hostPath: %s
 `, sharedDir)
-	os.WriteFile(filepath.Join(teamsDir, "default.yaml"), []byte(teamManifest), 0644) //nolint:errcheck
+	if err := os.WriteFile(filepath.Join(teamsDir, "default.yaml"), []byte(teamManifest), 0644); err != nil {
+		t.Fatalf("writing team manifest with shared volumes: %v", err)
+	}
 
 	// Writer agent (rw access).
 	writeVMAgentManifestWithVolumes(t, root, "writer-agent", "default", "data", "/workspace/data", "rw")

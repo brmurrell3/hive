@@ -90,8 +90,10 @@ type processInstance struct {
 	stderr        *safeBuf
 	cancel        context.CancelFunc
 	done          chan struct{}
+	closeOnce     sync.Once // BE-H2: prevents double-close of done channel
 	err           error
 	workspacePath string // set for OpenClaw agents; cleaned up in Destroy
+	gatewayPort   int    // BE-C1: OpenClaw gateway port; released in Destroy
 }
 
 func (i *processInstance) ID() string      { return i.id }
@@ -165,7 +167,22 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 			"workspace", workspacePath,
 			"gateway_port", port,
 		)
-	} else {
+	}
+
+	// BE-C2: Deferred cleanup of port and workspace if Create fails after
+	// prepareOpenClawWorkspace has succeeded. The success flag is set just
+	// before the successful return so that early returns trigger cleanup.
+	success := false
+	defer func() {
+		if !success && openclawPort > 0 {
+			releaseGatewayPort(openclawPort)
+			if wsPath != "" {
+				os.RemoveAll(wsPath) //nolint:errcheck // best-effort cleanup on failure path
+			}
+		}
+	}()
+
+	if !isOpenClawRuntime(spec) {
 		// Standard process runtime path.
 		runtimeCmd := spec.Spec.Runtime.Command
 		if runtimeCmd == "" {
@@ -266,6 +283,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 		cancel:        cancel,
 		done:          make(chan struct{}),
 		workspacePath: wsPath,
+		gatewayPort:   openclawPort, // BE-C1: store port for release in Destroy
 	}
 
 	// Transition to CREATING state.
@@ -284,6 +302,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	b.mu.Unlock()
 
 	b.logger.Info("process instance created", "agent_id", agentID, "cmd", cmdName)
+	success = true // BE-C2: disarm deferred cleanup
 	return inst, nil
 }
 
@@ -331,7 +350,7 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 			inst.cancel()
 			// Wait for the process to exit so we don't leak it.
 			_ = inst.cmd.Wait()
-			close(inst.done)
+			inst.closeOnce.Do(func() { close(inst.done) })
 			return fmt.Errorf("setting agent %q to RUNNING: %w", id, err)
 		}
 	}
@@ -339,7 +358,7 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 	// Wait in background.
 	go func() {
 		inst.err = inst.cmd.Wait()
-		close(inst.done)
+		inst.closeOnce.Do(func() { close(inst.done) })
 		b.logger.Info("process exited", "agent_id", id, "error", inst.err)
 	}()
 
@@ -368,9 +387,11 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 
 	// If the process was never started (cmd.Process is nil), the Wait
 	// goroutine was never launched and inst.done will never close. In that
-	// case, just cancel the context and skip waiting.
+	// case, cancel the context and close done so callers don't block.
+	// BE-H2: Use closeOnce to prevent double-close.
 	if inst.cmd.Process == nil {
 		inst.cancel()
+		inst.closeOnce.Do(func() { close(inst.done) })
 	} else {
 		// Send SIGTERM first for graceful shutdown.
 		inst.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck // best-effort graceful shutdown signal
@@ -410,6 +431,11 @@ func (b *Backend) Destroy(ctx context.Context, id string) error {
 	inst := b.instances[id]
 	delete(b.instances, id)
 	b.mu.Unlock()
+
+	// BE-C1: Release the OpenClaw gateway port back to the pool.
+	if inst != nil && inst.gatewayPort > 0 {
+		releaseGatewayPort(inst.gatewayPort)
+	}
 
 	// Clean up the OpenClaw workspace directory if one was created (BE-H5).
 	if inst != nil && inst.workspacePath != "" {
