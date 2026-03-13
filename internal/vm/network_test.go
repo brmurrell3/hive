@@ -15,10 +15,13 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_EgressNone(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "none",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// NATS port 4222 must be accepted.
 	if !strings.Contains(rules, "tcp dport 4222 accept") {
@@ -39,11 +42,14 @@ func TestGenerateNftables_EgressNone(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_EgressRestrictedAllowlist(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "restricted",
 		Allowlist: []string{"10.0.0.1", "192.168.1.0/24"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !strings.Contains(rules, "10.0.0.1") {
 		t.Error("restricted: expected allowlist IP 10.0.0.1 in rules")
@@ -66,10 +72,13 @@ func TestGenerateNftables_EgressRestrictedAllowlist(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_EgressFull(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "full",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !strings.Contains(rules, `iifname "tap0" accept`) {
 		t.Error("egress full: expected unconditional accept rule for tap0")
@@ -81,11 +90,14 @@ func TestGenerateNftables_EgressFull(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_IPv6Allowlist(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "restricted",
 		Allowlist: []string{"2001:db8::1", "fd00::/64"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !strings.Contains(rules, "ip6 daddr") {
 		t.Error("IPv6 allowlist: expected 'ip6 daddr' directive")
@@ -103,12 +115,15 @@ func TestGenerateNftables_IPv6Allowlist(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_GatewayIP(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "restricted",
 		GatewayIP: "10.0.0.1",
 		Allowlist: []string{"1.2.3.4"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// DNS rules should include the gateway IP.
 	if !strings.Contains(rules, "10.0.0.1 udp dport 53 accept") {
@@ -129,10 +144,13 @@ func TestGenerateNftables_GatewayIP(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_EmptyTapDevice(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "",
 		Egress:    "none",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if rules != "" {
 		t.Errorf("expected empty string for empty TapDevice, got %q", rules)
 	}
@@ -223,17 +241,23 @@ func TestValidateAllowlistHost(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_IngressNoneVsRestricted(t *testing.T) {
-	noneRules := GenerateNftables(NetworkPolicy{
+	noneRules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "full",
 		Ingress:   "none",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	restrictedRules := GenerateNftables(NetworkPolicy{
+	restrictedRules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "full",
 		Ingress:   "restricted",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Both ingress modes should include a drop rule for the tap device.
 	if !strings.Contains(noneRules, `oifname "tap0" drop`) {
@@ -252,11 +276,14 @@ func TestGenerateNftables_IngressNoneVsRestricted(t *testing.T) {
 	}
 
 	// Verify that ingress "full" produces a different result from "none".
-	fullRules := GenerateNftables(NetworkPolicy{
+	fullRules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "full",
 		Ingress:   "full",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if fullRules == noneRules {
 		t.Error("ingress 'full' and 'none' should produce different rules")
 	}
@@ -271,11 +298,14 @@ func TestGenerateNftables_IngressNoneVsRestricted(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGenerateNftables_RestrictedNoGateway(t *testing.T) {
-	rules := GenerateNftables(NetworkPolicy{
+	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "restricted",
 		Allowlist: []string{"1.2.3.4"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Without GatewayIP, DNS rules should be unscoped (no ip daddr before port 53).
 	lines := strings.Split(rules, "\n")

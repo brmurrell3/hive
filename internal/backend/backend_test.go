@@ -746,17 +746,20 @@ func TestAgentManager_RestartAgent_TrackedAgent(t *testing.T) {
 		t.Fatalf("StartAgent: %v", err)
 	}
 
-	if err := mgr.RestartAgent(context.Background(), "restart-me", spec); err != nil {
+	if err := mgr.RestartAgent(context.Background(), spec); err != nil {
 		t.Fatalf("RestartAgent: %v", err)
 	}
 
-	// Expect: 2x Create, 2x Start, 1x Destroy (from the teardown before restart).
-	created, started, _, destroyed := b.callCounts()
+	// Expect: 2x Create, 2x Start, 1x Stop + 1x Destroy (from the teardown before restart).
+	created, started, stopped, destroyed := b.callCounts()
 	if created != 2 {
 		t.Errorf("Create called %d times, want 2", created)
 	}
 	if started != 2 {
 		t.Errorf("Start called %d times, want 2", started)
+	}
+	if stopped != 1 {
+		t.Errorf("Stop called %d times, want 1", stopped)
 	}
 	if destroyed != 1 {
 		t.Errorf("Destroy called %d times, want 1", destroyed)
@@ -775,7 +778,7 @@ func TestAgentManager_RestartAgent_UntrackedAgent(t *testing.T) {
 	spec := testManifest("fresh-restart", "firecracker")
 
 	// RestartAgent on an agent that was never started should just start it.
-	if err := mgr.RestartAgent(context.Background(), "fresh-restart", spec); err != nil {
+	if err := mgr.RestartAgent(context.Background(), spec); err != nil {
 		t.Fatalf("RestartAgent on untracked agent: %v", err)
 	}
 

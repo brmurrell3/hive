@@ -50,9 +50,8 @@ let
     else toString (../../bin/linux-amd64/hive-sidecar);
 
   # Wrap the binary in a derivation so Nix can track it as a store path.
-  # If the file does not exist yet the derivation is a stub that installs a
-  # placeholder script that prints a clear error — this prevents a hard build
-  # failure during early development when the binary hasn't been compiled yet.
+  # If the file does not exist the build aborts immediately — a silently
+  # broken image without the sidecar is worse than a clear build failure.
   sidecarBin =
     if builtins.pathExists resolvedSidecarPath
     then
@@ -60,11 +59,11 @@ let
         install -Dm755 ${resolvedSidecarPath} $out/bin/hive-sidecar
       ''
     else
-      pkgs.writeShellScriptBin "hive-sidecar" ''
-        echo "ERROR: hive-sidecar binary was not found at build time." >&2
-        echo "       Compile it first:" >&2
-        echo "         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar" >&2
-        exit 1
+      builtins.abort ''
+        hive-sidecar binary not found at '${resolvedSidecarPath}'.
+        Compile it first:
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
+        Or set HIVE_SIDECAR_BIN to point to an existing binary.
       '';
 in
 {
@@ -131,7 +130,7 @@ in
   # ---------------------------------------------------------------------------
   networking = {
     hostName = "hive-vm";
-    firewall.enable = false;
+    firewall.enable = true;
     useDHCP = true;
   };
 
@@ -208,6 +207,127 @@ in
   };
 
   # ---------------------------------------------------------------------------
+  # Egress policy enforcement (iptables rules based on HIVE_EGRESS_MODE)
+  # ---------------------------------------------------------------------------
+  systemd.services.hive-egress-policy = {
+    description = "Hive Egress Network Policy";
+    after = [ "network.target" "agent.mount" ];
+    wants = [ "agent.mount" ];
+    wantedBy = [ "multi-user.target" ];
+    before = [ "hive-sidecar.service" ];
+
+    path = [ pkgs.iptables pkgs.iproute2 pkgs.dnsutils ];
+
+    script = ''
+      HIVE_EGRESS_MODE=""
+      HIVE_EGRESS_ALLOWLIST=""
+      HIVE_DNS_SERVER=""
+
+      if [ -f /agent/sidecar.conf ]; then
+        . /agent/sidecar.conf
+      fi
+
+      # Configure DNS resolver
+      if [ -n "''${HIVE_DNS_SERVER:-}" ]; then
+          echo "nameserver $HIVE_DNS_SERVER" > /etc/resolv.conf
+      fi
+
+      [ -z "''${HIVE_EGRESS_MODE:-}" ] && exit 0
+
+      case "$HIVE_EGRESS_MODE" in
+          none)
+              echo "Network policy: egress=none (vsock only)"
+              iptables -P INPUT DROP
+              iptables -A INPUT -i lo -j ACCEPT
+              iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+              iptables -P OUTPUT DROP
+              iptables -A OUTPUT -o lo -j ACCEPT
+              ;;
+          restricted)
+              echo "Network policy: egress=restricted"
+              iptables -P OUTPUT DROP
+              iptables -P FORWARD DROP
+              iptables -P INPUT DROP
+              iptables -A INPUT -i lo -j ACCEPT
+              iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+              iptables -A OUTPUT -o lo -j ACCEPT
+
+              # Allow DNS to gateway
+              iptables -A OUTPUT -d 172.16.0.1 -p udp --dport 53 -j ACCEPT
+              iptables -A OUTPUT -d 172.16.0.1 -p tcp --dport 53 -j ACCEPT
+
+              # Allow established connections
+              iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+              # Parse and allow domains from HIVE_EGRESS_ALLOWLIST (JSON array)
+              if [ -n "''${HIVE_EGRESS_ALLOWLIST:-}" ]; then
+                  echo "$HIVE_EGRESS_ALLOWLIST" | tr -d '[]"' | tr ',' ' ' | tr ' ' '\n' | while read -r domain; do
+                      [ -z "$domain" ] && continue
+                      for ip in $(nslookup "$domain" 2>/dev/null | awk '/^Address: / { print $2 }'); do
+                          iptables -A OUTPUT -d "$ip" -j ACCEPT
+                      done
+                  done
+              fi
+              ;;
+          full)
+              echo "Network policy: egress=full (no restrictions)"
+              ;;
+      esac
+    '';
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+  };
+
+  # ---------------------------------------------------------------------------
+  # Volume mount service (parses HIVE_VOLUMES from sidecar.conf)
+  # ---------------------------------------------------------------------------
+  systemd.services.hive-volumes = {
+    description = "Hive Shared Volume Mounts";
+    after = [ "agent.mount" ];
+    wants = [ "agent.mount" ];
+    wantedBy = [ "multi-user.target" ];
+    before = [ "hive-sidecar.service" ];
+
+    path = [ pkgs.util-linux pkgs.coreutils ];
+
+    script = ''
+      HIVE_VOLUMES=""
+
+      if [ -f /agent/sidecar.conf ]; then
+        . /agent/sidecar.conf
+      fi
+
+      [ -z "''${HIVE_VOLUMES:-}" ] && exit 0
+
+      OLD_IFS="$IFS"
+      IFS='|'
+      for volspec in $HIVE_VOLUMES; do
+          IFS="$OLD_IFS"
+          device=$(echo "$volspec" | cut -d: -f1)
+          mountpoint=$(echo "$volspec" | cut -d: -f2)
+          access=$(echo "$volspec" | cut -d: -f3)
+          mkdir -p "$mountpoint"
+          mount_opts="rw"
+          if [ "$access" = "ro" ]; then
+              mount_opts="ro"
+          fi
+          if ! mount -o "$mount_opts" "$device" "$mountpoint"; then
+              echo "ERROR: failed to mount $device at $mountpoint" >&2
+          fi
+      done
+      IFS="$OLD_IFS"
+    '';
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+  };
+
+  # ---------------------------------------------------------------------------
   # Directory structure expected by the sidecar
   # ---------------------------------------------------------------------------
   systemd.tmpfiles.rules = [
@@ -254,6 +374,8 @@ in
   environment.systemPackages = with pkgs; [
     bashInteractive
     coreutils
+    dnsutils     # for nslookup (egress allowlist resolution)
+    iptables     # for egress policy enforcement
     iproute2
     cacert
     curl
@@ -289,8 +411,8 @@ in
 
       # Install the sidecar binary at /opt/hive/sidecar.
       # The systemd service (hive-sidecar.service) exec's this path directly.
-      # sidecarBin is either the real compiled binary or a stub that prints an
-      # error — see the sidecarBin derivation in the let block above.
+      # The build will abort if the sidecar binary is missing — see the
+      # sidecarBin derivation in the let block above.
       install -Dm755 ${sidecarBin}/bin/hive-sidecar ./files/opt/hive/sidecar
     '';
   };

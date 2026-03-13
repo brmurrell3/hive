@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net"
 	"strings"
 )
@@ -25,9 +24,10 @@ type NetworkPolicy struct {
 
 // GenerateNftables produces nftables rules for the given policy.
 // Rules are returned as a string suitable for `nft -f`.
-func GenerateNftables(p NetworkPolicy) string {
+// Returns an error if allowlist hostname resolution fails.
+func GenerateNftables(p NetworkPolicy) (string, error) {
 	if p.TapDevice == "" {
-		return ""
+		return "", nil
 	}
 
 	var rules []string
@@ -72,7 +72,10 @@ func GenerateNftables(p NetworkPolicy) string {
 			fmt.Sprintf("    iifname %q tcp dport 4222 accept", p.TapDevice),
 		)
 		// Resolve hostnames to IPs before generating rules.
-		resolvedHosts := resolveAllowlistHosts(p.Allowlist)
+		resolvedHosts, resolveErr := resolveAllowlistHosts(p.Allowlist)
+		if resolveErr != nil {
+			return "", resolveErr
+		}
 		// Allow specific destinations.
 		for _, host := range resolvedHosts {
 			if err := validateAllowlistHost(host); err != nil {
@@ -122,8 +125,10 @@ func GenerateNftables(p NetworkPolicy) string {
 			fmt.Sprintf("    oifname %q ct state established,related accept", p.TapDevice),
 		)
 	case "none":
+		// For true "none" ingress, only allow established/related replies
+		// for the NATS port — not for all traffic.
 		rules = append(rules,
-			fmt.Sprintf("    oifname %q ct state established,related accept", p.TapDevice),
+			fmt.Sprintf("    oifname %q tcp sport 4222 ct state established,related accept", p.TapDevice),
 		)
 	}
 
@@ -136,7 +141,7 @@ func GenerateNftables(p NetworkPolicy) string {
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
 
-	return strings.Join(rules, "\n")
+	return strings.Join(rules, "\n"), nil
 }
 
 // validateAllowlistHost checks that a host entry is a valid IP or CIDR,
@@ -173,8 +178,9 @@ func TapDeviceName(agentID string) string {
 
 // resolveAllowlistHosts resolves hostname entries in the allowlist to IP
 // addresses using DNS lookup. IPs and CIDRs are passed through unchanged.
-// Unresolvable hostnames are logged and skipped.
-func resolveAllowlistHosts(hosts []string) []string {
+// Returns an error if any hostname cannot be resolved (NET-H3: fail loudly
+// instead of silently skipping DNS failures).
+func resolveAllowlistHosts(hosts []string) ([]string, error) {
 	var resolved []string
 	for _, host := range hosts {
 		// If it's already a valid IP or CIDR, keep it as-is.
@@ -189,17 +195,13 @@ func resolveAllowlistHosts(hosts []string) []string {
 		// It's a hostname -- resolve to IPs.
 		ips, err := net.LookupHost(host)
 		if err != nil {
-			slog.Warn("failed to resolve allowlist hostname, skipping",
-				"hostname", host,
-				"error", err,
-			)
-			continue
+			return nil, fmt.Errorf("resolving allowlist hostname %q: %w", host, err)
 		}
 		for _, ip := range ips {
 			resolved = append(resolved, ip)
 		}
 	}
-	return resolved
+	return resolved, nil
 }
 
 // CleanupNftables returns the command name and arguments to remove the

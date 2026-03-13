@@ -602,7 +602,7 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 		case reconciler.ActionRestart:
 			restartCtx, restartCancel := context.WithTimeout(runCtx, 2*time.Minute)
 			defer restartCancel()
-			if err := agentMgr.RestartAgent(restartCtx, action.AgentID, action.Manifest); err != nil {
+			if err := agentMgr.RestartAgent(restartCtx, action.Manifest); err != nil {
 				return err
 			}
 			replicateViaCluster(action.AgentID)
@@ -1274,7 +1274,7 @@ func (h *controlHandler) handleRestart(msg *nats.Msg) {
 
 		restartCtx, restartCancel := context.WithTimeout(h.runCtx, 2*time.Minute)
 		defer restartCancel()
-		if err := h.agentMgr.RestartAgent(restartCtx, req.AgentID, agent); err != nil {
+		if err := h.agentMgr.RestartAgent(restartCtx, agent); err != nil {
 			h.respondError(msg, fmt.Sprintf("restarting agent: %v", err))
 			return
 		}

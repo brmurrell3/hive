@@ -180,9 +180,18 @@ func TestNextGatewayPort_Sequential(t *testing.T) {
 	resetGatewayPort()
 	defer resetGatewayPort()
 
-	port1 := nextGatewayPort()
-	port2 := nextGatewayPort()
-	port3 := nextGatewayPort()
+	port1, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() returned unexpected error: %v", err)
+	}
+	port2, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() returned unexpected error: %v", err)
+	}
+	port3, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() returned unexpected error: %v", err)
+	}
 
 	if port1 != openClawBasePort {
 		t.Errorf("first port = %d, want %d", port1, openClawBasePort)
@@ -201,16 +210,24 @@ func TestNextGatewayPort_Concurrent(t *testing.T) {
 
 	const goroutines = 50
 	ports := make([]int, goroutines)
+	errs := make([]error, goroutines)
 	var wg sync.WaitGroup
 
 	wg.Add(goroutines)
 	for i := range goroutines {
 		go func(idx int) {
 			defer wg.Done()
-			ports[idx] = nextGatewayPort()
+			ports[idx], errs[idx] = nextGatewayPort()
 		}(i)
 	}
 	wg.Wait()
+
+	// No errors should have occurred.
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: nextGatewayPort() returned unexpected error: %v", i, err)
+		}
+	}
 
 	// All ports must be unique.
 	seen := make(map[int]bool, goroutines)

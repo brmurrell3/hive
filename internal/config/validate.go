@@ -96,6 +96,7 @@ var dangerousMountHostPaths = map[string]bool{
 	"/bin":  true,
 	"/sbin": true,
 	"/lib":  true,
+	"/tmp":  true,
 }
 
 // validMountPathRegex matches safe mount paths (absolute, alphanumeric with /_.-).
@@ -458,6 +459,14 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Cross-validate backend and tier (VAL-C3).
+	if agent.Spec.Runtime.Backend == "firecracker" && agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
+		ve.addf("%s: spec.runtime.backend \"firecracker\" requires tier \"vm\", got %q", prefix, agent.Spec.Tier)
+	}
+	if agent.Spec.Runtime.Backend == "process" && agent.Spec.Tier == "vm" {
+		ve.addf("%s: spec.runtime.backend \"process\" is incompatible with tier \"vm\"", prefix)
+	}
+
 	// Validate mode
 	if agent.Spec.Mode != "" {
 		validModes := map[string]bool{types.AgentModeManaged: true, types.AgentModeExternal: true}
@@ -607,6 +616,10 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			} else if strings.Contains(m.Host, "..") {
 				ve.addf("%s: mount %q host path %q contains path traversal (..)", prefix, m.Name, m.Host)
 			} else {
+				// Validate character set (VAL-C2).
+				if !validMountPathRegex.MatchString(m.Host) {
+					ve.addf("%s: mount %q host path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Host)
+				}
 				// Block dangerous host directories.
 				cleanHost := filepath.Clean(m.Host)
 				for dp := range dangerousMountHostPaths {
@@ -621,6 +634,10 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			} else if !strings.HasPrefix(m.Guest, "/") {
 				ve.addf("%s: mount %q guest path must be an absolute path, got %q", prefix, m.Name, m.Guest)
 			} else {
+				// Validate character set (VAL-C2).
+				if !validMountPathRegex.MatchString(m.Guest) {
+					ve.addf("%s: mount %q guest path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Guest)
+				}
 				// Use prefix match for dangerous guest paths.
 				cleanGuest := filepath.Clean(m.Guest)
 				for dp := range dangerousGuestPaths {
@@ -726,7 +743,10 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
-	// Validate network ingress.
+	// Validate network ingress only for vm tier (same guard as egress).
+	if agent.Spec.Network.Ingress != "" && agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
+		ve.addf("%s: network ingress is only valid for vm tier", prefix)
+	}
 	if agent.Spec.Network.Ingress != "" {
 		validIngress := map[string]bool{"none": true, "restricted": true, "full": true}
 		if !validIngress[agent.Spec.Network.Ingress] {
@@ -734,9 +754,19 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Ingress requires egress to be set (NET-C1).
+	if agent.Spec.Network.Ingress != "" && agent.Spec.Network.Egress == "" {
+		ve.addf("%s: spec.network.ingress requires spec.network.egress to be set", prefix)
+	}
+
 	// Validate egress_allowlist is only used with restricted egress.
 	if len(agent.Spec.Network.EgressAllowlist) > 0 && agent.Spec.Network.Egress != "restricted" {
 		ve.addf("%s: spec.network.egress_allowlist is only valid when egress is \"restricted\"", prefix)
+	}
+
+	// Egress "restricted" requires a non-empty allowlist (VAL-H5).
+	if agent.Spec.Network.Egress == "restricted" && len(agent.Spec.Network.EgressAllowlist) == 0 {
+		ve.addf("%s: spec.network.egress is \"restricted\" but egress_allowlist is empty", prefix)
 	}
 
 	// Validate egress_allowlist size limit.
@@ -752,6 +782,18 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 		if !isValidAllowlistEntry(entry) {
 			ve.addf("%s: spec.network.egress_allowlist entry %q is not a valid hostname, IP, or CIDR", prefix, entry)
+			continue
+		}
+		// Reject overly broad CIDR prefixes (VAL-C1).
+		if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+			ones, bits := ipNet.Mask.Size()
+			if bits == 32 && ones <= 4 {
+				// IPv4 with prefix /0 through /4 is too broad.
+				ve.addf("%s: spec.network.egress_allowlist entry %q has overly broad IPv4 prefix /%d (minimum /5)", prefix, entry, ones)
+			} else if bits == 128 && ones <= 8 {
+				// IPv6 with prefix /0 through /8 is too broad.
+				ve.addf("%s: spec.network.egress_allowlist entry %q has overly broad IPv6 prefix /%d (minimum /9)", prefix, entry, ones)
+			}
 		}
 	}
 

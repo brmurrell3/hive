@@ -24,8 +24,9 @@ type AgentManager struct {
 	defaultBackend string
 	logger         *slog.Logger
 	mu             sync.RWMutex
-	agentBackends  map[string]string // agentID -> backend name
-	forceProcess   bool              // when true, always use "process" backend regardless of manifest
+	agentBackends  map[string]string      // agentID -> backend name
+	creating       map[string]struct{}    // agentIDs currently in the Create/Start pipeline (TOCTOU guard)
+	forceProcess   bool                   // when true, always use "process" backend regardless of manifest
 }
 
 // NewAgentManager creates a new AgentManager with the given backend registry.
@@ -37,6 +38,7 @@ func NewAgentManager(registry *Registry, defaultBackend string, logger *slog.Log
 		defaultBackend: defaultBackend,
 		logger:         logger.With("component", "agent-manager"),
 		agentBackends:  make(map[string]string),
+		creating:       make(map[string]struct{}),
 	}
 }
 
@@ -87,12 +89,27 @@ func (m *AgentManager) getBackendForAgent(agentID string) (Backend, error) {
 func (m *AgentManager) StartAgent(ctx context.Context, spec *types.AgentManifest) error {
 	agentID := spec.Metadata.ID
 
-	m.mu.RLock()
+	// Acquire write lock to atomically check both agentBackends and creating
+	// maps, preventing duplicate Create calls from concurrent StartAgent
+	// invocations (BE-H7).
+	m.mu.Lock()
 	if _, exists := m.agentBackends[agentID]; exists {
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return fmt.Errorf("agent %s is already managed by AgentManager", agentID)
 	}
-	m.mu.RUnlock()
+	if _, inProgress := m.creating[agentID]; inProgress {
+		m.mu.Unlock()
+		return fmt.Errorf("agent %s is already being created", agentID)
+	}
+	m.creating[agentID] = struct{}{}
+	m.mu.Unlock()
+
+	// Ensure the creating sentinel is removed on all exit paths.
+	defer func() {
+		m.mu.Lock()
+		delete(m.creating, agentID)
+		m.mu.Unlock()
+	}()
 
 	b, err := m.resolveBackend(spec)
 	if err != nil {
@@ -110,8 +127,6 @@ func (m *AgentManager) StartAgent(ctx context.Context, spec *types.AgentManifest
 	}
 
 	// Track which backend owns this agent.
-	// Re-check under the write lock to close the TOCTOU window between
-	// the RLock existence check above and this assignment.
 	m.mu.Lock()
 	if _, exists := m.agentBackends[agentID]; exists {
 		m.mu.Unlock()
@@ -137,23 +152,15 @@ func (m *AgentManager) StartAgent(ctx context.Context, spec *types.AgentManifest
 	return nil
 }
 
-// StopAgent stops a running agent and removes it from the agentBackends map
-// so that a subsequent StartAgent call (e.g., health-monitor restart) can
-// re-create the agent without hitting the "already managed" guard.
+// StopAgent stops a running agent but keeps it tracked in agentBackends so
+// that DestroyAgent can still locate the backend. Callers that want a full
+// teardown should call DestroyAgent instead.
 func (m *AgentManager) StopAgent(ctx context.Context, agentID string) error {
 	b, err := m.getBackendForAgent(agentID)
 	if err != nil {
 		return err
 	}
-	if err := b.Stop(ctx, agentID); err != nil {
-		return err
-	}
-
-	m.mu.Lock()
-	delete(m.agentBackends, agentID)
-	m.mu.Unlock()
-
-	return nil
+	return b.Stop(ctx, agentID)
 }
 
 // DestroyAgent destroys an agent and releases all resources.
@@ -174,17 +181,35 @@ func (m *AgentManager) DestroyAgent(ctx context.Context, agentID string) error {
 	return nil
 }
 
-// RestartAgent stops then re-creates and starts an agent.
-func (m *AgentManager) RestartAgent(ctx context.Context, agentID string, spec *types.AgentManifest) error {
+// RestartAgent tears down any existing instance for the agent and starts a
+// fresh one. It removes the agent from tracking under a single lock hold,
+// then calls Stop/Destroy outside the lock, and finally delegates to
+// StartAgent for the new instance.
+func (m *AgentManager) RestartAgent(ctx context.Context, spec *types.AgentManifest) error {
+	agentID := spec.Metadata.ID
 	m.logger.Info("restarting agent", "agent_id", agentID)
 
-	// Stop and destroy the existing instance if tracked.
-	if _, err := m.getBackendForAgent(agentID); err == nil {
-		if err := m.DestroyAgent(ctx, agentID); err != nil {
-			m.logger.Warn("error destroying agent during restart",
-				"agent_id", agentID,
-				"error", err,
-			)
+	m.mu.Lock()
+	backendName, exists := m.agentBackends[agentID]
+	if exists {
+		delete(m.agentBackends, agentID)
+	}
+	m.mu.Unlock()
+
+	if exists {
+		if b, err := m.registry.Get(backendName); err == nil {
+			if stopErr := b.Stop(ctx, agentID); stopErr != nil {
+				m.logger.Warn("error stopping agent during restart",
+					"agent_id", agentID,
+					"error", stopErr,
+				)
+			}
+			if destroyErr := b.Destroy(ctx, agentID); destroyErr != nil {
+				m.logger.Warn("error destroying agent during restart",
+					"agent_id", agentID,
+					"error", destroyErr,
+				)
+			}
 		}
 	}
 

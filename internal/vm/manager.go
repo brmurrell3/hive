@@ -715,7 +715,23 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		((netPolicy.Egress != "" && netPolicy.Egress != egressFull) ||
 			(netPolicy.Ingress != "" && netPolicy.Ingress != egressFull))
 	if needsNftables {
-		rules := GenerateNftables(*netPolicy)
+		rules, nftGenErr := GenerateNftables(*netPolicy)
+		if nftGenErr != nil {
+			if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
+				m.logger.Warn("failed to destroy VM after nftables generation failure",
+					"agent_id", agentID,
+					"error", destroyErr,
+				)
+			}
+			m.stopForwarder(agentID)
+			for _, imgPath := range volumeImgPaths {
+				os.Remove(imgPath)
+			}
+			os.Remove(rootfsCopy)
+			os.Remove(sidecarConf)
+			os.Remove(agentDriveImg)
+			return m.failAgent(agentState, fmt.Errorf("generating nftables rules for agent %s: %w", agentID, nftGenErr))
+		}
 		if rules != "" {
 			nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer nftCancel()

@@ -251,6 +251,7 @@ func (m *ImageManager) downloadFile(ctx context.Context, rawURL, destPath string
 	body := io.LimitReader(resp.Body, maxImageDownloadSize)
 
 	totalSize := resp.ContentLength
+	var written int64
 	if totalSize > 0 {
 		// Wrap reader to log progress at 10% intervals.
 		pr := &progressReader{
@@ -259,8 +260,13 @@ func (m *ImageManager) downloadFile(ctx context.Context, rawURL, destPath string
 			logger:    m.logger,
 			url:       rawURL,
 		}
-		if _, err := io.Copy(out, pr); err != nil {
+		written, err = io.Copy(out, pr)
+		if err != nil {
 			return fmt.Errorf("writing to %s: %w", destPath, err)
+		}
+		// IMG-H1: Verify bytes written matches Content-Length to detect truncated downloads.
+		if written != totalSize {
+			return fmt.Errorf("incomplete download of %s: wrote %d bytes, expected %d", rawURL, written, totalSize)
 		}
 	} else {
 		if _, err := io.Copy(out, body); err != nil {
@@ -450,7 +456,8 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 	if err != nil {
 		return fmt.Errorf("creating decompressed file: %w", err)
 	}
-	defer out.Close()
+	// IMG-H2: No defer out.Close() — close is handled explicitly below to
+	// avoid double-close (Sync path closes on error, final Close at the end).
 
 	// Wrap the gzip reader with context awareness and a size limit.
 	// HIGH-4: Use contextReader to check for cancellation during decompression.
@@ -458,6 +465,7 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 	limitedReader := io.LimitReader(ctxReader, maxImageDownloadSize)
 
 	if _, err := io.Copy(out, limitedReader); err != nil {
+		out.Close()
 		return fmt.Errorf("decompressing: %w", err)
 	}
 
@@ -466,9 +474,11 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 	probe := make([]byte, 1)
 	ctxProbe := &contextReader{ctx: ctx, reader: gz}
 	if n, probeErr := ctxProbe.Read(probe); n > 0 {
+		out.Close()
 		return fmt.Errorf("decompressed data exceeds maximum size (%d bytes): possible zip bomb", maxImageDownloadSize)
 	} else if probeErr != nil && probeErr != io.EOF {
 		// Read error that isn't EOF — could indicate corruption.
+		out.Close()
 		return fmt.Errorf("checking for truncated decompression: %w", probeErr)
 	}
 

@@ -10,19 +10,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"github.com/brmurrell3/hive/internal/types"
 )
 
+// agentIDPattern validates agent IDs to prevent path traversal.
+// Must start with an alphanumeric character and contain only alphanumeric,
+// dots, underscores, and hyphens.
+var agentIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
 // openClawBasePort is the first gateway port assigned to OpenClaw agents.
 const openClawBasePort = 9300
 
-// openClawPortAllocator provides thread-safe, monotonically increasing port
-// numbers for OpenClaw gateway instances. Each agent gets a unique port.
+// openClawMaxPort is the highest valid TCP port number.
+const openClawMaxPort = 65535
+
+// openClawPortAllocator provides thread-safe port allocation for OpenClaw
+// gateway instances. Each agent gets a unique port. Released ports are
+// recycled before allocating new ones.
 var openClawPortAllocator = struct {
-	mu   sync.Mutex
-	next int
+	mu       sync.Mutex
+	next     int
+	released []int
 }{next: openClawBasePort}
 
 // openClawConfig is the JSON configuration written to openclaw.json inside
@@ -76,7 +87,28 @@ func findOpenClawBinary() (string, error) {
 //
 // Returns the absolute workspace path and the gateway port assigned.
 func prepareOpenClawWorkspace(clusterRoot, agentID string, spec *types.AgentManifest) (workspacePath string, port int, err error) {
-	workspacePath = filepath.Join(clusterRoot, ".state", "agents", agentID, "workspace")
+	// BE-C1: Validate agentID to prevent path traversal.
+	if !agentIDPattern.MatchString(agentID) {
+		return "", 0, fmt.Errorf("invalid agent ID %q: must match %s", agentID, agentIDPattern.String())
+	}
+
+	parentDir := filepath.Join(clusterRoot, ".state", "agents")
+	workspacePath = filepath.Join(parentDir, agentID, "workspace")
+
+	// Verify the resolved workspace path doesn't escape the parent directory.
+	resolvedWorkspace, err := filepath.Abs(workspacePath)
+	if err != nil {
+		return "", 0, fmt.Errorf("resolving workspace path for %q: %w", agentID, err)
+	}
+	resolvedParent, err := filepath.Abs(parentDir)
+	if err != nil {
+		return "", 0, fmt.Errorf("resolving parent path for %q: %w", agentID, err)
+	}
+	rel, err := filepath.Rel(resolvedParent, resolvedWorkspace)
+	if err != nil || rel == ".." || len(rel) > 2 && rel[:3] == "../" {
+		return "", 0, fmt.Errorf("workspace path for agent %q escapes parent directory", agentID)
+	}
+
 	if err = os.MkdirAll(workspacePath, 0700); err != nil {
 		return "", 0, fmt.Errorf("creating openclaw workspace for %q: %w", agentID, err)
 	}
@@ -103,7 +135,10 @@ func prepareOpenClawWorkspace(clusterRoot, agentID string, spec *types.AgentMani
 	}
 
 	// Allocate a unique gateway port for this agent.
-	port = nextGatewayPort()
+	port, err = nextGatewayPort()
+	if err != nil {
+		return "", 0, fmt.Errorf("allocating gateway port for %q: %w", agentID, err)
+	}
 
 	// Generate and write openclaw.json.
 	configBytes, err := generateOpenClawConfig(spec, workspacePath, port)
@@ -137,13 +172,34 @@ func generateOpenClawConfig(spec *types.AgentManifest, workspacePath string, por
 }
 
 // nextGatewayPort returns the next available OpenClaw gateway port.
+// It recycles previously released ports before allocating new ones.
+// Returns an error if no ports are available (all ports up to 65535 exhausted).
 // It is safe for concurrent use.
-func nextGatewayPort() int {
+func nextGatewayPort() (int, error) {
 	openClawPortAllocator.mu.Lock()
 	defer openClawPortAllocator.mu.Unlock()
+
+	// Recycle a released port if available.
+	if n := len(openClawPortAllocator.released); n > 0 {
+		port := openClawPortAllocator.released[n-1]
+		openClawPortAllocator.released = openClawPortAllocator.released[:n-1]
+		return port, nil
+	}
+
+	if openClawPortAllocator.next > openClawMaxPort {
+		return 0, fmt.Errorf("gateway port exhaustion: all ports in range [%d, %d] are allocated", openClawBasePort, openClawMaxPort)
+	}
 	port := openClawPortAllocator.next
 	openClawPortAllocator.next++
-	return port
+	return port, nil
+}
+
+// releaseGatewayPort returns a port to the pool for reuse.
+// It is safe for concurrent use.
+func releaseGatewayPort(port int) {
+	openClawPortAllocator.mu.Lock()
+	defer openClawPortAllocator.mu.Unlock()
+	openClawPortAllocator.released = append(openClawPortAllocator.released, port)
 }
 
 // resetGatewayPort resets the port allocator to the base port.
@@ -152,22 +208,29 @@ func resetGatewayPort() {
 	openClawPortAllocator.mu.Lock()
 	defer openClawPortAllocator.mu.Unlock()
 	openClawPortAllocator.next = openClawBasePort
+	openClawPortAllocator.released = nil
 }
 
 // copyFile copies a single file from src to dst, preserving permissions.
+// BE-C2: Uses os.Lstat to verify the source is a regular file before opening,
+// preventing symlink-following filesystem escapes.
 func copyFile(src, dst string) error {
+	// Verify source is a regular file (not a symlink or special file).
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to copy non-regular file %q (mode: %s)", src, info.Mode().Type())
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
 	if err != nil {
 		return err
 	}
@@ -180,6 +243,7 @@ func copyFile(src, dst string) error {
 }
 
 // copyDir recursively copies a directory tree from src to dst.
+// BE-C2: Symlink entries are skipped to prevent filesystem escape attacks.
 func copyDir(src, dst string) error {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
@@ -194,6 +258,11 @@ func copyDir(src, dst string) error {
 		return err
 	}
 	for _, entry := range entries {
+		// Skip symlinks to prevent filesystem escape.
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 

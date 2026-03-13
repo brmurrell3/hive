@@ -66,6 +66,22 @@ func (b *Backend) Capabilities() backend.BackendCaps {
 	}
 }
 
+// Create provisions and starts a Firecracker VM for the given agent.
+//
+// Design constraint (BE-H4): the underlying vm.Manager.StartAgent performs
+// both VM creation and boot in a single atomic operation — it allocates a
+// CID, creates the root filesystem, launches the Firecracker process, and
+// waits for the guest kernel to boot. Splitting these into separate
+// Create + Start steps is not feasible without a major refactor of the
+// vm.Manager, because the Firecracker API socket is only available after
+// the process is launched, and resource accounting (memory, CID) must be
+// committed atomically with VM creation to prevent leaks.
+//
+// Consequently, Create calls vmMgr.StartAgent (which both creates and
+// starts the VM), and Start below is intentionally a no-op. This is safe
+// because the Backend interface contract allows Create to leave the
+// instance in a runnable state, and callers always invoke Create before
+// Start.
 func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backend.Instance, error) {
 	agentID := spec.Metadata.ID
 
@@ -81,8 +97,12 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	return inst, nil
 }
 
+// Start is intentionally a no-op for the Firecracker backend.
+//
+// The VM is already running after Create because vm.Manager.StartAgent
+// performs both provisioning and boot atomically. See the Create comment
+// above for the full rationale (BE-H4).
 func (b *Backend) Start(ctx context.Context, id string) error {
-	// Firecracker VMs are started during Create (StartAgent does both).
 	return nil
 }
 

@@ -83,14 +83,15 @@ func (s *safeBuf) Bytes() []byte {
 }
 
 type processInstance struct {
-	id      string
-	agentID string
-	cmd     *exec.Cmd
-	stdout  *safeBuf
-	stderr  *safeBuf
-	cancel  context.CancelFunc
-	done    chan struct{}
-	err     error
+	id            string
+	agentID       string
+	cmd           *exec.Cmd
+	stdout        *safeBuf
+	stderr        *safeBuf
+	cancel        context.CancelFunc
+	done          chan struct{}
+	err           error
+	workspacePath string // set for OpenClaw agents; cleaned up in Destroy
 }
 
 func (i *processInstance) ID() string      { return i.id }
@@ -134,6 +135,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	var cmdName string
 	var cmdArgs []string
 	var openclawPort int
+	var wsPath string // workspace directory to clean up on Destroy (OpenClaw only)
 
 	if isOpenClawRuntime(spec) {
 		// OpenClaw runtime path: use the openclaw binary instead of
@@ -156,6 +158,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 		cmdName = binaryPath
 		cmdArgs = []string{"--config", configPath}
 		openclawPort = port
+		wsPath = workspacePath
 
 		b.logger.Info("openclaw workspace prepared",
 			"agent_id", agentID,
@@ -179,9 +182,36 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, cmdName, cmdArgs...)
 
-	// Build environment.
-	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env,
+	// Build environment from a minimal allow-list of parent variables
+	// instead of inheriting the full parent environment, which could
+	// leak secrets (BE-H2).
+	var env []string
+	for _, key := range []string{"PATH", "HOME", "USER", "TMPDIR", "LANG", "TERM"} {
+		if v := os.Getenv(key); v != "" {
+			env = append(env, fmt.Sprintf("%s=%s", key, v))
+		}
+	}
+
+	// Add model env vars BEFORE HIVE_* assignments so that a malicious
+	// model config cannot override framework-critical variables (BE-H1).
+	// A denylist prevents injection of HIVE_*, LD_*, DYLD_*, PATH,
+	// HOME, and SHELL keys.
+	for k, v := range spec.Spec.Runtime.Model.Env {
+		upper := strings.ToUpper(k)
+		if strings.HasPrefix(upper, "HIVE_") ||
+			strings.HasPrefix(upper, "LD_") ||
+			strings.HasPrefix(upper, "DYLD_") ||
+			upper == "PATH" || upper == "HOME" || upper == "SHELL" {
+			b.logger.Warn("model env var denied by denylist",
+				"agent_id", agentID, "key", k)
+			continue
+		}
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// HIVE_* assignments come after model env vars so they cannot be
+	// overridden.
+	env = append(env,
 		fmt.Sprintf("HIVE_AGENT_ID=%s", agentID),
 		fmt.Sprintf("HIVE_TEAM=%s", spec.Metadata.Team),
 		fmt.Sprintf("HIVE_TEAM_ID=%s", spec.Metadata.Team),
@@ -189,16 +219,16 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 
 	// Add sidecar and callback env vars if available.
 	if v := os.Getenv("HIVE_NATS_URL"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_NATS_URL=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_NATS_URL=%s", v))
 	}
 	if v := os.Getenv("HIVE_NATS_TOKEN"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_NATS_TOKEN=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_NATS_TOKEN=%s", v))
 	}
 	if v := os.Getenv("HIVE_SIDECAR_URL"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_SIDECAR_URL=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_SIDECAR_URL=%s", v))
 	}
 	if v := os.Getenv("HIVE_CALLBACK_PORT"); v != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_CALLBACK_PORT=%s", v))
+		env = append(env, fmt.Sprintf("HIVE_CALLBACK_PORT=%s", v))
 	}
 
 	// Add OpenClaw-specific env vars.
@@ -206,13 +236,10 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	// gateway via HTTP at this port. That integration is handled separately
 	// in the sidecar package.
 	if openclawPort > 0 {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("HIVE_OPENCLAW_PORT=%d", openclawPort))
+		env = append(env, fmt.Sprintf("HIVE_OPENCLAW_PORT=%d", openclawPort))
 	}
 
-	// Add model env vars.
-	for k, v := range spec.Spec.Runtime.Model.Env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = env
 
 	stdout := &safeBuf{}
 	stderr := &safeBuf{}
@@ -231,13 +258,14 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	}
 
 	inst := &processInstance{
-		id:      agentID,
-		agentID: agentID,
-		cmd:     cmd,
-		stdout:  stdout,
-		stderr:  stderr,
-		cancel:  cancel,
-		done:    make(chan struct{}),
+		id:            agentID,
+		agentID:       agentID,
+		cmd:           cmd,
+		stdout:        stdout,
+		stderr:        stderr,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		workspacePath: wsPath,
 	}
 
 	// Transition to CREATING state.
@@ -379,8 +407,17 @@ func (b *Backend) Destroy(ctx context.Context, id string) error {
 	}
 
 	b.mu.Lock()
+	inst := b.instances[id]
 	delete(b.instances, id)
 	b.mu.Unlock()
+
+	// Clean up the OpenClaw workspace directory if one was created (BE-H5).
+	if inst != nil && inst.workspacePath != "" {
+		if err := os.RemoveAll(inst.workspacePath); err != nil {
+			b.logger.Warn("failed to remove workspace directory",
+				"agent_id", id, "path", inst.workspacePath, "error", err)
+		}
+	}
 
 	if b.store != nil {
 		if err := b.store.RemoveAgent(id); err != nil {
@@ -428,8 +465,13 @@ func (b *Backend) Logs(ctx context.Context, id string, opts backend.LogOpts) (io
 		return nil, fmt.Errorf("instance %q not found", id)
 	}
 
-	combined := append(inst.stdout.Bytes(), inst.stderr.Bytes()...)
-	return io.NopCloser(bytes.NewReader(combined)), nil
+	// Use io.MultiReader to avoid allocating a single combined buffer
+	// that could reach 2 * maxBufSize (up to 20 MB) (BE-H6).
+	combined := io.MultiReader(
+		bytes.NewReader(inst.stdout.Bytes()),
+		bytes.NewReader(inst.stderr.Bytes()),
+	)
+	return io.NopCloser(combined), nil
 }
 
 // systemMemoryMB returns the total physical system RAM in megabytes.

@@ -18,6 +18,8 @@
 # Node.js 20 LTS for running OpenClaw agents.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 OUTPUT="${1:-rootfs-openclaw.ext4}"
 SIZE="${2:-1G}"
 SIDECAR="${3:-hive-sidecar}"
@@ -73,7 +75,7 @@ mkdir -p "$STAGEDIR"
 # Build a temporary image that includes Node.js 20 from Alpine repos.
 # Alpine 3.19 ships nodejs-20 in its main repository.
 CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/sh -c "
-    apk add --no-cache nodejs npm iptables iproute2
+    apk add --no-cache bind-tools nodejs npm iptables iproute2
 ")
 if ! docker start -a "$CONTAINER_ID"; then
     echo "Error: docker start failed for container $CONTAINER_ID" >&2
@@ -81,6 +83,7 @@ if ! docker start -a "$CONTAINER_ID"; then
 fi
 docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
 docker rm "$CONTAINER_ID" >/dev/null
+CONTAINER_ID=""
 
 # Verify Node.js was installed
 if [ ! -f "$STAGEDIR/usr/bin/node" ]; then
@@ -89,11 +92,12 @@ if [ ! -f "$STAGEDIR/usr/bin/node" ]; then
     CONTAINER_ID=$(docker create --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" alpine:3.19 /bin/true)
     docker export "$CONTAINER_ID" | tar -xf - -C "$STAGEDIR"
     docker rm "$CONTAINER_ID" >/dev/null
+    CONTAINER_ID=""
 
     # Install Node.js using a Docker run with bind mount
     docker run --rm --platform "linux/${GOARCH:-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')}" \
         -v "$STAGEDIR:/rootfs" alpine:3.19 \
-        /bin/sh -c "apk add --no-cache --root /rootfs --initdb nodejs npm iptables iproute2"
+        /bin/sh -c "apk add --no-cache --root /rootfs --initdb bind-tools nodejs npm iptables iproute2"
 fi
 
 # Strip unnecessary files to keep image size down
@@ -117,8 +121,8 @@ fi
 # 3. Apply overlay files (optional)
 # ---------------------------------------------------------------------------
 echo "==> Applying overlay files..."
-if [ -d "overlay" ]; then
-    cp -r overlay/. "$STAGEDIR/" 2>/dev/null || true
+if [ -d "$SCRIPT_DIR/overlay" ]; then
+    cp -r "$SCRIPT_DIR/overlay/." "$STAGEDIR/" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -154,6 +158,11 @@ mkdir -p /var/log /var/tmp
 # Source agent config (AGENT_ID, TEAM_ID, NATS_URL, NATS_TOKEN)
 if [ -f /agent/sidecar.conf ]; then
     . /agent/sidecar.conf
+fi
+
+# Configure DNS resolver
+if [ -n "${HIVE_DNS_SERVER:-}" ]; then
+    echo "nameserver $HIVE_DNS_SERVER" > /etc/resolv.conf
 fi
 
 # Network policy enforcement
@@ -219,7 +228,7 @@ fi
 # HIVE_VOLUMES is a pipe-delimited list of device:mount_path:access specs.
 # Shared volume drives appear as /dev/vdc, /dev/vdd, etc.
 # (after vda=rootfs and vdb=agent drive).
-if [ -n "$HIVE_VOLUMES" ]; then
+if [ -n "${HIVE_VOLUMES:-}" ]; then
     OLD_IFS="$IFS"
     IFS='|'
     for volspec in $HIVE_VOLUMES; do
