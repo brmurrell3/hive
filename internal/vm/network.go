@@ -266,7 +266,18 @@ func resolveAllowlistHosts(hosts []string) ([]string, error) {
 // CleanupNftables returns the command name and arguments to remove the
 // nftables table for a tap device. The caller can pass these directly to
 // exec.CommandContext(ctx, cmd, args...) without string splitting.
+//
+// NET-H3: Validates tapDevice against tapDevicePattern (same as GenerateNftables)
+// to prevent nftables command injection. If the device name is invalid, returns
+// "true" with nil args so the caller executes a safe no-op, and logs a warning.
 func CleanupNftables(tapDevice string) (string, []string) {
+	if !tapDevicePattern.MatchString(tapDevice) {
+		slog.Warn("CleanupNftables: invalid tap device name, returning no-op",
+			"tapDevice", tapDevice,
+			"pattern", tapDevicePattern.String(),
+		)
+		return "true", nil
+	}
 	tableName := fmt.Sprintf("hive_%s", strings.ReplaceAll(tapDevice, "-", "_"))
 	return "nft", []string{"delete", "table", "inet", tableName}
 }

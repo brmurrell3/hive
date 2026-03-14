@@ -415,19 +415,21 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// Pass the runtime command so the sidecar starts the agent workload.
 	if agent.Spec.Runtime.Type != "" {
 		rtType := agent.Spec.Runtime.Type
-		if strings.ContainsAny(rtType, "\n\r'\"\\$`") {
-			return fmt.Errorf("invalid runtime type contains special characters: %s", rtType)
+		if strings.ContainsAny(rtType, "\n\r") {
+			return fmt.Errorf("invalid runtime type contains newline characters: %s", rtType)
 		}
-		confContent += fmt.Sprintf("RUNTIME_CMD=%s\n", rtType)
+		escapedRtType := strings.ReplaceAll(rtType, "'", "'\\''")
+		confContent += fmt.Sprintf("RUNTIME_CMD='%s'\n", escapedRtType)
 	}
 
 	// Pass network egress mode so the VM init script can enforce network policy.
 	if agent.Spec.Network.Egress != "" {
 		egressMode := agent.Spec.Network.Egress
-		if strings.ContainsAny(egressMode, "\n\r'\"\\$`") {
-			return fmt.Errorf("invalid egress mode contains special characters: %s", egressMode)
+		if strings.ContainsAny(egressMode, "\n\r") {
+			return fmt.Errorf("invalid egress mode contains newline characters: %s", egressMode)
 		}
-		confContent += fmt.Sprintf("HIVE_EGRESS_MODE=%s\n", egressMode)
+		escapedEgressMode := strings.ReplaceAll(egressMode, "'", "'\\''")
+		confContent += fmt.Sprintf("HIVE_EGRESS_MODE='%s'\n", escapedEgressMode)
 
 		// Pass allowlist as JSON array when egress is restricted.
 		if egressMode == "restricted" && len(agent.Spec.Network.EgressAllowlist) > 0 {
@@ -450,7 +452,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		// /etc/resolv.conf can be configured by the init script. Without this,
 		// domain-based allowlist entries cannot be resolved inside the guest.
 		if egressMode == "restricted" || egressMode == "none" {
-			confContent += "HIVE_DNS_SERVER=172.16.0.1\n"
+			confContent += "HIVE_DNS_SERVER='172.16.0.1'\n"
 		}
 	}
 
@@ -714,7 +716,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			fmt.Sprintf("127.0.0.1:%d", m.natsPort),
 			m.logger.With("agent_id", agentID),
 		)
-		vsockStartCtx, vsockStartCancel := context.WithTimeout(ctx, 5*time.Second)
+		vsockStartCtx, vsockStartCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer vsockStartCancel()
 		if err := fwd.Start(vsockStartCtx); err != nil {
 			m.logger.Warn("failed to start vsock forwarder, VM will lack NATS connectivity",
@@ -1151,6 +1153,16 @@ func (m *Manager) RestartAgent(ctx context.Context, agentID string, agent *types
 				// Agent was removed from store; use the original snapshot as fallback.
 				_ = m.hypervisor.DestroyVM(agentState.VMSocketPath, agentState.VMPID)
 			}
+			// Clean up nftables rules for the old VM's tap device. DestroyVM does
+			// not handle this, and StopAgent failed, so rules would leak.
+			tapDevice := TapDeviceName(agentID)
+			nftCmd, nftArgs := CleanupNftables(tapDevice)
+			nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if out, nftErr := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); nftErr != nil {
+				m.logger.Debug("nftables cleanup skipped during restart fallback",
+					"agent_id", agentID, "error", nftErr, "output", string(out))
+			}
+			nftCancel()
 			// Release resources that StopAgent failed to release. Atomically
 			// capture and zero the resource fields to prevent double-release
 			// if a concurrent operation also attempts cleanup.

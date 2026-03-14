@@ -244,6 +244,40 @@ func (f *FirecrackerHypervisor) CreateVM(ctx context.Context, cfg VMConfig) (int
 		return 0, fmt.Errorf("VMConfig.CID must be >= 3, got %d", cfg.CID)
 	}
 
+	// FC-H2b: Validate VMConfig path fields to prevent path traversal and
+	// glob injection. All paths must be absolute and contain no ".." components.
+	// SocketPath must also not contain glob metacharacters since it is used
+	// in filepath.Glob in cleanupSocket.
+	for _, pv := range []struct {
+		name, path string
+	}{
+		{"SocketPath", cfg.SocketPath},
+		{"KernelPath", cfg.KernelPath},
+		{"RootfsPath", cfg.RootfsPath},
+	} {
+		if !filepath.IsAbs(pv.path) {
+			return 0, fmt.Errorf("VMConfig.%s must be an absolute path, got %q", pv.name, pv.path)
+		}
+		if cleaned := filepath.Clean(pv.path); cleaned != pv.path && cleaned+"/" != pv.path {
+			// Allow the path only if Clean produces the same result (no ".." resolution needed).
+			if strings.Contains(pv.path, "..") {
+				return 0, fmt.Errorf("VMConfig.%s must not contain '..' components, got %q", pv.name, pv.path)
+			}
+		}
+	}
+	if cfg.AgentDrivePath != "" {
+		if !filepath.IsAbs(cfg.AgentDrivePath) {
+			return 0, fmt.Errorf("VMConfig.AgentDrivePath must be an absolute path, got %q", cfg.AgentDrivePath)
+		}
+		if strings.Contains(cfg.AgentDrivePath, "..") {
+			return 0, fmt.Errorf("VMConfig.AgentDrivePath must not contain '..' components, got %q", cfg.AgentDrivePath)
+		}
+	}
+	// SocketPath is used in filepath.Glob (cleanupSocket), so reject glob metacharacters.
+	if strings.ContainsAny(cfg.SocketPath, "*?[]") {
+		return 0, fmt.Errorf("VMConfig.SocketPath must not contain glob metacharacters (*?[]), got %q", cfg.SocketPath)
+	}
+
 	f.logger.Info("creating Firecracker VM",
 		"agent_id", cfg.AgentID,
 		"socket", cfg.SocketPath,

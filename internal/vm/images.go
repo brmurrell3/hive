@@ -7,6 +7,8 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -38,6 +40,12 @@ const (
 	// progressLogInterval controls how often download progress is logged.
 	// Progress is logged every 10% of total content length.
 	progressLogInterval = 10
+
+	// ext4SuperblockOffset is the byte offset of the ext4 superblock in the image.
+	ext4SuperblockOffset = 0x438
+
+	// ext4MagicNumber is the ext4 filesystem magic number (little-endian uint16 at offset 0x438).
+	ext4MagicNumber = 0xEF53
 )
 
 // errChecksumUnavailable is a sentinel error indicating the checksum file
@@ -53,8 +61,14 @@ var versionPattern = regexp.MustCompile(`^(latest|v[0-9]+\.[0-9]+\.[0-9]+([-._a-
 
 // httpClient is used for all image downloads. It rejects HTTP-downgrade
 // redirects (HTTPS -> HTTP) to prevent man-in-the-middle attacks.
+// H6: Explicit TLS configuration with minimum TLS 1.2.
 var httpClient = &http.Client{
 	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
@@ -111,9 +125,19 @@ func (m *ImageManager) EnsureImage(ctx context.Context, variant string) (string,
 	cachedPath := filepath.Join(m.cacheDir, filename)
 
 	// Check cache first.
+	// H5: On cache hit, verify integrity against stored SHA-256 sidecar file.
+	checksumSidecar := cachedPath + ".sha256"
 	if _, err := os.Stat(cachedPath); err == nil {
-		m.logger.Info("using cached rootfs image", "path", cachedPath)
-		return cachedPath, nil
+		if err := m.verifyCachedChecksum(cachedPath, checksumSidecar); err != nil {
+			m.logger.Warn("cached image integrity check failed, re-downloading",
+				"path", cachedPath, "error", err)
+			// Remove the corrupt cached file and its sidecar so we re-download.
+			os.Remove(cachedPath)
+			os.Remove(checksumSidecar)
+		} else {
+			m.logger.Info("using cached rootfs image", "path", cachedPath)
+			return cachedPath, nil
+		}
 	}
 
 	// Ensure cache directory exists.
@@ -192,12 +216,30 @@ func (m *ImageManager) EnsureImage(ctx context.Context, variant string) (string,
 		return "", fmt.Errorf("decompressing rootfs image: %w", err)
 	}
 
+	// H4: Verify decompressed file has a valid ext4 superblock signature.
+	if err := validateExt4Superblock(decompressedPath); err != nil {
+		return "", fmt.Errorf("post-decompression ext4 validation failed: %w", err)
+	}
+
+	// H5: Compute SHA-256 of decompressed image and store as sidecar for
+	// future cache-hit integrity verification.
+	imageHash, err := computeFileSHA256(decompressedPath)
+	if err != nil {
+		return "", fmt.Errorf("computing decompressed image checksum: %w", err)
+	}
+
 	// Atomic rename into place.
 	if err := os.Rename(decompressedPath, cachedPath); err != nil {
 		return "", fmt.Errorf("moving rootfs image to cache: %w", err)
 	}
 
-	m.logger.Info("rootfs image cached", "path", cachedPath)
+	// Write the SHA-256 sidecar file for future cache-hit verification.
+	if err := os.WriteFile(checksumSidecar, []byte(imageHash+"\n"), 0600); err != nil {
+		m.logger.Warn("failed to write checksum sidecar file", "path", checksumSidecar, "error", err)
+		// Non-fatal: the image is still valid, just won't have integrity checking on next cache hit.
+	}
+
+	m.logger.Info("rootfs image cached", "path", cachedPath, "sha256", imageHash)
 	return cachedPath, nil
 }
 
@@ -501,6 +543,98 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 	}
 	if err := out.Close(); err != nil {
 		return fmt.Errorf("closing %s: %w", dest, err)
+	}
+
+	return nil
+}
+
+// validateExt4Superblock checks that the file at path contains a valid ext4
+// superblock magic number (0xEF53) at the standard offset (0x438).
+// H4: Detects decompression corruption by verifying the filesystem signature.
+func validateExt4Superblock(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening file: %w", err)
+	}
+	defer f.Close()
+
+	// Check file is large enough to contain the superblock magic.
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat file: %w", err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("decompressed file is empty")
+	}
+	minSize := int64(ext4SuperblockOffset + 2) // offset + 2 bytes for magic
+	if info.Size() < minSize {
+		return fmt.Errorf("decompressed file too small (%d bytes) to contain ext4 superblock", info.Size())
+	}
+
+	// Read the 2-byte magic number at the superblock offset.
+	if _, err := f.Seek(ext4SuperblockOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("seeking to superblock offset: %w", err)
+	}
+	var magic uint16
+	if err := binary.Read(f, binary.LittleEndian, &magic); err != nil {
+		return fmt.Errorf("reading superblock magic: %w", err)
+	}
+	if magic != ext4MagicNumber {
+		return fmt.Errorf("invalid ext4 magic number: got 0x%04X, expected 0x%04X", magic, ext4MagicNumber)
+	}
+
+	return nil
+}
+
+// computeFileSHA256 computes and returns the hex-encoded SHA-256 hash of the file at path.
+func computeFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("opening file for checksum: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("computing SHA-256: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// verifyCachedChecksum verifies that the file at imagePath matches the SHA-256
+// hash stored in the sidecar file at checksumPath.
+// H5: Provides integrity re-verification for cached images.
+func (m *ImageManager) verifyCachedChecksum(imagePath, checksumPath string) error {
+	expectedBytes, err := os.ReadFile(checksumPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No sidecar file exists (e.g., cached before this feature was added).
+			// Compute and store it now for future verification.
+			m.logger.Info("no checksum sidecar found for cached image, computing one", "path", imagePath)
+			hash, hashErr := computeFileSHA256(imagePath)
+			if hashErr != nil {
+				return fmt.Errorf("computing checksum for cached image: %w", hashErr)
+			}
+			if writeErr := os.WriteFile(checksumPath, []byte(hash+"\n"), 0600); writeErr != nil {
+				m.logger.Warn("failed to write checksum sidecar", "path", checksumPath, "error", writeErr)
+			}
+			return nil // Trust the image this time; future hits will verify.
+		}
+		return fmt.Errorf("reading checksum sidecar: %w", err)
+	}
+
+	expectedHash := strings.TrimSpace(string(expectedBytes))
+	if len(expectedHash) != 64 {
+		return fmt.Errorf("invalid sidecar checksum format (expected 64 hex chars, got %d)", len(expectedHash))
+	}
+
+	actualHash, err := computeFileSHA256(imagePath)
+	if err != nil {
+		return fmt.Errorf("computing cached image checksum: %w", err)
+	}
+
+	if actualHash != expectedHash {
+		return fmt.Errorf("cached image integrity failure: expected %s, got %s", expectedHash, actualHash)
 	}
 
 	return nil

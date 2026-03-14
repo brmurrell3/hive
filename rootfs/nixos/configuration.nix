@@ -248,6 +248,7 @@ in
 
     # SEC-P3-004: Wait for sidecar.conf to be fully written before sourcing.
     script = ''
+      set -e
       HIVE_EGRESS_MODE=""
       HIVE_EGRESS_ALLOWLIST=""
       HIVE_DNS_SERVER=""
@@ -300,9 +301,8 @@ in
               ;;
           restricted)
               echo "Network policy: egress=restricted"
-              iptables -P OUTPUT DROP
-              iptables -P FORWARD DROP
-              iptables -P INPUT DROP
+              # Add all ACCEPT rules before setting DROP policies to avoid
+              # a window where traffic is dropped while rules are being added.
               iptables -A INPUT -i lo -j ACCEPT
               iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
               iptables -A OUTPUT -o lo -j ACCEPT
@@ -327,6 +327,11 @@ in
                       done
                   done
               fi
+
+              # Now set DROP policies after all ACCEPT rules are in place
+              iptables -P INPUT DROP
+              iptables -P FORWARD DROP
+              iptables -P OUTPUT DROP
               ;;
           full)
               echo "Network policy: egress=full (no restrictions)"
@@ -387,11 +392,11 @@ in
 
           # Reject dangerous guest mount paths to prevent overwriting critical system directories
           case "$mountpoint" in
-              /|/etc|/bin|/sbin|/usr|/lib|/dev|/proc|/sys|/boot|/run)
+              /|/etc|/bin|/sbin|/usr|/lib|/dev|/proc|/sys|/boot|/run|/agent|/nix)
                   echo "ERROR: refusing to mount volume to dangerous path: $mountpoint" >&2
                   continue
                   ;;
-              /etc/*|/bin/*|/sbin/*|/usr/*|/lib/*|/dev/*|/proc/*|/sys/*|/boot/*|/run/*)
+              /etc/*|/bin/*|/sbin/*|/usr/*|/lib/*|/dev/*|/proc/*|/sys/*|/boot/*|/run/*|/agent/*|/nix/*)
                   echo "ERROR: refusing to mount volume under dangerous path: $mountpoint" >&2
                   continue
                   ;;
@@ -446,8 +451,8 @@ in
   # ---------------------------------------------------------------------------
   # Serial console (debugging)
   # ---------------------------------------------------------------------------
-  # Auto-login root on the serial console so operators can inspect the VM.
-  services.getty.autologinUser = "root";
+  # Manual login is required for security — no auto-login on the serial console.
+  # Operators must authenticate to inspect the VM.
 
   # ---------------------------------------------------------------------------
   # Minimize image size

@@ -109,6 +109,9 @@ var ingressPathInvalidChars = regexp.MustCompile(`[^a-zA-Z0-9/_\-.]`)
 // validVolumeNameRegex matches safe volume names (alphanumeric, hyphens, underscores).
 var validVolumeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
+// mapKeyRegex matches safe map keys: starts with alphanumeric, then alphanumeric, dots, hyphens, underscores.
+var mapKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
 // reservedProviderNames lists provider names that cannot be used as model registry names.
 var reservedProviderNames = map[string]bool{
 	"anthropic": true,
@@ -788,9 +791,11 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		ve.addf("%s: network ingress is only valid for vm tier", prefix)
 	}
 	if agent.Spec.Network.Ingress != "" {
-		validIngress := map[string]bool{"none": true, "restricted": true, "full": true}
+		// Note: "restricted" is reserved for future use when ingress allowlist support is added.
+		// Until then, only "none" and "full" are accepted to avoid a false sense of restriction.
+		validIngress := map[string]bool{"none": true, "full": true}
 		if !validIngress[agent.Spec.Network.Ingress] {
-			ve.addf("%s: spec.network.ingress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Ingress)
+			ve.addf("%s: spec.network.ingress must be one of [none, full], got %q", prefix, agent.Spec.Network.Ingress)
 		}
 	}
 
@@ -883,10 +888,14 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			ve.addf("%s: spec.restart.policy must be one of [always, on-failure, never], got %q", prefix, agent.Spec.Restart.Policy)
 		}
 	}
-	if agent.Spec.Restart.MaxRestarts > 10000 {
+	if agent.Spec.Restart.MaxRestarts < 0 {
+		ve.addf("%s: spec.restart.maxRestarts must be >= 0, got %d", prefix, agent.Spec.Restart.MaxRestarts)
+	} else if agent.Spec.Restart.MaxRestarts > 10000 {
 		ve.addf("%s: spec.restart.maxRestarts must be <= 10000, got %d", prefix, agent.Spec.Restart.MaxRestarts)
 	}
-	if agent.Spec.Health.MaxFailures > 10000 {
+	if agent.Spec.Health.MaxFailures < 0 {
+		ve.addf("%s: spec.health.maxFailures must be >= 0, got %d", prefix, agent.Spec.Health.MaxFailures)
+	} else if agent.Spec.Health.MaxFailures > 10000 {
 		ve.addf("%s: spec.health.maxFailures must be <= 10000, got %d", prefix, agent.Spec.Health.MaxFailures)
 	}
 
@@ -959,6 +968,11 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		slog.Warn("agent placement.nodeId is set; node registration cannot be verified at parse time",
 			"agent_id", id, "node_id", agent.Spec.Placement.NodeID)
 	}
+
+	// Validate map fields for safe keys and values (no control chars, no NATS wildcards).
+	validateMapLabels(ve, prefix, "metadata.labels", agent.Metadata.Labels)
+	validateMapLabels(ve, prefix, "spec.hardware.custom", agent.Spec.Hardware.Custom)
+	validateMapLabels(ve, prefix, "spec.placement.nodeLabels", agent.Spec.Placement.NodeLabels)
 }
 
 func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agents map[string]*types.AgentManifest) {
@@ -978,6 +992,9 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 	} else if err := types.ValidateSubjectComponent("metadata.id", team.Metadata.ID); err != nil {
 		ve.addf("%s: %v", prefix, err)
 	}
+
+	// Validate team metadata labels for safe keys and values.
+	validateMapLabels(ve, prefix, "metadata.labels", team.Metadata.Labels)
 
 	// Validate lead (rule 3)
 	if team.Spec.Lead != "" {
@@ -1064,6 +1081,26 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 			if !validSharedVolumeAccess[normalizedAccess] {
 				ve.addf("%s: shared_volume %q access must be one of [ro, rw, read-only, read-write], got %q", prefix, sv.Name, sv.Access)
 			}
+		}
+	}
+}
+
+// validateMapLabels validates that all keys and values in a string map are safe.
+// Keys must match mapKeyRegex (alphanumeric start, then alphanumeric/dot/hyphen/underscore).
+// Values must not contain control characters or NATS wildcards (* and >).
+func validateMapLabels(ve *ValidationError, prefix string, fieldName string, m map[string]string) {
+	for k, v := range m {
+		if !mapKeyRegex.MatchString(k) {
+			ve.addf("%s: %s key %q must match [a-zA-Z0-9][a-zA-Z0-9._-]*", prefix, fieldName, k)
+		}
+		for _, c := range v {
+			if c < 0x20 || c == 0x7f {
+				ve.addf("%s: %s value for key %q contains control characters", prefix, fieldName, k)
+				break
+			}
+		}
+		if strings.ContainsAny(v, "*>") {
+			ve.addf("%s: %s value for key %q contains NATS wildcard characters", prefix, fieldName, k)
 		}
 	}
 }

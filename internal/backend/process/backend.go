@@ -104,6 +104,9 @@ type processInstance struct {
 	cancel        context.CancelFunc
 	done          chan struct{}
 	closeOnce     sync.Once // BE-H2: prevents double-close of done channel
+	mu            sync.Mutex // guards started and stopped flags
+	started       bool       // BE-H8: prevents double-Start
+	stopped       bool       // BE-H7: prevents Start after Stop
 	err           error
 	workspacePath string // set for OpenClaw agents; cleaned up in Destroy
 	gatewayPort   int    // BE-C1: OpenClaw gateway port; released in Destroy
@@ -333,6 +336,19 @@ func (b *Backend) Start(ctx context.Context, id string) error {
 		return fmt.Errorf("instance %q not found", id)
 	}
 
+	// BE-H7/BE-H8: Prevent double-start and start-after-stop races.
+	inst.mu.Lock()
+	if inst.stopped {
+		inst.mu.Unlock()
+		return fmt.Errorf("instance %q has been stopped; cannot start", id)
+	}
+	if inst.started {
+		inst.mu.Unlock()
+		return fmt.Errorf("instance %q already started; cannot start twice", id)
+	}
+	inst.started = true
+	inst.mu.Unlock()
+
 	// Transition to STARTING state.
 	if b.store != nil {
 		if err := b.store.SetAgent(&state.AgentState{
@@ -392,6 +408,12 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 	if !ok {
 		return fmt.Errorf("instance %q not found", id)
 	}
+
+	// BE-H7: Mark the instance as stopped so that a concurrent or
+	// subsequent Start call is rejected.
+	inst.mu.Lock()
+	inst.stopped = true
+	inst.mu.Unlock()
 
 	// Transition to STOPPING state.
 	if b.store != nil {

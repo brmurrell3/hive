@@ -151,6 +151,16 @@ func prepareOpenClawWorkspace(clusterRoot, agentID string, spec *types.AgentMani
 		return "", 0, fmt.Errorf("allocating gateway port for %q: %w", agentID, err)
 	}
 
+	// BE-C3: Release the port on any error path after allocation succeeds.
+	// The deferred cleanup above handles the workspace directory; this
+	// ensures the port is also released if config generation or writing fails.
+	portAllocated := true
+	defer func() {
+		if !success && portAllocated {
+			releaseGatewayPort(port)
+		}
+	}()
+
 	// Generate and write openclaw.json.
 	configBytes, err := generateOpenClawConfig(spec, workspacePath, port)
 	if err != nil {

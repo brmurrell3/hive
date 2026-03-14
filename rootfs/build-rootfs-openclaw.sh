@@ -171,6 +171,8 @@ fi
 
 # Network policy enforcement
 if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
+    # Fail on iptables errors so misconfigurations are not silently ignored
+    set -e
     case "$HIVE_EGRESS_MODE" in
         none)
             # No network device attached, vsock only - restrict INPUT and OUTPUT
@@ -196,9 +198,8 @@ if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
                 ip route add default via 172.16.0.1
 
                 # Set up iptables for restricted egress
-                iptables -P OUTPUT DROP
-                iptables -P FORWARD DROP
-                iptables -P INPUT DROP
+                # Add all ACCEPT rules before setting DROP policies to avoid
+                # a window where traffic is dropped while rules are being added.
                 iptables -A INPUT -i lo -j ACCEPT
                 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
@@ -226,6 +227,11 @@ if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
                         done
                     done
                 fi
+
+                # Now set DROP policies after all ACCEPT rules are in place
+                iptables -P INPUT DROP
+                iptables -P FORWARD DROP
+                iptables -P OUTPUT DROP
             fi
             ;;
         full)
@@ -238,6 +244,7 @@ if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
             fi
             ;;
     esac
+    set +e
 fi
 
 # Mount shared volumes (virtiofs-via-block-device)
@@ -255,11 +262,11 @@ if [ -n "${HIVE_VOLUMES:-}" ]; then
 
         # Reject dangerous guest mount paths to prevent overwriting critical system directories
         case "$mountpoint" in
-            /|/etc|/bin|/sbin|/usr|/lib|/dev|/proc|/sys|/boot|/run)
+            /|/etc|/bin|/sbin|/usr|/lib|/dev|/proc|/sys|/boot|/run|/agent)
                 echo "ERROR: refusing to mount volume to dangerous path: $mountpoint" >&2
                 continue
                 ;;
-            /etc/*|/bin/*|/sbin/*|/usr/*|/lib/*|/dev/*|/proc/*|/sys/*|/boot/*|/run/*)
+            /etc/*|/bin/*|/sbin/*|/usr/*|/lib/*|/dev/*|/proc/*|/sys/*|/boot/*|/run/*|/agent/*)
                 echo "ERROR: refusing to mount volume under dangerous path: $mountpoint" >&2
                 continue
                 ;;

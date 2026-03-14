@@ -535,29 +535,446 @@ func TestCleanupNftables_HyphenInDeviceName(t *testing.T) {
 }
 
 func TestCleanupNftables_EmptyDeviceName(t *testing.T) {
-	// Empty device name should produce an empty table suffix but still
-	// return the "nft" command structure (caller is responsible for
-	// validation before calling CleanupNftables).
+	// NET-H3: Empty device name fails tapDevicePattern validation and
+	// returns a safe no-op command ("true" with nil args).
 	cmd, args := CleanupNftables("")
 
-	if cmd != "nft" {
-		t.Errorf("CleanupNftables command = %q, want %q", cmd, "nft")
+	if cmd != "true" {
+		t.Errorf("CleanupNftables command = %q, want %q for invalid input", cmd, "true")
 	}
+	if args != nil {
+		t.Errorf("CleanupNftables args = %v, want nil for invalid input", args)
+	}
+}
 
-	// Table name with empty device = "hive_"
-	expectedTable := "hive_"
-	if len(args) < 4 {
-		t.Fatalf("CleanupNftables args too short: %v", args)
+func TestCleanupNftables_InvalidDeviceName(t *testing.T) {
+	// NET-H3: Device names with shell/nftables injection characters should
+	// return a safe no-op command.
+	invalidNames := []string{
+		"; drop table --",
+		"tap0; rm -rf /",
+		"tap device",
+		"../../etc",
+		"tap0\ndelete table inet foo",
+		"a-very-long-device-name-exceeding-limit",
 	}
-	if args[3] != expectedTable {
-		t.Errorf("CleanupNftables table name = %q, want %q", args[3], expectedTable)
-	}
-
-	// Full args should still be well-formed.
-	expectedArgs := []string{"delete", "table", "inet", "hive_"}
-	for i, a := range expectedArgs {
-		if args[i] != a {
-			t.Errorf("CleanupNftables args[%d] = %q, want %q", i, args[i], a)
+	for _, name := range invalidNames {
+		cmd, args := CleanupNftables(name)
+		if cmd != "true" {
+			t.Errorf("CleanupNftables(%q) command = %q, want %q", name, cmd, "true")
 		}
+		if args != nil {
+			t.Errorf("CleanupNftables(%q) args = %v, want nil", name, args)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TEST-COMBO: Ingress + Egress combination rules
+// ---------------------------------------------------------------------------
+
+func TestGenerateNftables_Combo_EgressNone_IngressNone(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "none",
+		Ingress:   "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: should have NATS accept, established/related, and drop.
+	if !strings.Contains(rules, `iifname "tap0" tcp dport 4222 accept`) {
+		t.Error("egressNone+ingressNone: egress chain missing NATS 4222 accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" ct state established,related accept`) {
+		t.Error("egressNone+ingressNone: egress chain missing established/related accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressNone+ingressNone: egress chain missing drop rule")
+	}
+
+	// Egress chain must NOT have a blanket accept (that would be "full").
+	lines := strings.Split(rules, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == `iifname "tap0" accept` {
+			t.Error("egressNone+ingressNone: egress chain should NOT have blanket accept")
+		}
+	}
+
+	// Ingress chain: "none" scopes established/related to NATS sport 4222 only.
+	if !strings.Contains(rules, `oifname "tap0" tcp sport 4222 ct state established,related accept`) {
+		t.Error("egressNone+ingressNone: ingress chain missing NATS-scoped established/related")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressNone+ingressNone: ingress chain missing drop rule")
+	}
+
+	// Ingress chain must NOT have a blanket accept.
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == `oifname "tap0" accept` {
+			t.Error("egressNone+ingressNone: ingress chain should NOT have blanket accept")
+		}
+	}
+
+	// Must have both chains.
+	if !strings.Contains(rules, "chain egress {") {
+		t.Error("egressNone+ingressNone: missing egress chain")
+	}
+	if !strings.Contains(rules, "chain ingress {") {
+		t.Error("egressNone+ingressNone: missing ingress chain")
+	}
+}
+
+func TestGenerateNftables_Combo_EgressRestricted_IngressRestricted(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "restricted",
+		Ingress:   "restricted",
+		Allowlist: []string{"10.0.0.1", "192.168.1.0/24"},
+		GatewayIP: "10.0.0.254",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: DNS scoped to gateway, NATS scoped to gateway, allowlist entries.
+	if !strings.Contains(rules, "ip daddr 10.0.0.254 udp dport 53 accept") {
+		t.Error("egressRestricted+ingressRestricted: missing DNS UDP rule scoped to gateway")
+	}
+	if !strings.Contains(rules, "ip daddr 10.0.0.254 tcp dport 53 accept") {
+		t.Error("egressRestricted+ingressRestricted: missing DNS TCP rule scoped to gateway")
+	}
+	if !strings.Contains(rules, "ip daddr 10.0.0.254 tcp dport 4222 accept") {
+		t.Error("egressRestricted+ingressRestricted: missing NATS rule scoped to gateway")
+	}
+	if !strings.Contains(rules, "ip daddr 10.0.0.1 accept") {
+		t.Error("egressRestricted+ingressRestricted: missing allowlist entry 10.0.0.1")
+	}
+	if !strings.Contains(rules, "ip daddr 192.168.1.0/24 accept") {
+		t.Error("egressRestricted+ingressRestricted: missing allowlist entry 192.168.1.0/24")
+	}
+	if !strings.Contains(rules, `iifname "tap0" ct state established,related accept`) {
+		t.Error("egressRestricted+ingressRestricted: egress chain missing established/related")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressRestricted+ingressRestricted: egress chain missing drop")
+	}
+
+	// Ingress chain: "restricted" allows all established/related (not scoped to NATS).
+	if !strings.Contains(rules, `oifname "tap0" ct state established,related accept`) {
+		t.Error("egressRestricted+ingressRestricted: ingress chain missing established/related")
+	}
+	if strings.Contains(rules, `oifname "tap0" tcp sport 4222 ct state established,related`) {
+		t.Error("egressRestricted+ingressRestricted: ingress should NOT scope established/related to sport 4222")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressRestricted+ingressRestricted: ingress chain missing drop")
+	}
+}
+
+func TestGenerateNftables_Combo_EgressFull_IngressFull(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "full",
+		Ingress:   "full",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: blanket accept.
+	if !strings.Contains(rules, `iifname "tap0" accept`) {
+		t.Error("egressFull+ingressFull: egress chain missing blanket accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressFull+ingressFull: egress chain missing drop rule")
+	}
+
+	// Ingress chain: blanket accept.
+	if !strings.Contains(rules, `oifname "tap0" accept`) {
+		t.Error("egressFull+ingressFull: ingress chain missing blanket accept")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressFull+ingressFull: ingress chain missing drop rule")
+	}
+
+	// Should NOT have any NATS-specific or DNS-specific rules.
+	if strings.Contains(rules, "dport 4222") {
+		t.Error("egressFull+ingressFull: should NOT have explicit NATS port rules")
+	}
+	if strings.Contains(rules, "dport 53") {
+		t.Error("egressFull+ingressFull: should NOT have explicit DNS port rules")
+	}
+
+	// Both chains should be present.
+	if !strings.Contains(rules, "chain egress {") {
+		t.Error("egressFull+ingressFull: missing egress chain")
+	}
+	if !strings.Contains(rules, "chain ingress {") {
+		t.Error("egressFull+ingressFull: missing ingress chain")
+	}
+}
+
+func TestGenerateNftables_Combo_EgressNone_IngressFull(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "none",
+		Ingress:   "full",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: locked down to NATS only.
+	if !strings.Contains(rules, `iifname "tap0" tcp dport 4222 accept`) {
+		t.Error("egressNone+ingressFull: egress chain missing NATS accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" ct state established,related accept`) {
+		t.Error("egressNone+ingressFull: egress chain missing established/related")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressNone+ingressFull: egress chain missing drop")
+	}
+
+	// Ingress chain: fully open.
+	if !strings.Contains(rules, `oifname "tap0" accept`) {
+		t.Error("egressNone+ingressFull: ingress chain missing blanket accept")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressNone+ingressFull: ingress chain missing drop")
+	}
+}
+
+func TestGenerateNftables_Combo_EgressFull_IngressNone(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "full",
+		Ingress:   "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: fully open.
+	if !strings.Contains(rules, `iifname "tap0" accept`) {
+		t.Error("egressFull+ingressNone: egress chain missing blanket accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressFull+ingressNone: egress chain missing drop")
+	}
+
+	// Ingress chain: only NATS-scoped established/related.
+	if !strings.Contains(rules, `oifname "tap0" tcp sport 4222 ct state established,related accept`) {
+		t.Error("egressFull+ingressNone: ingress chain missing NATS-scoped established/related")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressFull+ingressNone: ingress chain missing drop")
+	}
+
+	// Should NOT have blanket ingress accept.
+	lines := strings.Split(rules, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == `oifname "tap0" accept` {
+			t.Error("egressFull+ingressNone: ingress chain should NOT have blanket accept")
+		}
+	}
+}
+
+func TestGenerateNftables_Combo_EgressRestricted_IngressNone(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "restricted",
+		Ingress:   "none",
+		Allowlist: []string{"203.0.113.50"},
+		GatewayIP: "10.0.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: DNS and NATS scoped to gateway, allowlist entry, drop.
+	if !strings.Contains(rules, "ip daddr 10.0.0.1 udp dport 53 accept") {
+		t.Error("egressRestricted+ingressNone: missing scoped DNS UDP")
+	}
+	if !strings.Contains(rules, "ip daddr 10.0.0.1 tcp dport 4222 accept") {
+		t.Error("egressRestricted+ingressNone: missing scoped NATS")
+	}
+	if !strings.Contains(rules, "ip daddr 203.0.113.50 accept") {
+		t.Error("egressRestricted+ingressNone: missing allowlist entry")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressRestricted+ingressNone: egress chain missing drop")
+	}
+
+	// Ingress chain: NATS-scoped established/related only.
+	if !strings.Contains(rules, `oifname "tap0" tcp sport 4222 ct state established,related accept`) {
+		t.Error("egressRestricted+ingressNone: ingress chain missing NATS-scoped established/related")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressRestricted+ingressNone: ingress chain missing drop")
+	}
+}
+
+func TestGenerateNftables_Combo_EgressNone_IngressRestricted(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "none",
+		Ingress:   "restricted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: NATS only.
+	if !strings.Contains(rules, `iifname "tap0" tcp dport 4222 accept`) {
+		t.Error("egressNone+ingressRestricted: egress chain missing NATS accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressNone+ingressRestricted: egress chain missing drop")
+	}
+
+	// Ingress chain: all established/related (not scoped to NATS sport).
+	if !strings.Contains(rules, `oifname "tap0" ct state established,related accept`) {
+		t.Error("egressNone+ingressRestricted: ingress chain missing established/related")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressNone+ingressRestricted: ingress chain missing drop")
+	}
+}
+
+func TestGenerateNftables_Combo_EgressFull_IngressRestricted(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "full",
+		Ingress:   "restricted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: blanket accept.
+	if !strings.Contains(rules, `iifname "tap0" accept`) {
+		t.Error("egressFull+ingressRestricted: egress chain missing blanket accept")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressFull+ingressRestricted: egress chain missing drop")
+	}
+
+	// Ingress chain: general established/related (not NATS-scoped).
+	if !strings.Contains(rules, `oifname "tap0" ct state established,related accept`) {
+		t.Error("egressFull+ingressRestricted: ingress chain missing established/related")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressFull+ingressRestricted: ingress chain missing drop")
+	}
+
+	// Should NOT have blanket ingress accept (that would be "full").
+	lines := strings.Split(rules, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == `oifname "tap0" accept` {
+			t.Error("egressFull+ingressRestricted: ingress chain should NOT have blanket accept")
+		}
+	}
+}
+
+func TestGenerateNftables_Combo_EgressRestricted_IngressFull(t *testing.T) {
+	t.Parallel()
+
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "restricted",
+		Ingress:   "full",
+		Allowlist: []string{"10.0.0.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Egress chain: DNS, NATS, allowlist, established/related, drop.
+	if !strings.Contains(rules, "dport 53 accept") {
+		t.Error("egressRestricted+ingressFull: egress chain missing DNS rules")
+	}
+	if !strings.Contains(rules, "dport 4222 accept") {
+		t.Error("egressRestricted+ingressFull: egress chain missing NATS rule")
+	}
+	if !strings.Contains(rules, "ip daddr 10.0.0.1 accept") {
+		t.Error("egressRestricted+ingressFull: egress chain missing allowlist entry")
+	}
+	if !strings.Contains(rules, `iifname "tap0" drop`) {
+		t.Error("egressRestricted+ingressFull: egress chain missing drop")
+	}
+
+	// Ingress chain: blanket accept.
+	if !strings.Contains(rules, `oifname "tap0" accept`) {
+		t.Error("egressRestricted+ingressFull: ingress chain missing blanket accept")
+	}
+	if !strings.Contains(rules, `oifname "tap0" drop`) {
+		t.Error("egressRestricted+ingressFull: ingress chain missing drop")
+	}
+}
+
+func TestGenerateNftables_Combo_TableAndChainStructure(t *testing.T) {
+	t.Parallel()
+
+	// Verify the overall structure of generated rules for a mixed combo.
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "taptest01",
+		Egress:    "restricted",
+		Ingress:   "full",
+		Allowlist: []string{"10.0.0.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Table name should be derived from the tap device.
+	if !strings.Contains(rules, "table inet hive_taptest01 {") {
+		t.Error("expected table name hive_taptest01")
+	}
+
+	// Both chains must exist with correct filter hook forward.
+	egressIdx := strings.Index(rules, "chain egress {")
+	ingressIdx := strings.Index(rules, "chain ingress {")
+	if egressIdx < 0 {
+		t.Fatal("missing egress chain")
+	}
+	if ingressIdx < 0 {
+		t.Fatal("missing ingress chain")
+	}
+	// Egress chain should come before ingress chain.
+	if egressIdx >= ingressIdx {
+		t.Error("egress chain should appear before ingress chain")
+	}
+
+	// Both chains should have policy accept (not drop -- the scoped drop rules
+	// are explicit, policy accept lets other interfaces pass through).
+	if strings.Count(rules, "policy accept;") != 2 {
+		t.Errorf("expected exactly 2 'policy accept;' directives, got %d", strings.Count(rules, "policy accept;"))
+	}
+
+	// The rules should end with a closing brace for the table.
+	if !strings.HasSuffix(strings.TrimSpace(rules), "}") {
+		t.Error("rules should end with closing brace")
 	}
 }
