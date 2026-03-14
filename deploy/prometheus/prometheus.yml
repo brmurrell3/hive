@@ -1,0 +1,40 @@
+# Prometheus scrape configuration for Hive.
+#
+# This configuration scrapes metrics from the hived control plane daemon,
+# which exposes Prometheus metrics at /metrics on port 9090 by default.
+#
+# Usage:
+#   prometheus --config.file=prometheus.yml
+#
+# Available metrics:
+#   hive_agents_total{status}           - Agent count by status (running, stopped, failed, etc.)
+#   hive_nats_messages_total{subject}   - NATS message count by subject prefix
+#   hive_capability_invocation_duration_ms{capability} - Capability invocation latency (p50, p90, p99)
+#   hive_heartbeat_healthy{agent_id}    - Agent heartbeat health (1=healthy, 0=unhealthy)
+#   hive_node_memory_usage_percent{node_id} - Node memory usage percentage
+#   hive_node_cpu_usage_percent{node_id}    - Node CPU usage percentage
+#   hive_errors_total{error_type}       - Error count by type
+#   hive_nats_connected                 - NATS connection status (1=connected, 0=disconnected)
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: hive
+    static_configs:
+      - targets: ['localhost:9090']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # Uncomment the following section to scrape metrics from additional
+  # Hive nodes in a multi-node cluster.
+  #
+  # - job_name: hive-nodes
+  #   static_configs:
+  #     - targets:
+  #       - 'node-1:9090'
+  #       - 'node-2:9090'
+  #       - 'node-3:9090'
+  #   metrics_path: /metrics
+  #   scrape_interval: 10s

@@ -54,16 +54,25 @@ func nodesListCmd() *cobra.Command {
 				}
 
 				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintln(w, "NODE_ID\tTIER\tARCH\tSTATUS\tMEMORY\tCPUS\tAGENTS")
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					colorizedHeader("NODE_ID"),
+					colorizedHeader("TIER"),
+					colorizedHeader("ARCH"),
+					colorizedHeader("STATUS"),
+					colorizedHeader("MEMORY"),
+					colorizedHeader("CPUS"),
+					colorizedHeader("AGENTS"),
+				)
 
 				for _, n := range nodes {
 					memStr := formatBytes(n.Resources.MemoryTotal)
 					agentCount := len(n.Agents)
+					statusStr := colorizeNodeStatus(n.Status, 10)
 					fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%d\t%d\n",
 						n.ID,
 						n.Tier,
 						n.Arch,
-						n.Status,
+						statusStr,
 						memStr,
 						n.Resources.CPUCount,
 						agentCount,

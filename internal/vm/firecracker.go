@@ -68,6 +68,9 @@ func NewFirecrackerHypervisor(firecrackerBin string, logger *slog.Logger) (*Fire
 		return nil, fmt.Errorf("pre-flight check failed: firecracker binary %q not found in PATH: %w", firecrackerBin, err)
 	}
 
+	// Pre-flight check: detect Firecracker version and warn if below minimum.
+	checkFirecrackerVersion(resolvedBin, logger)
+
 	return &FirecrackerHypervisor{
 		firecrackerBin: resolvedBin,
 		logger:         logger,
@@ -822,4 +825,131 @@ func (f *FirecrackerHypervisor) cleanupSocket(socketPath string) {
 		}
 		os.Remove(m)
 	}
+}
+
+// minFirecrackerVersion is the minimum supported Firecracker version.
+// Versions below this may lack features or bug fixes that Hive depends on.
+const minFirecrackerVersion = "1.0.0"
+
+// checkFirecrackerVersion runs "firecracker --version", parses the output,
+// logs the detected version, and warns if it is below minFirecrackerVersion.
+// This is a best-effort check and never returns an error; if parsing fails
+// the warning is logged and execution continues.
+func checkFirecrackerVersion(bin string, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	if err != nil {
+		logger.Warn("could not determine firecracker version",
+			"binary", bin,
+			"error", err,
+		)
+		return
+	}
+
+	version := parseFirecrackerVersion(string(out))
+	if version == "" {
+		logger.Warn("could not parse firecracker version from output",
+			"binary", bin,
+			"output", strings.TrimSpace(string(out)),
+		)
+		return
+	}
+
+	logger.Info("detected firecracker version",
+		"version", version,
+		"binary", bin,
+	)
+
+	if compareVersions(version, minFirecrackerVersion) < 0 {
+		logger.Warn("firecracker version is below the minimum supported version",
+			"detected", version,
+			"minimum", minFirecrackerVersion,
+		)
+	}
+}
+
+// parseFirecrackerVersion extracts the version number from firecracker
+// --version output. Typical output looks like:
+//
+//	Firecracker v1.6.0
+//
+// or sometimes:
+//
+//	Firecracker v1.6.0-dev
+//
+// Returns the version string without the "v" prefix, or "" if parsing fails.
+func parseFirecrackerVersion(output string) string {
+	// Look for a line containing a version-like pattern.
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		// Try to find "vX.Y.Z" pattern.
+		for _, field := range strings.Fields(line) {
+			if strings.HasPrefix(field, "v") && len(field) > 1 {
+				ver := strings.TrimPrefix(field, "v")
+				// Strip any pre-release suffix (e.g., "-dev", "-rc1").
+				if idx := strings.IndexByte(ver, '-'); idx >= 0 {
+					ver = ver[:idx]
+				}
+				// Basic validation: must contain at least one dot and only digits/dots.
+				if strings.Contains(ver, ".") && isVersionString(ver) {
+					return ver
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// isVersionString returns true if s contains only digits and dots and does
+// not start or end with a dot.
+func isVersionString(s string) bool {
+	if len(s) == 0 || s[0] == '.' || s[len(s)-1] == '.' {
+		return false
+	}
+	for _, c := range s {
+		if c != '.' && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// compareVersions compares two dot-separated version strings (e.g., "1.6.0"
+// vs "1.0.0"). Returns -1 if a < b, 0 if equal, 1 if a > b.
+// Missing components are treated as 0 (e.g., "1.6" == "1.6.0").
+func compareVersions(a, b string) int {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+
+	maxLen := len(aParts)
+	if len(bParts) > maxLen {
+		maxLen = len(bParts)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var aVal, bVal int
+		if i < len(aParts) {
+			for _, c := range aParts[i] {
+				if c >= '0' && c <= '9' {
+					aVal = aVal*10 + int(c-'0')
+				}
+			}
+		}
+		if i < len(bParts) {
+			for _, c := range bParts[i] {
+				if c >= '0' && c <= '9' {
+					bVal = bVal*10 + int(c-'0')
+				}
+			}
+		}
+		if aVal < bVal {
+			return -1
+		}
+		if aVal > bVal {
+			return 1
+		}
+	}
+	return 0
 }

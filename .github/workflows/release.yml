@@ -24,7 +24,9 @@ jobs:
       - name: Build release binaries
         run: |
           VERSION=${GITHUB_REF_NAME}
-          LDFLAGS="-X main.version=${VERSION}"
+          COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
 
           for PAIR in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             OS=${PAIR%/*}
@@ -43,10 +45,41 @@ jobs:
       - name: Generate checksums
         run: cd dist && sha256sum *.tar.gz > sha256sums.txt
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating changelog since ${PREV_TAG}..."
+            {
+              echo 'CHANGELOG<<CHANGELOG_EOF'
+              echo "## Changes since ${PREV_TAG}"
+              echo ""
+              git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD"
+              echo ""
+              echo ""
+              echo "## Rootfs Images"
+              echo ""
+              echo "Rootfs images (base + OpenClaw, amd64 + arm64) are built and attached automatically by the rootfs workflow."
+              echo 'CHANGELOG_EOF'
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'CHANGELOG<<CHANGELOG_EOF'
+              echo "## Initial Release"
+              echo ""
+              echo "## Rootfs Images"
+              echo ""
+              echo "Rootfs images (base + OpenClaw, amd64 + arm64) are built and attached automatically by the rootfs workflow."
+              echo 'CHANGELOG_EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: ${{ steps.changelog.outputs.CHANGELOG }}
           files: |
             dist/*.tar.gz
             dist/sha256sums.txt

@@ -33,6 +33,24 @@ jobs:
           name: coverage
           path: "*.cov"
 
+  test-vm:
+    name: VM Tests (Mock)
+    runs-on: ubuntu-latest
+    # Note: Real KVM/Firecracker tests require a self-hosted runner with
+    # /dev/kvm access. This job uses HIVE_TEST_FIRECRACKER=mock to exercise
+    # VM-related code paths without actual hardware virtualization.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: VM tests (mock backend)
+        run: go test -tags vm -race -count=1 -timeout 5m ./...
+        env:
+          HIVE_TEST_FIRECRACKER: mock
+
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
@@ -72,9 +90,13 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
-          go build -ldflags "-X main.version=${VERSION}" -o /dev/null ./cmd/hived
-          go build -ldflags "-X main.version=${VERSION}" -o /dev/null ./cmd/hivectl
-          go build -ldflags "-X main.version=${VERSION}" -o /dev/null ./cmd/hive-agent
+          COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
+          go build -ldflags "${LDFLAGS}" -o /dev/null ./cmd/hived
+          go build -ldflags "${LDFLAGS}" -o /dev/null ./cmd/hivectl
+          go build -ldflags "${LDFLAGS}" -o /dev/null ./cmd/hive-agent
+          go build -ldflags "${LDFLAGS}" -o /dev/null ./cmd/hive-sidecar
 
   audit-lint:
     name: Audit Lint
@@ -145,3 +167,42 @@ jobs:
 
       - name: Race detector stress test
         run: go test -tags unit,integration -race -count=5 -timeout 20m ./...
+
+  license-check:
+    name: License Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apache-2.0 headers on all .go files
+        run: |
+          MISSING=()
+          while IFS= read -r -d '' file; do
+            if ! head -1 "$file" | grep -q "SPDX-License-Identifier: Apache-2.0"; then
+              MISSING+=("$file")
+            fi
+          done < <(find . -name '*.go' -not -path './vendor/*' -print0)
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo "::error::The following .go files are missing the Apache-2.0 SPDX license header:"
+            printf '  %s\n' "${MISSING[@]}"
+            exit 1
+          fi
+          echo "All .go files have Apache-2.0 license headers."
+
+  mod-tidy:
+    name: Module Tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.8'
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod or go.sum is not tidy. Run 'go mod tidy' and commit the changes."
+            exit 1
+          fi

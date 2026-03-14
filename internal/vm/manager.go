@@ -90,6 +90,7 @@ type Manager struct {
 	forwarders               map[string]*VsockForwarder // agentID -> VsockForwarder
 	skipSocketPathValidation bool                       // set to true in tests with mock hypervisors
 	rootfsOverride           string                     // if set, use this rootfs image instead of {clusterRoot}/rootfs/rootfs.ext4
+	kernelOverride           string                     // if set, use this kernel image instead of {clusterRoot}/rootfs/vmlinux
 
 	// Resource accounting
 	totalMemoryMB  int64    // Total memory available for VMs (0 = unlimited)
@@ -143,6 +144,27 @@ func (m *Manager) resolveBaseRootfs() string {
 		return m.rootfsOverride
 	}
 	return filepath.Join(m.clusterRoot, "rootfs", "rootfs.ext4")
+}
+
+// SetKernelOverride sets a custom kernel image path that overrides the default
+// {clusterRoot}/rootfs/vmlinux location. This is used when a kernel image
+// is provided via --kernel-path or auto-downloaded by the KernelManager.
+func (m *Manager) SetKernelOverride(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.kernelOverride = path
+}
+
+// resolveKernelPath returns the path to the kernel image. If a kernel
+// override has been set (via SetKernelOverride), it is used. Otherwise, the
+// default location {clusterRoot}/rootfs/vmlinux is returned.
+func (m *Manager) resolveKernelPath() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.kernelOverride != "" {
+		return m.kernelOverride
+	}
+	return filepath.Join(m.clusterRoot, "rootfs", "vmlinux")
 }
 
 // allocateCID returns the next available unique CID for virtio-vsock.
@@ -280,17 +302,25 @@ func (m *Manager) captureAndReleaseResources(agentID string) (memMB int64, vcpus
 	return memMB, vcpus, cid, nil
 }
 
-// cleanupAgentNetworkPolicy removes nftables rules for the given agent's TAP
-// device. It derives a 30-second timeout from the passed context.
-// Errors are logged at Debug level (nftables cleanup failure is expected on
-// systems without nftables or when no rules were applied).
+// cleanupAgentNetworkPolicy removes nftables rules and the TAP device for
+// the given agent. It derives a 30-second timeout from the passed context.
+// Errors are logged at Debug level (nftables/TAP cleanup failure is expected
+// on systems without nftables or when no rules/devices were applied).
 func (m *Manager) cleanupAgentNetworkPolicy(ctx context.Context, agentID string, logger *slog.Logger) {
 	tapDevice := TapDeviceName(agentID)
+
+	// Remove nftables rules first (while the TAP device still exists).
 	nftCmd, nftArgs := CleanupNftables(tapDevice)
 	nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer nftCancel()
 	if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
 		logger.Debug("nftables cleanup skipped", "agent_id", agentID, "error", err, "output", string(out))
+	}
+
+	// Delete the TAP device. This is best-effort; the device may not exist
+	// if TAP creation was skipped (e.g., no network policy, or non-Linux).
+	if tapErr := DeleteTapDevice(ctx, tapDevice); tapErr != nil {
+		logger.Debug("TAP device cleanup skipped", "agent_id", agentID, "device", tapDevice, "error", tapErr)
 	}
 }
 
@@ -413,7 +443,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	}
 
 	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
-	kernelPath := filepath.Join(m.clusterRoot, "rootfs", "vmlinux")
+	kernelPath := m.resolveKernelPath()
 	baseRootfs := m.resolveBaseRootfs()
 	agentDir := filepath.Join(m.clusterRoot, "agents", agentID)
 	agentDriveImg := filepath.Join(stateDir, "agent-drive.img")
@@ -674,12 +704,79 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		if egressMode == "" {
 			egressMode = egressFull
 		}
+		// Derive per-agent gateway IP from the CID to give each VM its own
+		// /30 subnet instead of sharing 172.16.0.1 across all agents.
+		hostCIDR, _, subnetErr := TapSubnet(cid)
+		if subnetErr != nil {
+			for _, imgPath := range volumeImgPaths {
+				os.Remove(imgPath)
+			}
+			os.Remove(rootfsCopy)
+			os.Remove(sidecarConf)
+			os.Remove(agentDriveImg)
+			return m.failAgent(agentState, fmt.Errorf("computing TAP subnet for agent %s (CID %d): %w", agentID, cid, subnetErr))
+		}
+		// Extract the host IP from the CIDR for use as gateway.
+		gatewayIP := strings.SplitN(hostCIDR, "/", 2)[0]
 		netPolicy = &NetworkPolicy{
 			TapDevice: tapDevice,
 			Egress:    egressMode,
 			Allowlist: agent.Spec.Network.EgressAllowlist,
 			Ingress:   agent.Spec.Network.Ingress,
-			GatewayIP: "172.16.0.1",
+			GatewayIP: gatewayIP,
+		}
+	}
+
+	// Create and configure the TAP device BEFORE Firecracker boots, because
+	// Firecracker requires the TAP device to exist when the network interface
+	// is configured. The TAP device is only created when a network policy is
+	// defined (i.e., the agent has network restrictions or a network interface).
+	tapCreated := false
+	if netPolicy != nil && netPolicy.TapDevice != "" {
+		if tapErr := CreateTapDevice(ctx, netPolicy.TapDevice); tapErr != nil {
+			m.logger.Warn("TAP device creation failed (non-fatal on non-Linux)",
+				"agent_id", agentID,
+				"device", netPolicy.TapDevice,
+				"error", tapErr,
+			)
+			// On Linux this is fatal; on other platforms the stub returns an error
+			// but we still allow startup for testing with the mock hypervisor.
+			if !m.skipSocketPathValidation {
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				os.Remove(sidecarConf)
+				os.Remove(agentDriveImg)
+				return m.failAgent(agentState, fmt.Errorf("creating TAP device for agent %s: %w", agentID, tapErr))
+			}
+		} else {
+			tapCreated = true
+			// Configure the TAP device with the host-side IP.
+			hostCIDR, _, _ := TapSubnet(cid) // already validated above
+			if cfgErr := ConfigureTapDevice(ctx, netPolicy.TapDevice, hostCIDR); cfgErr != nil {
+				// Clean up the TAP device we just created.
+				_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				os.Remove(sidecarConf)
+				os.Remove(agentDriveImg)
+				return m.failAgent(agentState, fmt.Errorf("configuring TAP device for agent %s: %w", agentID, cfgErr))
+			}
+
+			// Set up NAT so the guest VM can reach external networks.
+			if natErr := SetupNAT(ctx, netPolicy.TapDevice); natErr != nil {
+				_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+				for _, imgPath := range volumeImgPaths {
+					os.Remove(imgPath)
+				}
+				os.Remove(rootfsCopy)
+				os.Remove(sidecarConf)
+				os.Remove(agentDriveImg)
+				return m.failAgent(agentState, fmt.Errorf("setting up NAT for agent %s: %w", agentID, natErr))
+			}
 		}
 	}
 
@@ -699,6 +796,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 
 	vmPID, err := m.hypervisor.CreateVM(ctx, vmCfg)
 	if err != nil {
+		if tapCreated && netPolicy != nil {
+			_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+		}
 		for _, imgPath := range volumeImgPaths {
 			os.Remove(imgPath)
 		}
@@ -711,6 +811,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusStarting); err != nil {
 		// VM process is spawned — must destroy it to avoid orphan.
 		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
+		if tapCreated && netPolicy != nil {
+			_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+		}
 		m.stopForwarder(agentID)
 		for _, imgPath := range volumeImgPaths {
 			os.Remove(imgPath)
@@ -731,6 +834,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	if err := m.store.SetAgent(agentState); err != nil {
 		// VM process is spawned — must destroy it to avoid orphan.
 		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
+		if tapCreated && netPolicy != nil {
+			_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+		}
 		m.stopForwarder(agentID)
 		for _, imgPath := range volumeImgPaths {
 			os.Remove(imgPath)
@@ -784,6 +890,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	if needsNftables {
 		rules, nftGenErr := GenerateNftables(*netPolicy)
 		if nftGenErr != nil {
+			if tapCreated && netPolicy != nil {
+				_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+			}
 			if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
 				m.logger.Warn("failed to destroy VM after nftables generation failure",
 					"agent_id", agentID,
@@ -806,6 +915,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			nftCmd.Stdin = strings.NewReader(rules)
 			if out, nftErr := nftCmd.CombinedOutput(); nftErr != nil {
 				// Fatal: refuse to start the VM without network policy.
+				if tapCreated && netPolicy != nil {
+					_ = DeleteTapDevice(ctx, netPolicy.TapDevice)
+				}
 				if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
 					m.logger.Warn("failed to destroy VM after nftables failure",
 						"agent_id", agentID,
@@ -826,7 +938,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	}
 
 	if err := m.hypervisor.StartVM(ctx, socketPath); err != nil {
-		// Clean up nftables rules that were applied before StartVM.
+		// Clean up nftables rules and TAP device that were applied before StartVM.
 		if needsNftables {
 			tapDevice := TapDeviceName(agentID)
 			nftCmd, nftArgs := CleanupNftables(tapDevice)
@@ -834,6 +946,11 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			defer nftCancel2()
 			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
 				m.logger.Debug("nftables cleanup after StartVM failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
+			}
+		}
+		if tapCreated && netPolicy != nil {
+			if tapDelErr := DeleteTapDevice(ctx, netPolicy.TapDevice); tapDelErr != nil {
+				m.logger.Debug("TAP device cleanup after StartVM failure", "agent_id", agentID, "error", tapDelErr)
 			}
 		}
 		if destroyErr := m.hypervisor.DestroyVM(socketPath, vmPID); destroyErr != nil {
@@ -860,7 +977,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusRunning); err != nil {
 		// VM is running but state transition failed. Clean up nftables rules
-		// before destroying the VM to avoid leaked firewall rules.
+		// and TAP device before destroying the VM to avoid leaked resources.
 		if needsNftables {
 			tapDevice := TapDeviceName(agentID)
 			nftCmd, nftArgs := CleanupNftables(tapDevice)
@@ -868,6 +985,11 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			defer nftCancel2()
 			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
 				m.logger.Debug("nftables cleanup after CheckTransition failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
+			}
+		}
+		if tapCreated && netPolicy != nil {
+			if tapDelErr := DeleteTapDevice(ctx, netPolicy.TapDevice); tapDelErr != nil {
+				m.logger.Debug("TAP device cleanup after CheckTransition failure", "agent_id", agentID, "error", tapDelErr)
 			}
 		}
 		// Explicitly destroy the VM and release resources since the deferred
@@ -883,7 +1005,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	agentState.LastTransition = agentState.StartedAt
 	if err := m.store.SetAgent(agentState); err != nil {
 		// VM is running but state persistence failed. Clean up nftables rules
-		// before destroying the VM to avoid leaked firewall rules.
+		// and TAP device before destroying the VM to avoid leaked resources.
 		if needsNftables {
 			tapDevice := TapDeviceName(agentID)
 			nftCmd, nftArgs := CleanupNftables(tapDevice)
@@ -891,6 +1013,11 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			defer nftCancel2()
 			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
 				m.logger.Debug("nftables cleanup after SetAgent RUNNING failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
+			}
+		}
+		if tapCreated && netPolicy != nil {
+			if tapDelErr := DeleteTapDevice(ctx, netPolicy.TapDevice); tapDelErr != nil {
+				m.logger.Debug("TAP device cleanup after SetAgent RUNNING failure", "agent_id", agentID, "error", tapDelErr)
 			}
 		}
 		// Explicitly destroy the VM and release resources since the deferred
@@ -1179,6 +1306,13 @@ func (m *Manager) RestartAgent(ctx context.Context, agentID string, agent *types
 func (m *Manager) ReconcileOnStartup() error {
 	m.logger.Info("reconciling VM state on startup")
 
+	// Clean up stale TAP devices left behind by a previous crash. This runs
+	// before per-agent reconciliation so that orphaned TAP devices (whose
+	// agents may no longer exist in state) are removed.
+	if tapErr := CleanupStaleTapDevices(context.Background()); tapErr != nil {
+		m.logger.Warn("stale TAP device cleanup failed (non-fatal)", "error", tapErr)
+	}
+
 	agents := m.store.AllAgents()
 
 	// Restore nextCID and resource allocations from existing agent state
@@ -1218,14 +1352,8 @@ func (m *Manager) ReconcileOnStartup() error {
 					"previous_status", agent.Status,
 				)
 
-				// Clean up nftables rules for the dead agent's tap device.
-				tapDevice := TapDeviceName(agent.ID)
-				nftCmd, nftArgs := CleanupNftables(tapDevice)
-				nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer nftCancel()
-				if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
-					m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
-				}
+				// Clean up nftables rules and TAP device for the dead agent.
+				m.cleanupAgentNetworkPolicy(context.Background(), agent.ID, m.logger)
 
 				// Clean up disk artifacts left behind by the dead VM.
 				m.cleanupAgentArtifacts(agent.ID)
@@ -1269,14 +1397,8 @@ func (m *Manager) ReconcileOnStartup() error {
 					"status", agent.Status,
 				)
 
-				// Clean up nftables rules for the orphaned agent.
-				tapDevice := TapDeviceName(agent.ID)
-				nftCmd, nftArgs := CleanupNftables(tapDevice)
-				nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer nftCancel()
-				if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
-					m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
-				}
+				// Clean up nftables rules and TAP device for the orphaned agent.
+				m.cleanupAgentNetworkPolicy(context.Background(), agent.ID, m.logger)
 
 				// Clean up disk artifacts.
 				m.cleanupAgentArtifacts(agent.ID)

@@ -49,7 +49,11 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-var version = "dev"
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
 
 // controlHandlerConfig holds all dependencies for the control handler,
 // replacing the long parameter list in newControlHandler.
@@ -112,10 +116,16 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	forceProcessBackend := flag.Bool("force-process-backend", false, "Force all agents to use process backend, ignoring tier: vm config")
 	rootfsPath := flag.String("rootfs-path", "", "Path to prebuilt rootfs image (overrides auto-download)")
+	kernelPath := flag.String("kernel-path", "", "Path to prebuilt kernel image (overrides auto-download)")
+	skipNetwork := flag.Bool("skip-network", false, "Disable TAP/nftables creation (VM runs with vsock only)")
+	firecrackerBin := flag.String("firecracker-bin", "", "Path to Firecracker binary (defaults to 'firecracker' in PATH)")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("hived %s\n", version)
+		fmt.Printf("  Commit:     %s\n", commit)
+		fmt.Printf("  Built:      %s\n", buildDate)
+		fmt.Printf("  Go version: %s\n", runtime.Version())
 		os.Exit(0)
 	}
 
@@ -125,13 +135,13 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	if err := run(*clusterRoot, logger, *forceProcessBackend, *rootfsPath); err != nil {
+	if err := run(*clusterRoot, logger, *forceProcessBackend, *rootfsPath, *kernelPath, *skipNetwork, *firecrackerBin); err != nil {
 		logger.Error("hived failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, rootfsPath string) error {
+func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, rootfsPath string, kernelPath string, skipNetwork bool, firecrackerBin string) error {
 	// Top-level context cancelled on shutdown; child subsystems should derive
 	// from this so they stop when hived shuts down.
 	runCtx, runCancel := context.WithCancel(context.Background())
@@ -142,7 +152,47 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 		return fmt.Errorf("resolving cluster root: %w", err)
 	}
 
-	logger.Info("starting hived", "cluster_root", absRoot)
+	logger.Info("starting hived",
+		"version", version,
+		"commit", commit,
+		"build_date", buildDate,
+		"cluster_root", absRoot,
+	)
+
+	// Run pre-flight checks to verify system capabilities early.
+	preflightResults := vm.CheckCapabilities()
+	hasCriticalFailure := false
+	hasNetworkFailure := false
+	for _, r := range preflightResults {
+		switch r.Status {
+		case vm.PreflightPass:
+			logger.Info("preflight check passed", "check", r.Name, "message", r.Message)
+		case vm.PreflightWarn:
+			logger.Warn("preflight check warning", "check", r.Name, "message", r.Message)
+		case vm.PreflightFail:
+			logger.Error("preflight check failed", "check", r.Name, "message", r.Message)
+			if r.Name == "kvm_device" {
+				hasCriticalFailure = true
+			}
+			if r.Name == "nft_binary" || r.Name == "ip_binary" || r.Name == "cap_net_admin" {
+				hasNetworkFailure = true
+			}
+		}
+	}
+
+	if hasCriticalFailure && !forceProcessBackend {
+		return fmt.Errorf("critical preflight check failed: /dev/kvm is not available; " +
+			"Firecracker requires KVM — use --force-process-backend to run without VM support")
+	}
+
+	if hasNetworkFailure && !skipNetwork {
+		logger.Warn("network-related preflight checks failed; TAP/nftables may not work — " +
+			"use --skip-network to disable TAP/nftables and run with vsock only")
+	}
+
+	if skipNetwork {
+		logger.Info("--skip-network enabled: TAP/nftables creation is disabled, VMs will use vsock only")
+	}
 
 	cfg, err := config.LoadCluster(absRoot)
 	if err != nil {
@@ -273,8 +323,13 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 			useMock = true
 		} else {
 			f.Close()
-			if _, err := exec.LookPath("firecracker"); err != nil {
-				logger.Warn("firecracker binary not found in PATH, falling back to mock hypervisor")
+			fcBinToCheck := firecrackerBin
+			if fcBinToCheck == "" {
+				fcBinToCheck = "firecracker"
+			}
+			if _, err := exec.LookPath(fcBinToCheck); err != nil {
+				logger.Warn("firecracker binary not found, falling back to mock hypervisor",
+					"binary", fcBinToCheck)
 				useMock = true
 			}
 		}
@@ -283,7 +338,7 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 		hyp = vm.NewMockHypervisor()
 		logger.Info("using mock hypervisor")
 	} else {
-		fcHyp, err := vm.NewFirecrackerHypervisor("", logger)
+		fcHyp, err := vm.NewFirecrackerHypervisor(firecrackerBin, logger)
 		if err != nil {
 			return fmt.Errorf("initializing Firecracker hypervisor: %w", err)
 		}
@@ -305,6 +360,15 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 	} else if resolvedRootfs != "" {
 		vmMgr.SetRootfsOverride(resolvedRootfs)
 		logger.Info("rootfs image resolved", "path", resolvedRootfs)
+	}
+
+	// Resolve kernel image path: explicit flag > cluster config > local file > auto-download.
+	resolvedKernel, err := resolveKernelPath(runCtx, kernelPath, cfg.Spec.VM, absRoot, logger)
+	if err != nil {
+		logger.Warn("kernel auto-download failed; VMs will use default path", "error", err)
+	} else if resolvedKernel != "" {
+		vmMgr.SetKernelOverride(resolvedKernel)
+		logger.Info("kernel image resolved", "path", resolvedKernel)
 	}
 
 	if err := vmMgr.ReconcileOnStartup(); err != nil {
@@ -831,6 +895,8 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 			CORSOrigin: cfg.Spec.Dashboard.CORSOrigin,
 			AuthToken:  cfg.Spec.Dashboard.AuthToken,
 			Authorizer: authorizer,
+			Version:    version,
+			Reconciler: rec,
 		})
 		// dashErrCh receives an error if Start() fails (e.g., port already
 		// in use). The goroutine exits when Start() returns, so there is no
@@ -1456,6 +1522,60 @@ func resolveRootfsPath(ctx context.Context, flagPath, clusterRoot string, logger
 	}
 
 	return imagePath, nil
+}
+
+// resolveKernelPath determines the kernel image path using the following
+// precedence: (1) explicit --kernel-path flag, (2) cluster.yaml spec.vm.kernelPath,
+// (3) local file at the standard location in the cluster root, (4) auto-download
+// via KernelManager.
+// Returns the resolved path and any error. An empty string with no error means
+// no override is needed (the VM manager will use its default path).
+func resolveKernelPath(ctx context.Context, flagPath string, vmCfg types.VMConfig, clusterRoot string, logger *slog.Logger) (string, error) {
+	// 1. Explicit --kernel-path flag takes precedence.
+	if flagPath != "" {
+		abs, err := filepath.Abs(flagPath)
+		if err != nil {
+			return "", fmt.Errorf("resolving kernel path: %w", err)
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return "", fmt.Errorf("kernel image not found at %s: %w", abs, err)
+		}
+		logger.Info("using explicit kernel path", "path", abs)
+		return abs, nil
+	}
+
+	// 2. Cluster config spec.vm.kernelPath.
+	if vmCfg.KernelPath != "" {
+		abs, err := filepath.Abs(vmCfg.KernelPath)
+		if err != nil {
+			return "", fmt.Errorf("resolving cluster config kernel path: %w", err)
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return "", fmt.Errorf("kernel image from cluster config not found at %s: %w", abs, err)
+		}
+		logger.Info("using kernel path from cluster config", "path", abs)
+		return abs, nil
+	}
+
+	// 3. Check if a local kernel exists at the standard location.
+	localKernel := filepath.Join(clusterRoot, "rootfs", "vmlinux")
+	if _, err := os.Stat(localKernel); err == nil {
+		logger.Info("using local kernel image", "path", localKernel)
+		return "", nil // empty string = use the default path in the VM manager
+	}
+
+	// 4. Auto-download via KernelManager.
+	logger.Info("no local kernel found, attempting auto-download")
+	kernelMgr := vm.NewKernelManager(vm.KernelManagerConfig{
+		ImageURL: vmCfg.ImageURL,
+		Logger:   logger,
+	})
+	kernelPathResolved, err := kernelMgr.EnsureKernel(ctx, clusterRoot)
+	if err != nil {
+		return "", fmt.Errorf("auto-downloading kernel image: %w", err)
+	}
+
+	return kernelPathResolved, nil
 }
 
 // sdNotify sends READY=1 to systemd's notification socket if NOTIFY_SOCKET

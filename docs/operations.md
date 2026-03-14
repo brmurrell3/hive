@@ -1,132 +1,245 @@
 # Hive Operations Guide
 
-Operational reference for every Hive feature. For build and test instructions, see the [main README](../README.md). For a quick tutorial, see [Getting Started](getting-started.md).
+Complete operational reference for deploying, configuring, and maintaining Hive clusters. For a quick tutorial, see [Getting Started](getting-started.md).
 
 ---
 
 ## Table of Contents
 
-1. [Scaffold a Cluster](#1-scaffold-a-cluster)
-2. [Start the Control Plane](#2-start-the-control-plane)
-3. [Validate Configuration](#3-validate-configuration)
-4. [Manage Agents (VM Lifecycle)](#4-manage-agents-vm-lifecycle)
-5. [Join Tokens](#5-join-tokens)
-6. [Node Management](#6-node-management)
-7. [Join a Tier 2 Native Agent](#7-join-a-tier-2-native-agent)
-8. [RBAC and User Management](#8-rbac-and-user-management)
-9. [Dashboard and Web UI](#9-dashboard-and-web-ui)
-10. [Prometheus Metrics](#10-prometheus-metrics)
-11. [Log Aggregation](#11-log-aggregation)
-12. [NATS Messaging and Pub/Sub](#12-nats-messaging-and-pubsub)
-13. [Build the Rootfs Images](#13-build-the-rootfs-images)
-14. [Production Hardening](#14-production-hardening)
-15. [Troubleshooting](#15-troubleshooting)
+1. [Prerequisites](#prerequisites)
+2. [Installation](#installation)
+3. [Configuration Reference](#configuration-reference)
+4. [Agent Lifecycle](#agent-lifecycle)
+5. [Join Tokens](#join-tokens)
+6. [Node Management](#node-management)
+7. [Tier 2 Native Agents](#tier-2-native-agents)
+8. [RBAC and User Management](#rbac-and-user-management)
+9. [Dashboard and Web UI](#dashboard-and-web-ui)
+10. [Prometheus Metrics](#prometheus-metrics)
+11. [Log Aggregation](#log-aggregation)
+12. [Network Policy](#network-policy)
+13. [Backup and Recovery](#backup-and-recovery)
+14. [Production Hardening](#production-hardening)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
-## 1. Scaffold a Cluster
+## Prerequisites
 
-Create a fresh cluster directory with all the template files:
+### Hardware requirements
+
+| Deployment | CPU | RAM | Disk | KVM |
+|-----------|-----|-----|------|-----|
+| Local development (process backend) | Any | 1 GB+ | 1 GB | Not required |
+| Production (Firecracker VMs) | x86_64 or arm64 | 4 GB+ | 10 GB+ | Required |
+| Tier 2 node (Raspberry Pi, etc.) | Any Go-supported arch | 512 MB+ | 1 GB | Not required |
+
+### Software requirements
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| Go | 1.25+ | Required for building from source |
+| Linux kernel | 4.14+ | For Firecracker (KVM support) |
+| Firecracker | v1.6.0+ | For VM isolation (Linux only) |
+| Docker | Any recent | For building Alpine rootfs (optional) |
+| Nix | With flakes | For building NixOS rootfs (optional) |
+
+### Kernel modules (Linux, VM mode only)
 
 ```bash
-./hivectl init my-cluster
+# Verify KVM is available
+ls -la /dev/kvm
+
+# Load kernel modules if needed
+sudo modprobe kvm
+sudo modprobe kvm_intel    # Intel CPUs
+sudo modprobe kvm_amd      # AMD CPUs
+
+# Persistent: add to /etc/modules-load.d/kvm.conf
+echo -e "kvm\nkvm_intel" | sudo tee /etc/modules-load.d/kvm.conf
+
+# Grant access to your user
+sudo usermod -aG kvm $USER
 ```
 
-This creates:
+### Required Linux capabilities (Firecracker VM mode)
 
-```
-my-cluster/
-├── cluster.yaml                    # Cluster configuration
-├── agents/
-│   └── example-agent/
-│       └── manifest.yaml           # Example agent manifest
-└── teams/
-    └── default.yaml                # Default team
-```
+Running Hive with Firecracker VMs requires the following system capabilities and resources:
 
-Examine the generated files:
+| Requirement | Purpose |
+|-------------|---------|
+| `CAP_NET_ADMIN` | Creating TAP devices and managing nftables rules for VM networking |
+| `CAP_SYS_ADMIN` | Accessing `/dev/kvm` for hardware virtualization |
+| `/dev/kvm` | KVM device node must be readable/writable by the hived process |
+| `vhost_vsock` kernel module | Required for virtio-vsock host-guest communication |
+| `nft` binary in PATH | nftables CLI for applying egress firewall rules |
+| `ip` binary in PATH | iproute2 CLI for TAP device creation and network configuration |
 
 ```bash
-cat my-cluster/cluster.yaml
-cat my-cluster/agents/example-agent/manifest.yaml
-cat my-cluster/teams/default.yaml
+# Load the vhost_vsock module
+sudo modprobe vhost_vsock
+
+# Persistent: add to /etc/modules-load.d/vhost_vsock.conf
+echo "vhost_vsock" | sudo tee /etc/modules-load.d/vhost_vsock.conf
+
+# Verify required binaries are available
+which nft ip
+
+# If running hived without root, grant capabilities to the binary:
+sudo setcap 'cap_net_admin,cap_sys_admin+ep' ./bin/hived
+```
+
+### Installing Firecracker (Linux only)
+
+Firecracker is a lightweight VMM (virtual machine monitor) developed by AWS. It is only supported on Linux with KVM.
+
+**Download from GitHub releases (Ubuntu/Debian):**
+
+```bash
+# Check the latest release at https://github.com/firecracker-microvm/firecracker/releases
+ARCH=$(uname -m)  # x86_64 or aarch64
+FC_VERSION="1.6.0"
+
+# Download and extract
+curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" \
+  -o firecracker.tgz
+tar xzf firecracker.tgz
+sudo mv release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH} /usr/local/bin/firecracker
+rm -rf release-v${FC_VERSION}-${ARCH} firecracker.tgz
+
+# Verify installation
+firecracker --version
+```
+
+**Required kernel modules:**
+
+```bash
+# KVM (hardware virtualization)
+sudo modprobe kvm
+sudo modprobe kvm_intel    # Intel CPUs
+sudo modprobe kvm_amd      # AMD CPUs
+
+# vhost_vsock (host-guest communication)
+sudo modprobe vhost_vsock
+
+# Verify
+ls -la /dev/kvm
+ls -la /dev/vhost-vsock
 ```
 
 ---
 
-## 2. Start the Control Plane
+## Installation
+
+### From source
 
 ```bash
-# Start hived pointing at the cluster directory
-./hived --cluster-root my-cluster
+git clone https://github.com/brmurrell3/hive && cd hive
+make build
 ```
 
-Output (JSON structured logs to stdout):
+Produces binaries in `./bin/`:
+- `hived` -- control plane daemon
+- `hivectl` -- management CLI
+- `hive-agent` -- Tier 2 agent host binary
 
-```json
-{"level":"INFO","msg":"starting hived","cluster_root":"/path/to/my-cluster"}
-{"level":"INFO","msg":"cluster config loaded","name":"my-cluster","nats_port":4222,"jetstream":true}
-{"level":"INFO","msg":"hived is ready","nats_url":"nats://127.0.0.1:4222"}
+### Cross-compilation
+
+```bash
+# Linux x86_64 (servers, VMs)
+make build-linux-amd64
+
+# Linux arm64 (Raspberry Pi)
+make build-linux-arm64
+
+# macOS Intel
+make build-darwin-amd64
+
+# All targets
+make build-all
 ```
 
-hived runs in the foreground. It:
-- Embeds a NATS server (no external NATS needed)
-- Listens on the port from `cluster.yaml` (default 4222)
-- Enables JetStream for persistent messaging
-- Stores JetStream data at `my-cluster/.state/jetstream/`
-- Handles `SIGTERM`/`SIGINT` for graceful shutdown
+### VM images (Linux only)
 
-**To stop:** `Ctrl+C` or `kill <pid>`
+```bash
+# Download Firecracker-compatible kernel
+make download-kernel
+
+# Build Alpine rootfs (requires Docker)
+make rootfs
+
+# Build NixOS rootfs (requires Nix with flakes)
+cd rootfs/nixos && nix build .#rootfs && nix build .#kernel
+```
 
 ---
 
-## 3. Validate Configuration
+## Configuration Reference
 
-Validate all YAML manifests (cluster + agents + teams) without starting anything:
+### cluster.yaml
 
-```bash
-./hivectl validate --cluster-root my-cluster
-# Validation passed.
+The cluster configuration file lives at the root of the cluster directory. Full schema: [Schemas](schemas.md).
+
+```yaml
+apiVersion: hive/v1
+kind: Cluster
+metadata:
+  name: my-cluster
+spec:
+  nats:
+    port: 4222                    # NATS client port
+    clusterPort: 6222             # NATS cluster peering (multi-node)
+    jetstream:
+      enabled: true
+      maxMemory: "1GB"
+      maxStorage: "10GB"
+  vm:
+    kernelPath: /path/to/vmlinux       # Firecracker kernel
+    rootfsPath: /path/to/rootfs.ext4   # Firecracker rootfs
+  defaults:
+    resources:
+      memory: "512Mi"
+      vcpus: 1
+      disk: "5GB"
+    network:
+      egress: restricted                # none, restricted, full
+    health:
+      enabled: true
+      interval: "30s"
+      timeout: "5s"
+      maxFailures: 3
+    restart:
+      policy: on-failure               # always, on-failure, never
+      maxRestarts: 5
+      backoff: "10s"
+  nodes:
+    autoApprove: true                  # Auto-approve Tier 2 join requests
+  secrets:
+    ANTHROPIC_KEY: ""                  # Empty = read from HIVE_SECRET_ANTHROPIC_KEY env
 ```
 
-If there are errors (e.g., missing required fields, invalid agent IDs, duplicate IDs):
+### Agent manifest
 
-```bash
-# Example: invalid agent ID
-./hivectl validate --cluster-root my-cluster
-# Error: agent ID "-bad-id" is invalid: must match [a-z0-9][a-z0-9-]{0,62}
-```
+Each agent is defined in `agents/<agent-id>/manifest.yaml`:
 
----
-
-## 4. Manage Agents (VM Lifecycle)
-
-Agents run inside Firecracker VMs on Linux. On macOS or without `/dev/kvm`, use mock mode:
-
-```bash
-export HIVE_TEST_FIRECRACKER=mock
-```
-
-### Create an Agent Manifest
-
-```bash
-mkdir -p my-cluster/agents/my-agent
-
-cat > my-cluster/agents/my-agent/manifest.yaml << 'EOF'
+```yaml
 apiVersion: hive/v1
 kind: Agent
 metadata:
-  id: my-agent
-  team: default
+  id: my-agent                   # Unique, [a-z0-9][a-z0-9-]{0,62}
+  team: default                  # References a team ID
+  labels:
+    role: worker
 spec:
+  tier: vm                       # vm or native (auto-inferred if omitted)
   runtime:
-    type: openclaw
+    type: openclaw               # openclaw, custom, or process
     model:
       provider: anthropic
       name: claude-sonnet-4-5
   capabilities:
     - name: summarize
-      description: Summarize text
+      description: Summarize text input
       inputs:
         - name: text
           type: string
@@ -138,379 +251,265 @@ spec:
   resources:
     memory: "512Mi"
     vcpus: 2
-EOF
+    disk: "5GB"
+  network:
+    egress: restricted
+    egress_allowlist:
+      - "api.anthropic.com"
+  health:
+    interval: "10s"
+    timeout: "3s"
+    maxFailures: 5
+  restart:
+    policy: on-failure
+    maxRestarts: 3
+    backoff: "5s"
 ```
 
-### Start, Stop, Restart, Destroy
+### Team manifest
 
-```bash
-# Start an agent (provisions VM, transitions PENDING → CREATING → STARTING → RUNNING)
-./hivectl agents start my-agent --cluster-root my-cluster
-# Agent my-agent started
+Teams are defined in `teams/<team-id>.yaml`:
 
-# List all agents
-./hivectl agents list --cluster-root my-cluster
-# AGENT_ID    TEAM     STATE    UPTIME
-# my-agent    default  RUNNING  5s
-
-# Detailed status (JSON output)
-./hivectl agents status my-agent --cluster-root my-cluster
-
-# Stop an agent (RUNNING → STOPPING → STOPPED)
-./hivectl agents stop my-agent --cluster-root my-cluster
-# Agent my-agent stopped
-
-# Restart (stop + start, resets restart counter)
-./hivectl agents restart my-agent --cluster-root my-cluster
-# Agent my-agent restarted
-
-# Destroy (force kill, delete rootfs copy, remove from state)
-./hivectl agents destroy my-agent --cluster-root my-cluster
-# Agent my-agent destroyed
-```
-
-### State File
-
-All runtime state is persisted atomically to `my-cluster/state.db`:
-
-```bash
-cat my-cluster/state.db | python3 -m json.tool
-```
-
-```json
-{
-  "agents": {
-    "my-agent": {
-      "id": "my-agent",
-      "team": "default",
-      "status": "RUNNING",
-      "vm_pid": 12345,
-      "vm_cid": 3,
-      "vm_socket_path": ".state/agents/my-agent/firecracker.sock",
-      "rootfs_copy_path": ".state/agents/my-agent/rootfs.ext4",
-      "restart_count": 0,
-      "last_transition": "2026-03-03T10:00:00Z",
-      "started_at": "2026-03-03T10:00:00Z"
-    }
-  }
-}
-```
-
-### Agent State Machine
-
-```
-PENDING → CREATING → STARTING → RUNNING → STOPPING → STOPPED
-                 ↘              ↘          ↘
-                  ←←←← FAILED ←←←←←←←←←←←←←
-STOPPED → CREATING  (restart)
-FAILED  → CREATING  (restart)
+```yaml
+apiVersion: hive/v1
+kind: Team
+metadata:
+  id: ci-pipeline
+spec:
+  lead: code-reviewer            # Agent ID of team lead
+  resources:
+    maxMemory: "4Gi"
+    maxAgents: 10
+  communication:
+    persistent: true             # Enable JetStream for offline message delivery
+    historyDepth: 100
+  shared_volumes:
+    - name: shared-data
+      hostPath: /data/shared
+      access: read-write
 ```
 
 ---
 
-## 5. Join Tokens
+## Agent Lifecycle
+
+### State machine
+
+```
+PENDING --> CREATING --> STARTING --> RUNNING --> STOPPING --> STOPPED
+                 \                      \          \
+                  <-------- FAILED <-----<----------<
+STOPPED --> CREATING  (restart)
+FAILED  --> CREATING  (restart)
+```
+
+### Commands
+
+```bash
+# Start (PENDING -> CREATING -> STARTING -> RUNNING)
+./bin/hivectl agents start my-agent --cluster-root my-cluster
+
+# Stop (RUNNING -> STOPPING -> STOPPED)
+./bin/hivectl agents stop my-agent --cluster-root my-cluster
+
+# Restart (stop + start, resets restart counter)
+./bin/hivectl agents restart my-agent --cluster-root my-cluster
+
+# Destroy (force kill, delete rootfs copy, remove from state)
+./bin/hivectl agents destroy my-agent --cluster-root my-cluster
+
+# List all agents
+./bin/hivectl agents list --cluster-root my-cluster
+
+# Detailed status (JSON)
+./bin/hivectl agents status my-agent --cluster-root my-cluster
+```
+
+### State persistence
+
+Runtime state is stored in `<cluster-root>/state.db` (SQLite). This includes agent states, node registry, tokens, and capability registrations. Do not edit this file while hived is running.
+
+---
+
+## Join Tokens
 
 Tokens authenticate Tier 2 nodes joining the cluster. The raw token is shown once at creation time; only a SHA-256 hash is stored.
 
 ```bash
 # Create a token (no expiry)
-./hivectl tokens create --cluster-root my-cluster
-# a1b2c3d4e5f6...  (64 hex chars — save this!)
+./bin/hivectl tokens create --cluster-root my-cluster
 
 # Create a token with TTL
-./hivectl tokens create --ttl 24h --cluster-root my-cluster
-./hivectl tokens create --ttl 168h --cluster-root my-cluster  # 7 days
+./bin/hivectl tokens create --ttl 24h --cluster-root my-cluster
 
-# List tokens
-./hivectl tokens list --cluster-root my-cluster
-# PREFIX    CREATED                    EXPIRES                    LAST USED  STATUS
-# a1b2c3d4  2026-03-03T10:00:00Z       -                          -          active
+# List tokens (shows prefix, creation time, status)
+./bin/hivectl tokens list --cluster-root my-cluster
 
-# Revoke a token by prefix
-./hivectl tokens revoke a1b2c3d4 --cluster-root my-cluster
-# Token a1b2c3d4 revoked
+# Revoke by prefix
+./bin/hivectl tokens revoke a1b2c3d4 --cluster-root my-cluster
 ```
 
 ---
 
-## 6. Node Management
+## Node Management
 
-Nodes are registered when agents join via `hive-agent join`. Once registered, you can manage them:
+Nodes self-register when agents join via `hive-agent join`. Tier classification is automatic:
+
+- **Tier 1:** KVM available AND >= 4 GB RAM (can run Firecracker VMs)
+- **Tier 2:** Everything else (native agents only)
 
 ```bash
 # List all nodes
-./hivectl nodes list --cluster-root my-cluster
-# NODE_ID       TIER  ARCH      STATUS  MEMORY  CPUS  AGENTS
-# pi4-aarch64   2     aarch64   online  4.0Gi   4     1
+./bin/hivectl nodes list --cluster-root my-cluster
 
-# Detailed status (JSON)
-./hivectl nodes status pi4-aarch64 --cluster-root my-cluster
+# Detailed status
+./bin/hivectl nodes status pi4-aarch64 --cluster-root my-cluster
 
-# Cordon a node (prevents new agent scheduling, existing agents stay)
-./hivectl nodes cordon pi4-aarch64 --cluster-root my-cluster
-# Node pi4-aarch64 cordoned
+# Cordon (prevent new scheduling, existing agents stay)
+./bin/hivectl nodes cordon pi4-aarch64 --cluster-root my-cluster
 
-# Drain a node (prevents scheduling, signals migration)
-./hivectl nodes drain pi4-aarch64 --cluster-root my-cluster
-# Node pi4-aarch64 marked as draining
+# Drain (prevent scheduling, signal migration)
+./bin/hivectl nodes drain pi4-aarch64 --cluster-root my-cluster
 
 # Uncordon (return to online)
-./hivectl nodes uncordon pi4-aarch64 --cluster-root my-cluster
-# Node pi4-aarch64 uncordoned (now online)
+./bin/hivectl nodes uncordon pi4-aarch64 --cluster-root my-cluster
 
 # Add labels
-./hivectl nodes label pi4-aarch64 env=prod gpu=none --cluster-root my-cluster
-# Node pi4-aarch64 labeled
+./bin/hivectl nodes label pi4-aarch64 env=prod gpu=none --cluster-root my-cluster
 
 # Remove labels
-./hivectl nodes unlabel pi4-aarch64 gpu --cluster-root my-cluster
-# Node pi4-aarch64 unlabeled
+./bin/hivectl nodes unlabel pi4-aarch64 gpu --cluster-root my-cluster
 ```
-
-### Node Tiers
-
-Tier classification is automatic based on hardware:
-- **Tier 1:** KVM available AND >= 4GB RAM (can run Firecracker VMs)
-- **Tier 2:** Everything else — RPis, workstations without KVM (native agents)
 
 ---
 
-## 7. Join a Tier 2 Native Agent
+## Tier 2 Native Agents
 
 Tier 2 agents run natively on hardware (no VM). They use `hive-agent join` to connect to the control plane.
 
-**On the control plane host** (first create a join token):
+**On the control plane host:**
 
 ```bash
-./hivectl tokens create --cluster-root my-cluster
-# Copy the output token: a1b2c3d4e5f6...
+./bin/hivectl tokens create --cluster-root my-cluster
+# Save the token output
 ```
 
-**On the Tier 2 node** (e.g., a Raspberry Pi):
+**On the Tier 2 node (e.g., Raspberry Pi):**
 
 ```bash
-# Cross-compile the agent binary for the target
+# Cross-compile for the target
 GOOS=linux GOARCH=arm64 go build -o hive-agent ./cmd/hive-agent
 
-# Copy to the target and run:
+# Copy to target and run
 ./hive-agent join \
-    --token a1b2c3d4e5f6... \
+    --token <join-token> \
     --control-plane 192.168.1.10:4222 \
     --agent-id my-pi-agent \
     --http-addr :9100 \
     --work-dir /var/lib/hive/workspace
 ```
 
-The agent will:
-1. Connect to NATS at the control plane address
-2. Send a join request with hardware inventory (CPU count, memory, KVM availability)
-3. Receive a join response (accepted/rejected)
-4. Start the sidecar in library mode
-5. Begin sending heartbeats on `hive.health.my-pi-agent`
-6. Listen for tasks on `hive.agent.my-pi-agent.inbox`
+The agent will connect to NATS, send a join request with hardware inventory, start the sidecar, begin heartbeats, and listen for tasks.
 
-**Verify on the control plane:**
+**Verify:**
 
 ```bash
-./hivectl nodes list --cluster-root my-cluster
-# Should show the new node
-
-./hivectl agents list --cluster-root my-cluster
-# Should show the agent in RUNNING state
+./bin/hivectl nodes list --cluster-root my-cluster
+./bin/hivectl agents list --cluster-root my-cluster
 ```
 
 ---
 
-## 8. RBAC and User Management
+## RBAC and User Management
 
-Three roles with different permissions:
+Three roles:
 
-| Role | Actions | Scope |
-|------|---------|-------|
-| `admin` | Everything | All resources |
+| Role | Permissions | Scope |
+|------|-------------|-------|
+| `admin` | All operations | All resources |
 | `operator` | start, stop, restart, destroy, list, status, logs | Assigned teams/agents |
 | `viewer` | list, status, logs | Assigned teams/agents |
 
 ```bash
-# Create an admin user
-./hivectl users create alice --role admin --cluster-root my-cluster
-# User alice created with role admin
-# Token: hive-user-a1b2c3d4...  (save this!)
+# Create an admin
+./bin/hivectl users create alice --role admin --cluster-root my-cluster
 
 # Create an operator scoped to a team
-./hivectl users create bob --role operator --teams default --cluster-root my-cluster
+./bin/hivectl users create bob --role operator --teams default --cluster-root my-cluster
 
 # Create a viewer scoped to specific agents
-./hivectl users create carol --role viewer --agents my-agent,other-agent --cluster-root my-cluster
+./bin/hivectl users create carol --role viewer --agents my-agent,other-agent --cluster-root my-cluster
 
 # List users
-./hivectl users list --cluster-root my-cluster
-# USER_ID  ROLE      TEAMS    AGENTS
-# alice    admin     -        -
-# bob      operator  default  -
-# carol    viewer    -        my-agent,other-agent
+./bin/hivectl users list --cluster-root my-cluster
 
-# Update a user's role or scope
-./hivectl users update bob --role admin --cluster-root my-cluster
+# Update role or scope
+./bin/hivectl users update bob --role admin --cluster-root my-cluster
 
-# Clear a user's team scope
-./hivectl users update bob --teams "" --cluster-root my-cluster
-
-# Revoke a user (removes from RBAC entirely)
-./hivectl users revoke carol --cluster-root my-cluster
-# User carol revoked
+# Revoke
+./bin/hivectl users revoke carol --cluster-root my-cluster
 ```
 
 ---
 
-## 9. Dashboard and Web UI
+## Dashboard and Web UI
 
-The dashboard is a single-page web application served by hived's HTTP server.
+hived serves a REST API and WebSocket endpoint for real-time monitoring.
 
-### Starting the Dashboard
-
-The dashboard API server is at `internal/dashboard/api.go`. To integrate it with hived, it binds to `:8080` by default. It needs access to the state store and a NATS connection.
-
-Currently the dashboard server is a library — you wire it into hived or run it standalone by writing a small main:
-
-```go
-// Example standalone dashboard runner
-package main
-
-import (
-    "github.com/brmurrell3/hive/internal/dashboard"
-    "github.com/brmurrell3/hive/internal/state"
-)
-
-func main() {
-    store, _ := state.NewStore("my-cluster/state.db", logger)
-    nc, _ := nats.Connect("nats://127.0.0.1:4222")
-    srv := dashboard.NewServer(dashboard.Config{
-        Store:    store,
-        NATSConn: nc,
-        Addr:     ":8080",
-    })
-    srv.Start()
-}
-```
-
-### REST API Endpoints
-
-Once running, the following endpoints are available:
+### REST API
 
 ```bash
 # Cluster overview
 curl http://localhost:8080/api/cluster
-# {"node_count":2,"team_count":1,"agent_count":3,"uptime_seconds":120,"agent_status":{"RUNNING":2,"STOPPED":1}}
 
-# List all agents
+# List agents
 curl http://localhost:8080/api/agents
-# [{"id":"my-agent","team":"default","status":"RUNNING",...},...]
 
 # Agent detail
 curl http://localhost:8080/api/agents/my-agent
-# {"id":"my-agent","team":"default","status":"RUNNING","vm_pid":12345,...}
 
-# List all nodes
+# List nodes
 curl http://localhost:8080/api/nodes
-# [{"id":"node-1","tier":1,"arch":"x86_64","status":"online",...}]
 
-# Node detail
-curl http://localhost:8080/api/nodes/node-1
-
-# All registered capabilities
+# Registered capabilities
 curl http://localhost:8080/api/capabilities
-# {"agents":{"my-agent":{"team_id":"default","capabilities":[...]}},"capabilities":{"summarize":["my-agent"]}}
 
-# Chat with an agent (proxied via NATS, 10s timeout)
+# Chat with an agent
 curl -X POST http://localhost:8080/api/agents/my-agent/chat \
   -H 'Content-Type: application/json' \
-  -d '{"message":"Hello, what can you do?"}'
-# {"agent_id":"my-agent","response":"I can summarize text..."}
+  -d '{"message":"Hello"}'
 
-# Query agent logs
+# Agent logs
 curl http://localhost:8080/api/logs/my-agent?limit=50
 
-# Static dashboard UI
-open http://localhost:8080/
+# Health check
+curl http://localhost:8080/healthz
 ```
 
-### WebSocket Live Events
+### WebSocket
 
-Connect to `ws://localhost:8080/ws` for real-time events:
+Connect to `ws://localhost:8080/ws` for live events:
 
 ```bash
-# Using websocat (install: cargo install websocat)
 websocat ws://localhost:8080/ws
 ```
 
-Events pushed by the server:
-
-```json
-{"type":"agent_state_change","data":{"agent_id":"my-agent","old_status":"RUNNING","new_status":"STOPPED"}}
-{"type":"heartbeat","data":{"agent_id":"my-agent","healthy":true}}
-{"type":"log_entry","data":{"agent_id":"my-agent","message":"processing request..."}}
-```
-
-### Dashboard UI Features
-
-The embedded SPA at `http://localhost:8080/` provides:
-- **Cluster Overview** — agent counts, node counts, status summary
-- **Nodes** — table with tier, arch, status, labels
-- **Agents** — table with click-through to detail view
-- **Agent Detail** — full status, chat interface, live logs
-- **Capabilities** — browse all registered capabilities by agent
-- **Logs** — select agent, load/stream log entries
+Event types:
+- `agent_state_change` -- state transitions
+- `heartbeat` -- agent health updates
+- `log_entry` -- log messages
 
 ---
 
-## 10. Prometheus Metrics
+## Prometheus Metrics
 
-The metrics collector exposes a `/metrics` endpoint in Prometheus text exposition format.
-
-### Testing Metrics
+Exposed at `/metrics` on the dashboard port (default `:8080`).
 
 ```bash
-# After the dashboard/metrics server is running:
 curl http://localhost:8080/metrics
 ```
 
-Expected output:
-
-```
-# HELP hive_agents_total Number of agents by status
-# TYPE hive_agents_total gauge
-hive_agents_total{status="RUNNING"} 2
-hive_agents_total{status="STOPPED"} 1
-
-# HELP hive_nats_messages_total Total NATS messages by subject
-# TYPE hive_nats_messages_total counter
-hive_nats_messages_total{subject="hive.health"} 450
-
-# HELP hive_capability_invocation_duration_ms Capability invocation latency
-# TYPE hive_capability_invocation_duration_ms summary
-hive_capability_invocation_duration_ms{capability="summarize",quantile="0.5"} 120.5
-hive_capability_invocation_duration_ms{capability="summarize",quantile="0.9"} 350.2
-hive_capability_invocation_duration_ms{capability="summarize",quantile="0.99"} 450.0
-hive_capability_invocation_duration_ms_sum{capability="summarize"} 12050
-hive_capability_invocation_duration_ms_count{capability="summarize"} 100
-
-# HELP hive_heartbeat_healthy Agent heartbeat status (1=healthy, 0=unhealthy)
-# TYPE hive_heartbeat_healthy gauge
-hive_heartbeat_healthy{agent_id="my-agent"} 1
-
-# HELP hive_node_memory_usage_percent Node memory usage percentage
-# TYPE hive_node_memory_usage_percent gauge
-hive_node_memory_usage_percent{node_id="node-1"} 65.2
-
-# HELP hive_node_cpu_usage_percent Node CPU usage percentage
-# TYPE hive_node_cpu_usage_percent gauge
-hive_node_cpu_usage_percent{node_id="node-1"} 42.1
-```
-
-### Connecting to Grafana
-
-Add to your `prometheus.yml`:
+Add to `prometheus.yml`:
 
 ```yaml
 scrape_configs:
@@ -520,335 +519,315 @@ scrape_configs:
     scrape_interval: 15s
 ```
 
+Key metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `hive_agents_total{status}` | gauge | Agent count by state |
+| `hive_heartbeat_healthy{agent_id}` | gauge | 1=healthy, 0=unhealthy |
+| `hive_capability_invocation_duration_ms` | summary | Capability latency |
+| `hive_nats_messages_total{subject}` | counter | NATS message throughput |
+| `hive_node_memory_usage_percent{node_id}` | gauge | Node memory usage |
+| `hive_node_cpu_usage_percent{node_id}` | gauge | Node CPU usage |
+
 ---
 
-## 11. Log Aggregation
+## Log Aggregation
 
-Agent logs are streamed via NATS and persisted to local JSONL files.
+Agent logs are streamed via NATS and persisted to JSONL files.
 
-### Log Directory Structure
+### Storage layout
 
 ```
 <cluster-root>/logs/
-└── <agent-id>/
-    ├── 2026-03-03.jsonl          # One file per day
-    ├── 2026-03-03.1.jsonl        # Rotated when >100MB
-    └── 2026-03-04.jsonl
-```
-
-Each line is a JSON log entry:
-
-```json
-{"agent_id":"my-agent","timestamp":"2026-03-03T10:00:00Z","level":"info","message":"processing request","fields":{"request_id":"abc123"}}
-```
-
-### Publishing Logs (from an agent/sidecar)
-
-Agents publish logs as NATS envelopes on `hive.logs.<agent_id>`:
-
-```bash
-# Using nats CLI to simulate an agent log
-nats pub hive.logs.my-agent '{
-  "id": "log-1",
-  "from": "my-agent",
-  "to": "hived",
-  "type": "status",
-  "timestamp": "2026-03-03T10:00:00Z",
-  "payload": {
-    "agent_id": "my-agent",
-    "timestamp": "2026-03-03T10:00:00Z",
-    "level": "info",
-    "message": "Hello from my-agent"
-  }
-}'
++-- <agent-id>/
+    +-- 2026-03-14.jsonl        # One file per day
+    +-- 2026-03-14.1.jsonl      # Rotated when >100MB
 ```
 
 ### Configuration
 
-- **Retention:** 30 days by default (files older than this are deleted on startup)
-- **Rotation:** Files exceeding 100MB are rotated to `{date}.1.jsonl`, `.2.jsonl`, etc.
+- Retention: 30 days (older files deleted on startup)
+- Rotation: files > 100 MB rotated to `{date}.1.jsonl`, `.2.jsonl`, etc.
+- Max entry size: 64 KB
+- Max concurrent followers: 1000
+
+### CLI access
+
+```bash
+./bin/hivectl agents logs my-agent --cluster-root my-cluster
+./bin/hivectl agents logs my-agent --follow --cluster-root my-cluster
+./bin/hivectl agents logs my-agent --tail 100 --cluster-root my-cluster
+./bin/hivectl agents logs my-agent --since 1h --cluster-root my-cluster
+```
 
 ---
 
-## 12. NATS Messaging and Pub/Sub
+## Network Policy
 
-With hived running, you can interact with the embedded NATS server using the `nats` CLI.
+### Network topology
 
-```bash
-# Install nats CLI
-go install github.com/nats-io/natscli/nats@latest
+Hive uses three communication layers depending on the agent tier:
 
-# Connect to the embedded server
-export NATS_URL=nats://127.0.0.1:4222
+**Tier 1 VM agents:** Each Firecracker VM gets a TAP device and a private network namespace. The VM communicates with the host via virtio-vsock (no TCP exposure). The vsock forwarder on the host side bridges the VM's NATS traffic to the embedded NATS server. Network egress from VMs is controlled by nftables rules based on the `network.egress` setting in the agent manifest.
 
-# Check server info
-nats server info
+**Tier 1 native agents:** Agents running as processes on a Tier 1 host connect to NATS via localhost IPC. No network namespace isolation.
 
-# Subscribe to health heartbeats
-nats sub 'hive.health.>'
+**Tier 2 agents:** Remote agents connect to the control plane NATS server over TCP. TLS is supported and recommended for production. The `hive-agent join` command establishes the connection using a join token for authentication.
 
-# Subscribe to all agent state changes
-nats sub 'hive.agent.state.>'
+### Egress control (VM agents only)
 
-# Subscribe to log messages
-nats sub 'hive.logs.>'
-
-# Publish a test heartbeat (simulating an agent)
-nats pub hive.health.test-agent '{
-  "id": "test-1",
-  "from": "test-agent",
-  "to": "hived",
-  "type": "health",
-  "timestamp": "2026-03-03T10:00:00Z",
-  "payload": {
-    "healthy": true,
-    "uptime_seconds": 60,
-    "tier": "vm"
-  }
-}'
-
-# Publish a capability request
-nats pub hive.capabilities.my-agent.summarize.request '{
-  "id": "req-1",
-  "from": "requester",
-  "to": "my-agent",
-  "type": "capability-request",
-  "timestamp": "2026-03-03T10:00:00Z",
-  "payload": {"text": "Summarize this document..."},
-  "reply_to": "hive.capabilities.my-agent.summarize.response"
-}'
-
-# Listen for the response
-nats sub hive.capabilities.my-agent.summarize.response
-
-# Team broadcast
-nats pub team.default.broadcast '{
-  "id": "broadcast-1",
-  "from": "team-lead",
-  "to": "team.default",
-  "type": "broadcast",
-  "timestamp": "2026-03-03T10:00:00Z",
-  "payload": {"message": "All agents: new task available"}
-}'
-
-# JetStream streams (check what exists)
-nats stream list
+```yaml
+# In agent manifest
+spec:
+  network:
+    egress: restricted          # none, restricted, or full
+    egress_allowlist:           # Only when egress=restricted
+      - "api.anthropic.com"
+      - "api.openai.com"
 ```
 
-### NATS Subject Reference
+- `none` -- no outbound network access
+- `restricted` -- only domains/IPs in `egress_allowlist` allowed (via nftables)
+- `full` -- unrestricted outbound access
 
-| Subject Pattern | Direction | Description |
-|----------------|-----------|-------------|
-| `hive.health.<agent_id>` | Agent → hived | Heartbeat from sidecar |
-| `hive.control.<agent_id>` | hived → Agent | Control commands to sidecar |
-| `hive.agent.<agent_id>.inbox` | Any → Agent | Agent message inbox |
-| `hive.join.request` | Agent → hived | Tier 2 node join request |
-| `hive.logs.<agent_id>` | Agent → hived | Log entries |
-| `hive.agent.state.<agent_id>` | hived → All | State change notifications |
-| `hive.capabilities.<agent>.<cap>.request` | Any → Agent | Capability invocation |
-| `hive.capabilities.<agent>.<cap>.response` | Agent → Requester | Capability response |
-| `team.<team_id>.broadcast` | Lead → Team | Team broadcast |
+### NATS subjects
+
+All agent communication flows through the embedded NATS server. Subject hierarchy:
+
+| Subject | Direction | Description |
+|---------|-----------|-------------|
+| `hive.health.<agent_id>` | Agent -> hived | Heartbeats |
+| `hive.control.<agent_id>` | hived -> Agent | Control commands |
+| `hive.agent.<agent_id>.inbox` | Any -> Agent | Message inbox |
+| `hive.capabilities.<agent>.<cap>.request` | Any -> Agent | Capability invocation |
+| `hive.capabilities.<agent>.<cap>.response` | Agent -> Requester | Capability response |
+| `hive.team.<team_id>.broadcast` | Lead -> Team | Team broadcast |
+| `hive.logs.<agent_id>` | Agent -> hived | Log entries |
+| `hive.join.request` | Agent -> hived | Tier 2 join |
+
+See [Communication](communication.md) for the full subject hierarchy and envelope format.
 
 ---
 
-## 13. Build the Rootfs Images
+## Backup and Recovery
 
-### Alpine Rootfs (current)
+### What to back up
 
-Requires Docker and sudo (for loop mounting):
+| Path | Contents | Priority |
+|------|----------|----------|
+| `cluster.yaml` | Cluster configuration | Critical |
+| `agents/*/manifest.yaml` | Agent definitions | Critical |
+| `teams/*.yaml` | Team definitions | Critical |
+| `state.db` | Runtime state (agent states, nodes, tokens) | High |
+| `.state/agents/*/workspace/` | Agent workspace data (MEMORY.md, runtime files) | Medium |
+| `.state/jetstream/` | JetStream persistent messages | Low |
 
-```bash
-cd rootfs
-
-# Build the sidecar binary for Linux
-make sidecar
-
-# Build the rootfs image (512MB ext4)
-make rootfs
-# Output: rootfs/rootfs.ext4
-
-# Or manually:
-./build-rootfs.sh rootfs.ext4 512M hive-sidecar
-```
-
-The rootfs contains:
-- Alpine 3.19 base
-- `/usr/local/bin/hive-sidecar` — the sidecar binary
-- `/init` — init script that mounts proc/sys/dev and exec's the sidecar
-- `/workspace` — mount point for agent files
-
-### NixOS Rootfs (production)
-
-Requires Nix with flakes enabled:
+### Backup procedure
 
 ```bash
-cd rootfs/nixos
+CLUSTER_ROOT=/var/lib/hive/cluster
+BACKUP_DIR=/backups/hive/$(date +%Y%m%d-%H%M%S)
 
-# Build the rootfs ext4 image
-nix build .#rootfs
-# Output: result/ (contains the ext4 image)
+mkdir -p "$BACKUP_DIR"
 
-# Build the kernel (vmlinux for Firecracker direct boot)
-nix build .#kernel
-# Output: result/ (contains vmlinux)
+# Back up configuration (always safe to copy)
+cp "$CLUSTER_ROOT/cluster.yaml" "$BACKUP_DIR/"
+cp -r "$CLUSTER_ROOT/agents" "$BACKUP_DIR/"
+cp -r "$CLUSTER_ROOT/teams" "$BACKUP_DIR/"
 
-# Build everything
-nix build
-# Default package is rootfs
+# Back up state (stop hived first for consistency, or accept point-in-time snapshot)
+cp "$CLUSTER_ROOT/state.db" "$BACKUP_DIR/"
+
+# Back up workspaces (optional, can be large)
+cp -r "$CLUSTER_ROOT/.state/agents" "$BACKUP_DIR/agent-state/"
 ```
 
-The NixOS rootfs includes:
-- Minimal NixOS with custom kernel (virtio, vsock, serial console)
-- systemd service for hive-sidecar at `/opt/hive/sidecar`
-- Directories: `/opt/hive/agent`, `/opt/hive/tools`, `/workspace`
-- vsock device access for host-guest NATS bridge
-- Serial console auto-login for debugging
-- Packages: bash, coreutils, iproute2, curl, cacert, procps, strace
+### Recovery procedure
+
+```bash
+# 1. Stop hived
+sudo systemctl stop hived
+
+# 2. Restore configuration
+cp "$BACKUP_DIR/cluster.yaml" "$CLUSTER_ROOT/"
+cp -r "$BACKUP_DIR/agents" "$CLUSTER_ROOT/"
+cp -r "$BACKUP_DIR/teams" "$CLUSTER_ROOT/"
+
+# 3. Restore state
+cp "$BACKUP_DIR/state.db" "$CLUSTER_ROOT/"
+
+# 4. Restart hived (crash recovery runs automatically)
+sudo systemctl start hived
+```
+
+### State file corruption
+
+If `state.db` becomes corrupted, delete it and restart. hived will rebuild state from manifests. Runtime state (which agents were running, restart counts) will be lost, but configuration is preserved.
+
+```bash
+rm "$CLUSTER_ROOT/state.db"
+sudo systemctl restart hived
+```
 
 ---
 
-## 14. Production Hardening
+## Production Hardening
 
-### Graceful Shutdown
+### Graceful shutdown
 
-Sending `SIGTERM` or `SIGINT` to hived triggers graceful shutdown:
+`SIGTERM` or `SIGINT` triggers graceful shutdown:
 
-```bash
-kill -TERM $(pgrep hived)
-```
-
-This will:
 1. Stop accepting new connections
-2. Stop all running agents (in parallel)
+2. Stop all running agents in parallel
 3. Wait up to 30 seconds for clean shutdown
 4. Close all NATS connections
 5. Exit
 
-### Crash Recovery
+### Crash recovery
 
-If hived is killed with `SIGKILL` (unclean shutdown):
+If hived is killed with `SIGKILL`, crash recovery runs on next startup:
 
-```bash
-kill -9 $(pgrep hived)
-```
-
-On next startup, crash recovery runs automatically:
-1. Reads `state.db` to find agents marked as RUNNING/STARTING
-2. For each, checks if the VM PID is still alive (`kill -0 PID`)
-3. If the process is dead, marks the agent as FAILED with error "process not found after crash recovery"
+1. Reads `state.db` for agents marked as RUNNING/STARTING
+2. Checks if the VM/process PID is still alive
+3. Marks dead agents as FAILED
 4. Agents can then be restarted normally
 
-### Rate Limiting
+### Rate limiting
 
-The rate limiter uses a per-subject token bucket algorithm:
-- Default: 100 messages/second per subject
-- Burst: 100 messages
-- When exceeded, messages are dropped and a warning is logged
+Per-subject token bucket: 100 messages/second, burst of 100. Exceeded messages are dropped with a warning logged.
 
-### Resource Monitoring
+### Resource monitoring
 
-The resource monitor checks node usage every 30 seconds:
-- Logs a warning when memory usage exceeds 80%
-- Logs a warning when CPU usage exceeds 80%
-- Records metrics for Prometheus export
+Checks node resource usage every 30 seconds. Logs warnings when memory or CPU usage exceeds 80%.
 
 ---
 
-## 15. Troubleshooting
+## Troubleshooting
 
-### Port conflicts
+### Common errors and solutions
 
-If NATS fails to start with "address already in use", change the port in `cluster.yaml`:
+**"address already in use" on NATS startup**
 
-```yaml
+```bash
+# Change the port in cluster.yaml
 spec:
   nats:
-    port: 4223  # try a different port
+    port: 4223
+
+# Or find and kill the existing process
+lsof -i :4222
 ```
 
-### Firecracker not found
-
-If `agents start` fails with "firecracker: command not found":
+**"firecracker: command not found"**
 
 ```bash
-# Use mock mode
+# Option 1: Use process backend (any OS)
 export HIVE_TEST_FIRECRACKER=mock
 
-# Or install Firecracker (Linux only):
-# https://github.com/firecracker-microvm/firecracker/releases
+# Option 2: Install Firecracker (Linux only)
+# See https://github.com/firecracker-microvm/firecracker/releases
 ```
 
-### /dev/kvm not available
-
-On macOS or Linux without KVM:
+**"/dev/kvm not available"**
 
 ```bash
+# On macOS: use process backend
 export HIVE_TEST_FIRECRACKER=mock
-```
 
-On Linux, enable KVM:
-
-```bash
+# On Linux: load kernel modules
 sudo modprobe kvm
 sudo modprobe kvm_intel  # or kvm_amd
 sudo chmod 666 /dev/kvm
 ```
 
-### State file corruption
-
-If `state.db` becomes corrupted:
+**Agent stuck in CREATING or STARTING**
 
 ```bash
-# Delete it and start fresh (loses runtime state, not config)
-rm demo-cluster/state.db
+# Force destroy, then restart
+./bin/hivectl agents destroy stuck-agent --cluster-root my-cluster
+./bin/hivectl agents start stuck-agent --cluster-root my-cluster
 ```
 
-### Tests fail with "timeout"
-
-Integration tests use embedded NATS with random ports. If tests time out:
+**NATS connection refused**
 
 ```bash
-# Run with verbose output
+# Verify hived is running
+pgrep hived
+
+# Check NATS is listening
+lsof -i :4222
+
+# Check hived logs (stdout by default)
+```
+
+**VM boots but sidecar does not connect**
+
+```bash
+# Check serial console output
+cat my-cluster/.state/agents/my-agent/console.log
+
+# Check vsock UDS files exist
+ls my-cluster/.state/agents/my-agent/*.vsock*
+
+# Monitor NATS for heartbeats
+nats sub 'hive.health.>'
+```
+
+**Capability invoke times out**
+
+Wait for the sidecar to finish connecting (heartbeat appears on `hive.health.>`), then retry. Default timeout is 30 seconds.
+
+**Tests fail with timeout**
+
+```bash
 go test -tags integration -race -count=1 -v -timeout 10m ./internal/...
 ```
 
-### Agent stuck in CREATING or STARTING
+### Diagnostic commands
 
 ```bash
-# Force destroy
-./hivectl agents destroy stuck-agent --cluster-root demo-cluster
+# Validate all manifests
+./bin/hivectl validate --cluster-root my-cluster
 
-# Then restart
-./hivectl agents start stuck-agent --cluster-root demo-cluster
-```
+# Check cluster status
+./bin/hivectl status --cluster-root my-cluster
 
-### NATS connection refused
+# List everything
+./bin/hivectl agents list --cluster-root my-cluster
+./bin/hivectl nodes list --cluster-root my-cluster
+./bin/hivectl tokens list --cluster-root my-cluster
+./bin/hivectl capabilities list --cluster-root my-cluster
 
-Verify hived is running and the port matches:
+# Verbose hived logs
+./bin/hived --cluster-root my-cluster --log-level debug
 
-```bash
-# Check if NATS is listening
-lsof -i :4222
-
-# Check hived logs (they go to stdout)
+# NATS diagnostics (requires nats CLI)
+nats server info
+nats sub 'hive.>'
+nats stream list
 ```
 
 ---
 
-## Environment Variables Reference
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HIVE_TEST_FIRECRACKER` | _(unset)_ | Set to `mock` to use mock VM manager |
-| `NATS_URL` | _(unset)_ | Override NATS URL for `nats` CLI |
+| `HIVE_TEST_FIRECRACKER` | _(unset)_ | Set to `mock` to use process backend |
+| `HIVE_CONFIG` | _(unset)_ | Path to cluster root |
+| `HIVE_CONTROL_PLANE` | _(unset)_ | Remote control plane address |
+| `HIVE_USER` | _(unset)_ | User ID for RBAC |
+| `HIVE_TOKEN` | _(unset)_ | Auth token for RBAC |
 
 ## File Reference
 
 | File | Owned By | Purpose |
 |------|----------|---------|
-| `cluster.yaml` | Operator | Cluster configuration (read by hived and hivectl) |
+| `cluster.yaml` | Operator | Cluster configuration |
 | `agents/*/manifest.yaml` | Operator | Agent definitions |
 | `teams/*.yaml` | Operator | Team definitions |
-| `state.db` | hived | Runtime state (do not edit manually while hived runs) |
+| `state.db` | hived | Runtime state (do not edit while hived runs) |
 | `.state/jetstream/` | NATS | JetStream persistence |
 | `.state/agents/*/` | hived | Per-agent VM artifacts (sockets, rootfs copies) |
+| `.state/nats-auth-token` | hived | Auto-generated NATS auth token |

@@ -1,6 +1,9 @@
 name: Build Rootfs Images
 
 on:
+  push:
+    tags:
+      - "v*"
   release:
     types: [created]
   workflow_dispatch:
@@ -45,7 +48,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y e2fsprogs
 
       - name: Build base rootfs
-        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'base' || github.event_name == 'release'
+        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'base' || github.event_name == 'release' || github.event_name == 'push'
         run: |
           cd rootfs
           chmod +x build-rootfs.sh
@@ -54,7 +57,7 @@ jobs:
           sha256sum hive-rootfs-base-${{ matrix.arch }}.ext4.gz > hive-rootfs-base-${{ matrix.arch }}.ext4.gz.sha256
 
       - name: Build OpenClaw rootfs
-        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'openclaw' || github.event_name == 'release'
+        if: github.event.inputs.variant == 'all' || github.event.inputs.variant == 'openclaw' || github.event_name == 'release' || github.event_name == 'push'
         run: |
           cd rootfs
           chmod +x build-rootfs-openclaw.sh
@@ -62,14 +65,28 @@ jobs:
           gzip -9 hive-rootfs-openclaw-${{ matrix.arch }}.ext4
           sha256sum hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz > hive-rootfs-openclaw-${{ matrix.arch }}.ext4.gz.sha256
 
+      - name: Download Firecracker kernel
+        run: |
+          FC_VERSION="v1.6.0"
+          KERNEL_LINUX="5.10"
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            FC_ARCH="x86_64"
+          else
+            FC_ARCH="aarch64"
+          fi
+          KERNEL_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/vmlinux-${KERNEL_LINUX}-${FC_ARCH}.bin"
+          echo "Downloading kernel from ${KERNEL_URL}..."
+          curl -fSL -o "rootfs/vmlinux-${{ matrix.arch }}" "${KERNEL_URL}"
+          sha256sum "rootfs/vmlinux-${{ matrix.arch }}" > "rootfs/vmlinux-${{ matrix.arch }}.sha256"
+
       - name: Upload release assets
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
+          TAG_NAME: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
         run: |
           cd rootfs
-          for f in *.ext4.gz *.sha256; do
+          for f in *.ext4.gz *.sha256 vmlinux-*; do
             [ -f "$f" ] && gh release upload "$TAG_NAME" "$f" --clobber
           done
 
@@ -78,4 +95,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rootfs-${{ matrix.arch }}
-          path: rootfs/*.ext4.gz*
+          path: |
+            rootfs/*.ext4.gz*
+            rootfs/vmlinux-*

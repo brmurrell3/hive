@@ -36,8 +36,12 @@ state.db
 # Local validation (not shipped)
 VALIDATE.sh
 
-# Deployment configs (contain user-specific secrets/settings)
-deploy/
+# Deployment configs (user-specific settings are local-only)
+# Track reference configs (grafana, prometheus, systemd) but ignore user deployments
+deploy/*
+!deploy/grafana/
+!deploy/prometheus/
+!deploy/systemd/
 
 # Node modules
 node_modules/

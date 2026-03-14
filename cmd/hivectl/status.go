@@ -62,7 +62,8 @@ func statusCmd() *cobra.Command {
 						state.AgentStatusStopping,
 					} {
 						if count, ok := status.StatusCounts[string(s)]; ok && count > 0 {
-							fmt.Fprintf(w, "  %s:\t%d\n", s, count)
+							coloredStatus := colorizeAgentStatus(s, 0)
+							fmt.Fprintf(w, "  %s:\t%d\n", coloredStatus, count)
 						}
 					}
 				}

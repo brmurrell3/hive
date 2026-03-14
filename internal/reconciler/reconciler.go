@@ -83,6 +83,23 @@ func NewReconciler(store *state.Store, clusterRoot string, logger *slog.Logger) 
 	}
 }
 
+// IsRunning reports whether the reconciler's polling loop has been started
+// and has not yet been stopped. It satisfies the dashboard.ReadyzChecker interface.
+func (r *Reconciler) IsRunning() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.started {
+		return false
+	}
+	// Check if the stop channel has been closed.
+	select {
+	case <-r.stopCh:
+		return false
+	default:
+		return true
+	}
+}
+
 // SetInterval overrides the default 5-second polling interval.
 // Must be called before Start; returns an error if called after Start.
 func (r *Reconciler) SetInterval(d time.Duration) error {

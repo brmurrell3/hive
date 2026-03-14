@@ -78,6 +78,19 @@ type NATSConn interface {
 	Request(subject string, data []byte, timeout time.Duration) (*nats.Msg, error)
 }
 
+// NATSStatusChecker is an optional interface that NATSConn implementations
+// may satisfy to expose connection health. *nats.Conn satisfies this.
+type NATSStatusChecker interface {
+	IsConnected() bool
+}
+
+// ReadyzChecker is an optional interface for components that can report
+// readiness (e.g., reconciler). If provided via Config, the /readyz
+// endpoint will include the component's health status.
+type ReadyzChecker interface {
+	IsRunning() bool
+}
+
 // LogQuerier is the interface for querying aggregated logs.
 type LogQuerier interface {
 	Query(agentID string, opts logs.QueryOpts) ([]logs.LogEntry, error)
@@ -87,13 +100,15 @@ type LogQuerier interface {
 type Config struct {
 	Store          StoreReader
 	NATSConn       NATSConn
-	Logs           LogQuerier // optional; if nil, log queries return empty results
+	Logs           LogQuerier      // optional; if nil, log queries return empty results
 	Logger         *slog.Logger
-	Addr           string           // e.g. ":8080"
-	CORSOrigin     string           // Allowed CORS origin; defaults to same-origin only (empty string)
-	AllowedOrigins []string         // Allowed WebSocket origins; defaults to dashboard's own address; ["*"] allows all
-	AuthToken      string           // If set, API and WebSocket connections require this token
+	Addr           string          // e.g. ":8080"
+	CORSOrigin     string          // Allowed CORS origin; defaults to same-origin only (empty string)
+	AllowedOrigins []string        // Allowed WebSocket origins; defaults to dashboard's own address; ["*"] allows all
+	AuthToken      string          // If set, API and WebSocket connections require this token
 	Authorizer     *auth.Authorizer // If set, per-user RBAC is enforced; tokens are matched against user token hashes
+	Version        string          // Version string for health endpoint; defaults to "dev"
+	Reconciler     ReadyzChecker   // optional; if set, /readyz includes reconciler health
 }
 
 // UserResponse is the JSON representation of a user in API responses.
@@ -140,6 +155,8 @@ type Server struct {
 	allowedOrigins []string         // Allowed WebSocket origins
 	authToken      string           // Required token for API and WebSocket authentication
 	authorizer     *auth.Authorizer // Per-user RBAC authorizer (nil = shared token only)
+	version        string           // Version string for health endpoint
+	reconciler     ReadyzChecker    // Optional reconciler readiness checker
 	healthzLimiter *rate.Limiter
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
@@ -184,6 +201,11 @@ func NewServer(cfg Config) *Server {
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
+	ver := cfg.Version
+	if ver == "" {
+		ver = "dev"
+	}
+
 	s := &Server{
 		store:          cfg.Store,
 		natsConn:       cfg.NATSConn,
@@ -195,6 +217,8 @@ func NewServer(cfg Config) *Server {
 		allowedOrigins: allowedOrigins,
 		authToken:      cfg.AuthToken,
 		authorizer:     cfg.Authorizer,
+		version:        ver,
+		reconciler:     cfg.Reconciler,
 		healthzLimiter: rate.NewLimiter(100, 100),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
@@ -261,8 +285,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/logs/", s.authMiddleware("logs", s.handleLogs))
 	mux.HandleFunc("/api/users", s.authMiddleware("list", s.handleUsers))
 
-	// Health check endpoint (no auth required).
+	// Health and readiness check endpoints (no auth required).
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 
 	// WebSocket endpoint (uses its own token-based auth).
 	mux.HandleFunc("/ws", s.handleWebSocket)
@@ -475,7 +500,7 @@ func (s *Server) resolveNode(w http.ResponseWriter, r *http.Request, prefix stri
 	return filtered[0]
 }
 
-// handleHealthz returns a simple health check (no auth required).
+// handleHealthz returns a simple health check with version and uptime (no auth required).
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMethod(w, r, http.MethodGet) {
 		return
@@ -484,7 +509,91 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	uptime := time.Since(s.startTime).Truncate(time.Second).String()
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"version": s.version,
+		"uptime":  uptime,
+	})
+}
+
+// componentStatus is a single readiness check result.
+type componentStatus struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// handleReadyz returns readiness status with individual component checks (no auth required).
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if !s.healthzLimiter.Allow() {
+		s.writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
+	checks := make(map[string]componentStatus)
+	allOK := true
+
+	// Check NATS connection health.
+	if s.natsConn != nil {
+		if checker, ok := s.natsConn.(NATSStatusChecker); ok {
+			if checker.IsConnected() {
+				checks["nats"] = componentStatus{Status: "ok"}
+			} else {
+				checks["nats"] = componentStatus{Status: "fail", Error: "not connected"}
+				allOK = false
+			}
+		} else {
+			// Interface does not support status check; assume ok if non-nil.
+			checks["nats"] = componentStatus{Status: "ok"}
+		}
+	} else {
+		checks["nats"] = componentStatus{Status: "fail", Error: "not configured"}
+		allOK = false
+	}
+
+	// Check state store accessibility by calling AllAgents (cheap read).
+	if s.store != nil {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					checks["state"] = componentStatus{Status: "fail", Error: "store panic"}
+					allOK = false
+				}
+			}()
+			_ = s.store.AllAgents()
+			checks["state"] = componentStatus{Status: "ok"}
+		}()
+	} else {
+		checks["state"] = componentStatus{Status: "fail", Error: "not configured"}
+		allOK = false
+	}
+
+	// Check reconciler health (if provided).
+	if s.reconciler != nil {
+		if s.reconciler.IsRunning() {
+			checks["reconciler"] = componentStatus{Status: "ok"}
+		} else {
+			checks["reconciler"] = componentStatus{Status: "fail", Error: "not running"}
+			allOK = false
+		}
+	} else {
+		checks["reconciler"] = componentStatus{Status: "ok"}
+	}
+
+	status := "ready"
+	httpStatus := http.StatusOK
+	if !allOK {
+		status = "not ready"
+		httpStatus = http.StatusServiceUnavailable
+	}
+
+	s.writeJSON(w, httpStatus, map[string]interface{}{
+		"status": status,
+		"checks": checks,
+	})
 }
 
 // handleUsers returns all users with token hashes stripped.

@@ -64,22 +64,7 @@ func agentsListCmd() *cobra.Command {
 					return fmt.Errorf("listing agents: %w", err)
 				}
 
-				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintln(w, "AGENT_ID\tTEAM\tSTATE\tUPTIME")
-
-				for _, a := range agents {
-					uptime := ""
-					if a.Status == state.AgentStatusRunning && !a.StartedAt.IsZero() {
-						uptime = formatDuration(time.Since(a.StartedAt))
-					}
-					team := a.Team
-					if team == "" {
-						team = "-"
-					}
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", a.ID, team, a.Status, uptime)
-				}
-
-				w.Flush()
+				printColorizedAgentTable(agents)
 				return nil
 			})
 		},
