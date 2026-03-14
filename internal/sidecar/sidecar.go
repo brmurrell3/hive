@@ -186,9 +186,10 @@ func New(cfg Config, logger *slog.Logger) *Sidecar {
 	}
 }
 
-// Start initializes and starts all sidecar subsystems: NATS connection,
-// HTTP server, agent runtime, and heartbeat publishing. It blocks until all
-// subsystems are started or an error occurs.
+// Start initializes and starts all sidecar subsystems: vsock proxy, NATS
+// connection, capability router, agent runtime, HTTP server, and heartbeat
+// publishing. It blocks until all subsystems are started or an error occurs.
+// On failure, previously started subsystems are cleaned up in reverse order.
 func (s *Sidecar) Start(ctx context.Context) error {
 	// Validate agent and team IDs before using them in NATS subjects.
 	if err := types.ValidateSubjectComponent("agent_id", s.agentID); err != nil {
@@ -206,59 +207,119 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		"team_id", s.teamID,
 	)
 
-	// 1a. If vsock is enabled (running inside a Firecracker VM), start the
-	// vsock-to-TCP proxy so the NATS client can connect to 127.0.0.1:<port>
-	// and have the traffic forwarded to the host via virtio-vsock.
-	if s.config.VsockEnabled {
-		hostCID := s.config.VsockHostCID
-		if hostCID == 0 {
-			hostCID = 2 // VMADDR_CID_HOST
-		}
-		hostPort := s.config.VsockHostPort
-		if hostPort == 0 {
-			hostPort = 4222
-		}
-		// The proxy listens on the same address the NATS client will connect to.
-		proxyAddr := fmt.Sprintf("127.0.0.1:%d", hostPort)
-		s.vsockProxy = NewVsockProxy(proxyAddr, hostCID, hostPort, s.logger)
-		if err := s.vsockProxy.Start(ctx); err != nil {
-			return fmt.Errorf("starting vsock proxy: %w", err)
-		}
-		s.logger.Info("vsock proxy started, NATS traffic will be forwarded via vsock",
-			"proxy_addr", proxyAddr,
-			"host_cid", hostCID,
-			"host_port", hostPort,
-		)
+	// Phase 1: Vsock proxy (if running inside a Firecracker VM).
+	if err := s.startVsock(ctx); err != nil {
+		return fmt.Errorf("starting vsock proxy: %w", err)
 	}
 
-	// 1b. Connect to NATS.
+	// Phase 2: NATS connection and subscriptions.
+	if err := s.startNATS(ctx); err != nil {
+		s.cleanupVsock()
+		return fmt.Errorf("starting NATS: %w", err)
+	}
+
+	// Phase 3: Capability router and control plane registration.
+	if err := s.registerCapabilities(); err != nil {
+		s.closeNATS()
+		s.cleanupVsock()
+		return fmt.Errorf("registering capabilities: %w", err)
+	}
+
+	// Phase 4: Agent runtime (secrets, process, callback readiness, metadata).
+	if err := s.startRuntime(ctx); err != nil {
+		s.cleanupCapRouter()
+		s.closeNATS()
+		s.cleanupVsock()
+		return fmt.Errorf("starting runtime: %w", err)
+	}
+
+	// Phase 5: HTTP server for health and capability endpoints.
+	if err := s.startHTTPServer(); err != nil {
+		s.runtime.Stop() //nolint:errcheck // best-effort cleanup on HTTP server start failure
+		s.cleanupCapRouter()
+		s.closeNATS()
+		s.cleanupVsock()
+		return fmt.Errorf("starting HTTP server: %w", err)
+	}
+
+	// Post-startup: heartbeats, lead broadcast subscription, runtime monitor.
+	s.startPostStartup()
+
+	s.logger.Info("sidecar started successfully")
+	return nil
+}
+
+// startVsock starts the vsock-to-TCP proxy if VsockEnabled is set. The proxy
+// allows the NATS client inside a Firecracker VM to connect to 127.0.0.1:<port>
+// and have the traffic forwarded to the host via virtio-vsock.
+func (s *Sidecar) startVsock(ctx context.Context) error {
+	if !s.config.VsockEnabled {
+		return nil
+	}
+
+	hostCID := s.config.VsockHostCID
+	if hostCID == 0 {
+		hostCID = 2 // VMADDR_CID_HOST
+	}
+	hostPort := s.config.VsockHostPort
+	if hostPort == 0 {
+		hostPort = 4222
+	}
+	// The proxy listens on the same address the NATS client will connect to.
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", hostPort)
+	s.vsockProxy = NewVsockProxy(proxyAddr, hostCID, hostPort, s.logger)
+	if err := s.vsockProxy.Start(ctx); err != nil {
+		return err
+	}
+	s.logger.Info("vsock proxy started, NATS traffic will be forwarded via vsock",
+		"proxy_addr", proxyAddr,
+		"host_cid", hostCID,
+		"host_port", hostPort,
+	)
+	return nil
+}
+
+// cleanupVsock stops the vsock proxy if it was started. Used during cleanup
+// on Start() failure.
+func (s *Sidecar) cleanupVsock() {
+	if s.vsockProxy != nil {
+		s.vsockProxy.Stop()
+	}
+}
+
+// startNATS connects to the NATS server and subscribes to control and memory
+// update subjects. On failure the NATS connection is not cleaned up here; the
+// caller is responsible for calling closeNATS().
+func (s *Sidecar) startNATS(ctx context.Context) error {
 	if err := s.connectNATS(ctx); err != nil {
-		if s.vsockProxy != nil {
-			s.vsockProxy.Stop()
-		}
 		return fmt.Errorf("connecting to NATS: %w", err)
 	}
 
-	// 2. Subscribe to control messages.
 	if err := s.subscribeControl(); err != nil {
+		s.closeNATS()
 		return fmt.Errorf("subscribing to control: %w", err)
 	}
 
-	// 2b. Subscribe to MEMORY.md updates pushed from hived.
 	if err := s.subscribeMemoryUpdates(); err != nil {
+		s.closeNATS()
 		return fmt.Errorf("subscribing to memory updates: %w", err)
 	}
 
-	// 3. Create the capability router and register a handler for each declared
-	// capability. Each handler is the local implementation that processes
-	// incoming NATS capability requests. The router subscribes to
-	// hive.capabilities.{agentID}.{cap}.request and dispatches to the handler.
-	//
-	// IMPORTANT: The handler must NOT call capRouter.Invoke() for its own agent,
-	// as that would publish back to the same NATS subject the router subscribes
-	// to, creating an infinite loop. Instead, the handler executes the capability
-	// locally by forwarding to the runtime process via HTTP (if configured) or
-	// returning an acknowledgment for no-op runtimes.
+	return nil
+}
+
+// registerCapabilities creates the capability router and registers a handler
+// for each declared capability. Each handler is the local implementation that
+// processes incoming NATS capability requests. After starting the router, the
+// capabilities are announced to the control plane for cross-team routing and
+// discovery.
+//
+// IMPORTANT: The handler must NOT call capRouter.Invoke() for its own agent,
+// as that would publish back to the same NATS subject the router subscribes
+// to, creating an infinite loop. Instead, the handler executes the capability
+// locally by forwarding to the runtime process via HTTP (if configured) or
+// returning an acknowledgment for no-op runtimes.
+func (s *Sidecar) registerCapabilities() error {
 	s.mu.Lock()
 	oldRouter := s.capRouter
 	s.mu.Unlock()
@@ -272,20 +333,18 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		if err := router.RegisterHandler(capName, func(_ context.Context, inputs map[string]interface{}) (map[string]interface{}, error) {
 			return s.executeCapabilityLocally(capName, inputs)
 		}); err != nil {
-			s.closeNATS()
 			return fmt.Errorf("registering capability handler %q: %w", capName, err)
 		}
 	}
 	if err := router.Start(); err != nil {
-		s.closeNATS()
 		return fmt.Errorf("starting capability router: %w", err)
 	}
 	s.mu.Lock()
 	s.capRouter = router
 	s.mu.Unlock()
 
-	// 3b. Register capabilities with the control plane so the capability
-	// registry is populated for cross-team routing and discovery.
+	// Announce capabilities to the control plane so the capability registry
+	// is populated for cross-team routing and discovery.
 	if len(s.capabilities) > 0 {
 		regPayload, _ := json.Marshal(map[string]interface{}{
 			"agent_id":     s.agentID,
@@ -301,7 +360,25 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		}
 	}
 
-	// 4. Fetch and inject secrets if configured.
+	return nil
+}
+
+// cleanupCapRouter stops the capability router if it was started. Used during
+// cleanup on Start() failure.
+func (s *Sidecar) cleanupCapRouter() {
+	s.mu.RLock()
+	router := s.capRouter
+	s.mu.RUnlock()
+	if router != nil {
+		router.Stop()
+	}
+}
+
+// startRuntime fetches secrets, creates and starts the agent runtime process,
+// waits for the agent's callback HTTP server to be ready (if configured),
+// marks the sidecar as healthy, and writes workspace metadata.
+func (s *Sidecar) startRuntime(_ context.Context) error {
+	// Fetch and inject secrets if configured.
 	// SECURITY: Secrets are passed via environment variables. On Linux,
 	// /proc/<pid>/environ is readable by same-UID processes. Firecracker VM
 	// isolation mitigates this for Tier 1 agents.
@@ -318,7 +395,7 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		}
 	}
 
-	// 5. Create and start the agent runtime.
+	// Create and start the agent runtime.
 	s.runtime = NewRuntime(
 		s.config.RuntimeCmd,
 		s.config.RuntimeArgs,
@@ -331,15 +408,13 @@ func (s *Sidecar) Start(ctx context.Context) error {
 	envs = append(envs, secretEnv...)
 	s.runtime.EnvVars = envs
 	if err := s.runtime.Start(); err != nil {
-		s.capRouter.Stop()
-		s.closeNATS()
 		return fmt.Errorf("starting runtime: %w", err)
 	}
 
-	// 5b. Wait for the agent's callback HTTP server to be ready before
-	// accepting capability requests. Without this, NATS capability
-	// subscriptions (registered in step 3) can deliver requests before
-	// the agent's HTTP server is listening, causing transient failures.
+	// Wait for the agent's callback HTTP server to be ready before accepting
+	// capability requests. Without this, NATS capability subscriptions
+	// (registered in registerCapabilities) can deliver requests before the
+	// agent's HTTP server is listening, causing transient failures.
 	if s.config.CallbackURL != "" {
 		healthURL := strings.TrimRight(s.config.CallbackURL, "/") + "/health"
 		client := &http.Client{Timeout: 500 * time.Millisecond}
@@ -356,12 +431,12 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		}
 	}
 
-	// 6. Mark as healthy now that the runtime is up.
+	// Mark as healthy now that the runtime is up.
 	s.mu.Lock()
 	s.healthy = true
 	s.mu.Unlock()
 
-	// 6b. Write workspace metadata so hivectl can track agent workspaces.
+	// Write workspace metadata so hivectl can track agent workspaces.
 	// Use a typed struct so started_at marshals as a time.Time (RFC3339),
 	// matching the hiveMetadata struct in hivectl/workspace.go.
 	if s.config.WorkspacePath != "" {
@@ -388,18 +463,17 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		}
 	}
 
-	// 7. Start the HTTP server for health and capabilities.
-	if err := s.startHTTPServer(); err != nil {
-		s.runtime.Stop() //nolint:errcheck // best-effort cleanup on HTTP server start failure
-		s.capRouter.Stop()
-		s.closeNATS()
-		return fmt.Errorf("starting HTTP server: %w", err)
-	}
+	return nil
+}
 
-	// 8. Start publishing heartbeats.
+// startPostStartup launches background goroutines that run after all core
+// subsystems are initialized: heartbeat publishing, lead agent broadcast
+// subscription, and runtime monitoring.
+func (s *Sidecar) startPostStartup() {
+	// Start publishing heartbeats.
 	s.startHeartbeat()
 
-	// 8b. If this is a lead agent with a callback URL, subscribe to team
+	// If this is a lead agent with a callback URL, subscribe to team
 	// broadcasts so that trigger messages are forwarded to the agent's
 	// /handle/orchestrate endpoint for pipeline orchestration.
 	if s.config.IsLead && s.config.CallbackURL != "" && s.teamID != "" {
@@ -442,7 +516,7 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		}
 	}
 
-	// 9. Monitor the runtime; if it exits unexpectedly, mark unhealthy.
+	// Monitor the runtime; if it exits unexpectedly, mark unhealthy.
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.monitorCancel = monitorCancel
@@ -452,9 +526,6 @@ func (s *Sidecar) Start(ctx context.Context) error {
 		defer s.wg.Done()
 		s.monitorRuntime(monitorCtx)
 	}()
-
-	s.logger.Info("sidecar started successfully")
-	return nil
 }
 
 // monitorRuntime watches the agent runtime process. If the runtime exits,

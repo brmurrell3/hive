@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"sync"
 
 	"github.com/brmurrell3/hive/internal/types"
@@ -173,30 +172,6 @@ func prepareOpenClawWorkspace(clusterRoot, agentID string, spec *types.AgentMani
 
 	success = true
 	return workspacePath, port, nil
-}
-
-// filterModelEnv returns a copy of env with dangerous keys removed.
-// BE-H1: The same denylist used in Create (HIVE_*, LD_*, DYLD_*, PATH,
-// HOME, SHELL) is applied to prevent injection via openclaw.json.
-func filterModelEnv(env map[string]string) map[string]string {
-	if len(env) == 0 {
-		return nil
-	}
-	filtered := make(map[string]string, len(env))
-	for k, v := range env {
-		upper := strings.ToUpper(k)
-		if strings.HasPrefix(upper, "HIVE_") ||
-			strings.HasPrefix(upper, "LD_") ||
-			strings.HasPrefix(upper, "DYLD_") ||
-			upper == "PATH" || upper == "HOME" || upper == "SHELL" {
-			continue
-		}
-		filtered[k] = v
-	}
-	if len(filtered) == 0 {
-		return nil
-	}
-	return filtered
 }
 
 // generateOpenClawConfig produces the JSON bytes for openclaw.json from the

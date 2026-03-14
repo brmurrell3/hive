@@ -253,6 +253,47 @@ func (m *Manager) releaseResources(memMB int64, vcpus int64) {
 	}
 }
 
+// captureAndReleaseResources atomically captures the agent's resource allocations
+// (memory in MB, vCPUs, CID) via ModifyAgent, zeros them in state, and releases
+// them back to the manager's resource pools. Returns the captured values.
+// On ModifyAgent failure, returns an error without releasing any resources
+// (since the fields were not successfully zeroed, releasing would risk a
+// double-release if a concurrent operation also releases them).
+func (m *Manager) captureAndReleaseResources(agentID string) (memMB int64, vcpus int64, cid uint32, err error) {
+	if modErr := m.store.ModifyAgent(agentID, func(a *state.AgentState) error {
+		memMB = a.MemoryBytes / (1024 * 1024)
+		vcpus = int64(a.VCPUs)
+		cid = a.VMCID
+		a.MemoryBytes = 0
+		a.VCPUs = 0
+		a.VMCID = 0
+		return nil
+	}); modErr != nil {
+		return 0, 0, 0, modErr
+	}
+	if memMB > 0 || vcpus > 0 {
+		m.releaseResources(memMB, vcpus)
+	}
+	if cid >= 3 {
+		m.releaseCID(cid)
+	}
+	return memMB, vcpus, cid, nil
+}
+
+// cleanupAgentNetworkPolicy removes nftables rules for the given agent's TAP
+// device. It derives a 30-second timeout from the passed context.
+// Errors are logged at Debug level (nftables cleanup failure is expected on
+// systems without nftables or when no rules were applied).
+func (m *Manager) cleanupAgentNetworkPolicy(ctx context.Context, agentID string, logger *slog.Logger) {
+	tapDevice := TapDeviceName(agentID)
+	nftCmd, nftArgs := CleanupNftables(tapDevice)
+	nftCtx, nftCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer nftCancel()
+	if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
+		logger.Debug("nftables cleanup skipped", "agent_id", agentID, "error", err, "output", string(out))
+	}
+}
+
 // StartAgent provisions and boots a VM for the given agent manifest.
 // It performs the full lifecycle: validate not already running, set PENDING,
 // copy rootfs, CREATING, create VM, STARTING, start VM, then RUNNING.
@@ -917,41 +958,24 @@ func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
 		// StopVM failed; failAgent marks the agent as FAILED but doesn't release
 		// resources. Capture and release the agent's memory/vCPU/CID allocations
 		// to prevent resource leaks.
-		var failReleaseMem int64
-		var failReleaseVCPUs int64
-		var failReleaseCID uint32
-		if modErr := m.store.ModifyAgent(agentID, func(a *state.AgentState) error {
-			failReleaseMem = a.MemoryBytes / (1024 * 1024)
-			failReleaseVCPUs = int64(a.VCPUs)
-			failReleaseCID = a.VMCID
-			a.MemoryBytes = 0
-			a.VCPUs = 0
-			a.VMCID = 0
-			return nil
-		}); modErr != nil {
+		if _, _, _, captureErr := m.captureAndReleaseResources(agentID); captureErr != nil {
 			// ModifyAgent failed; fall back to the snapshot values.
-			failReleaseMem = agentState.MemoryBytes / (1024 * 1024)
-			failReleaseVCPUs = int64(agentState.VCPUs)
-			failReleaseCID = agentState.VMCID
-		}
-		if failReleaseMem > 0 || failReleaseVCPUs > 0 {
-			m.releaseResources(failReleaseMem, failReleaseVCPUs)
-		}
-		if failReleaseCID >= 3 {
-			m.releaseCID(failReleaseCID)
+			failReleaseMem := agentState.MemoryBytes / (1024 * 1024)
+			failReleaseVCPUs := int64(agentState.VCPUs)
+			failReleaseCID := agentState.VMCID
+			if failReleaseMem > 0 || failReleaseVCPUs > 0 {
+				m.releaseResources(failReleaseMem, failReleaseVCPUs)
+			}
+			if failReleaseCID >= 3 {
+				m.releaseCID(failReleaseCID)
+			}
 		}
 		return fmt.Errorf("stopping VM for agent %s: %w", agentID, err)
 	}
 
 	// Clean up nftables rules for this agent's tap device.
 	// Use context.Background() so cleanup succeeds even if the caller's context is cancelled.
-	tapDevice := TapDeviceName(agentID)
-	nftCmd, nftArgs := CleanupNftables(tapDevice)
-	nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer nftCancel()
-	if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
-		m.logger.Debug("nftables cleanup skipped", "agent_id", agentID, "error", err, "output", string(out))
-	}
+	m.cleanupAgentNetworkPolicy(context.Background(), agentID, m.logger)
 
 	// Atomically capture and zero resource fields inside ModifyAgent to
 	// prevent TOCTOU double-release (C2): a concurrent DestroyAgent could
@@ -1004,58 +1028,32 @@ func (m *Manager) DestroyAgent(ctx context.Context, agentID string) error {
 
 	m.stopForwarder(agentID)
 
-	// Atomically capture VM process info and zero resource fields to prevent
-	// double-release if DestroyAgent races with StopAgent. We capture
-	// VMSocketPath and VMPID inside the callback to avoid using stale values
-	// from the initial GetAgent snapshot (a concurrent StopAgent could zero them).
-	var capturedSocketPath string
-	var capturedRootfsCopyPath string
-	var capturedPID int
-	var capturedStatus string
-	var releaseMem int64
-	var releaseVCPUs int64
-	var releaseCID uint32
-	if err := m.store.ModifyAgent(agentID, func(a *state.AgentState) error {
-		capturedSocketPath = a.VMSocketPath
-		capturedRootfsCopyPath = a.RootfsCopyPath
-		capturedPID = a.VMPID
-		capturedStatus = string(a.Status)
-		releaseMem = a.MemoryBytes / (1024 * 1024)
-		releaseVCPUs = int64(a.VCPUs)
-		releaseCID = a.VMCID
-		// Zero resource fields inside the callback so a concurrent StopAgent
-		// sees zeroed values and does not double-release. The actual
-		// releaseResources/releaseCID calls happen AFTER ModifyAgent returns
-		// to avoid lock inversion (m.mu must not be acquired while store.mu
-		// is held by ModifyAgent).
-		a.MemoryBytes = 0
-		a.VCPUs = 0
-		a.VMCID = 0
-		return nil
-	}); err != nil {
+	// Atomically capture and release the agent's resource allocations to
+	// prevent double-release if DestroyAgent races with StopAgent.
+	// Non-resource fields (VMSocketPath, VMPID, etc.) are read from the
+	// initial snapshot; if a concurrent StopAgent zeroed them, it already
+	// handled stopping the VM, so using stale values is safe (DestroyVM
+	// with a dead PID is a no-op that logs a benign warning).
+	capturedSocketPath := agentState.VMSocketPath
+	capturedRootfsCopyPath := agentState.RootfsCopyPath
+	capturedPID := agentState.VMPID
+	capturedStatus := string(agentState.Status)
+	if _, _, _, captureErr := m.captureAndReleaseResources(agentID); captureErr != nil {
 		m.logger.Warn("failed to atomically read/zero agent resources during destroy",
 			"agent_id", agentID,
-			"error", err,
+			"error", captureErr,
 		)
 		// Fall back to the snapshot values if ModifyAgent fails (agent may
 		// already be removed from state). Use the initial snapshot for cleanup.
-		capturedSocketPath = agentState.VMSocketPath
-		capturedRootfsCopyPath = agentState.RootfsCopyPath
-		capturedPID = agentState.VMPID
-		capturedStatus = string(agentState.Status)
-		releaseMem = agentState.MemoryBytes / (1024 * 1024)
-		releaseVCPUs = int64(agentState.VCPUs)
-		releaseCID = agentState.VMCID
-	}
-
-	// Release resources and CID outside the ModifyAgent callback to avoid
-	// lock inversion (C1): releaseResources/releaseCID acquire m.mu, which
-	// must not be held while store.mu is held by ModifyAgent.
-	if releaseMem > 0 || releaseVCPUs > 0 {
-		m.releaseResources(releaseMem, releaseVCPUs)
-	}
-	if releaseCID >= 3 {
-		m.releaseCID(releaseCID)
+		releaseMem := agentState.MemoryBytes / (1024 * 1024)
+		releaseVCPUs := int64(agentState.VCPUs)
+		releaseCID := agentState.VMCID
+		if releaseMem > 0 || releaseVCPUs > 0 {
+			m.releaseResources(releaseMem, releaseVCPUs)
+		}
+		if releaseCID >= 3 {
+			m.releaseCID(releaseCID)
+		}
 	}
 
 	// If the VM is still running or starting, forcefully destroy it.
@@ -1072,15 +1070,7 @@ func (m *Manager) DestroyAgent(ctx context.Context, agentID string) error {
 
 	// Clean up nftables rules for this agent's tap device.
 	// Use context.Background() so cleanup succeeds even if the caller's context is cancelled.
-	tapDevice := TapDeviceName(agentID)
-	nftCmd, nftArgs := CleanupNftables(tapDevice)
-	{
-		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer nftCancel()
-		if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
-			m.logger.Debug("nftables cleanup skipped during destroy", "agent_id", agentID, "error", err, "output", string(out))
-		}
-	}
+	m.cleanupAgentNetworkPolicy(context.Background(), agentID, m.logger)
 
 	// Remove sidecar.conf from the agent directory.
 	sidecarConf := filepath.Join(m.clusterRoot, "agents", agentID, "sidecar.conf")
@@ -1155,38 +1145,13 @@ func (m *Manager) RestartAgent(ctx context.Context, agentID string, agent *types
 			}
 			// Clean up nftables rules for the old VM's tap device. DestroyVM does
 			// not handle this, and StopAgent failed, so rules would leak.
-			tapDevice := TapDeviceName(agentID)
-			nftCmd, nftArgs := CleanupNftables(tapDevice)
-			nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if out, nftErr := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); nftErr != nil {
-				m.logger.Debug("nftables cleanup skipped during restart fallback",
-					"agent_id", agentID, "error", nftErr, "output", string(out))
-			}
-			nftCancel()
+			m.cleanupAgentNetworkPolicy(context.Background(), agentID, m.logger)
 			// Release resources that StopAgent failed to release. Atomically
 			// capture and zero the resource fields to prevent double-release
 			// if a concurrent operation also attempts cleanup.
-			var releaseMem int64
-			var releaseVCPUs int64
-			var releaseCID uint32
-			if modErr := m.store.ModifyAgent(agentID, func(a *state.AgentState) error {
-				releaseMem = a.MemoryBytes / (1024 * 1024)
-				releaseVCPUs = int64(a.VCPUs)
-				releaseCID = a.VMCID
-				a.MemoryBytes = 0
-				a.VCPUs = 0
-				a.VMCID = 0
-				return nil
-			}); modErr != nil {
+			if _, _, _, captureErr := m.captureAndReleaseResources(agentID); captureErr != nil {
 				m.logger.Warn("failed to zero agent resources during restart fallback",
-					"agent_id", agentID, "error", modErr)
-			} else {
-				if releaseMem > 0 || releaseVCPUs > 0 {
-					m.releaseResources(releaseMem, releaseVCPUs)
-				}
-				if releaseCID >= 3 {
-					m.releaseCID(releaseCID)
-				}
+					"agent_id", agentID, "error", captureErr)
 			}
 		}
 	}

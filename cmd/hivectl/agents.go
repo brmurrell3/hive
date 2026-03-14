@@ -58,34 +58,30 @@ func agentsListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List all agents with their current state",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			agents, err := client.AgentList()
-			if err != nil {
-				return fmt.Errorf("listing agents: %w", err)
-			}
-
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "AGENT_ID\tTEAM\tSTATE\tUPTIME")
-
-			for _, a := range agents {
-				uptime := ""
-				if a.Status == state.AgentStatusRunning && !a.StartedAt.IsZero() {
-					uptime = formatDuration(time.Since(a.StartedAt))
+			return withClient(func(client *DaemonClient) error {
+				agents, err := client.AgentList()
+				if err != nil {
+					return fmt.Errorf("listing agents: %w", err)
 				}
-				team := a.Team
-				if team == "" {
-					team = "-"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", a.ID, team, a.Status, uptime)
-			}
 
-			w.Flush()
-			return nil
+				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "AGENT_ID\tTEAM\tSTATE\tUPTIME")
+
+				for _, a := range agents {
+					uptime := ""
+					if a.Status == state.AgentStatusRunning && !a.StartedAt.IsZero() {
+						uptime = formatDuration(time.Since(a.StartedAt))
+					}
+					team := a.Team
+					if team == "" {
+						team = "-"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", a.ID, team, a.Status, uptime)
+				}
+
+				w.Flush()
+				return nil
+			})
 		},
 	}
 }
@@ -102,22 +98,19 @@ func agentsStatusCmd() *cobra.Command {
 				return err
 			}
 
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-			a, err := client.AgentStatus(agentID)
-			if err != nil {
-				return fmt.Errorf("getting agent status: %w", err)
-			}
+			return withClient(func(client *DaemonClient) error {
+				a, err := client.AgentStatus(agentID)
+				if err != nil {
+					return fmt.Errorf("getting agent status: %w", err)
+				}
 
-			data, err := json.MarshalIndent(a, "", "  ")
-			if err != nil {
-				return fmt.Errorf("marshaling agent state: %w", err)
-			}
-			fmt.Println(string(data))
-			return nil
+				data, err := json.MarshalIndent(a, "", "  ")
+				if err != nil {
+					return fmt.Errorf("marshaling agent state: %w", err)
+				}
+				fmt.Println(string(data))
+				return nil
+			})
 		},
 	}
 }
@@ -125,31 +118,7 @@ func agentsStatusCmd() *cobra.Command {
 // simpleAgentCmd creates a cobra command that validates an agent ID,
 // sends an agent control request, and prints a success message.
 func simpleAgentCmd(use, short, long string, action func(c *DaemonClient, id string) error, pastTense string) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   use + " AGENT_ID",
-		Short: short,
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			agentID := args[0]
-			if err := types.ValidateSubjectComponent("agent_id", agentID); err != nil {
-				return err
-			}
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-			if err := action(client, agentID); err != nil {
-				return err
-			}
-			fmt.Printf("Agent %s %s\n", agentID, pastTense)
-			return nil
-		},
-	}
-	if long != "" {
-		cmd.Long = long
-	}
-	return cmd
+	return simpleResourceCmd(use+" AGENT_ID", short, long, "agent_id", "Agent", action, pastTense)
 }
 
 func agentsStartCmd() *cobra.Command {
@@ -500,15 +469,17 @@ Example:
 			}
 
 			// Verify agent is running.
-			client, err := newDaemonClient()
-			if err != nil {
+			var agentState *state.AgentState
+			if err := withClient(func(client *DaemonClient) error {
+				var statusErr error
+				agentState, statusErr = client.AgentStatus(agentID)
+				if statusErr != nil {
+					return fmt.Errorf("checking agent status: %w", statusErr)
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-			agentState, err := client.AgentStatus(agentID)
-			if err != nil {
-				return fmt.Errorf("checking agent status: %w", err)
-			}
-			client.Close()
 
 			if agentState.Status != state.AgentStatusRunning {
 				return fmt.Errorf("agent %q is not running (status: %s)", agentID, agentState.Status)

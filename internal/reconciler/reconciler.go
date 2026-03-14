@@ -659,107 +659,102 @@ func sortActions(actions []Action) {
 	})
 }
 
-// manifestHash computes a stable SHA-256 hash of the manifest.
-// Uses sorted map keys for deterministic output regardless of iteration order.
-// All fields from AgentManifest/AgentSpec are included so that any change
-// triggers drift detection.
+// sortMapPairs converts a map[string]string into a deterministically ordered
+// [][2]string by sorting on keys. Returns nil for empty/nil maps. This
+// ensures stable JSON serialization for hash computation.
+func sortMapPairs(m map[string]string) [][2]string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([][2]string, len(keys))
+	for i, k := range keys {
+		pairs[i] = [2]string{k, m[k]}
+	}
+	return pairs
+}
+
+// stableSpec is the canonical representation of an agent's spec-level fields
+// used for deterministic hash computation. Map fields are replaced with sorted
+// [][2]string pairs, and capabilities and egress allowlists are sorted by name.
 //
 // IMPORTANT: Hash stability depends on deterministic JSON serialization.
-// Map fields (map[string]string) are explicitly sorted into [][2]string pairs
-// above (Labels, Env, NodeLabels, HardwareCustom). If any of the embedded
-// types (e.g., AgentNetwork, AgentHealth, AgentRestart, AgentReplicas,
-// AgentIngress) gain map fields
-// in the future, those maps MUST be broken out and sorted the same way,
-// otherwise Go's non-deterministic map iteration will produce unstable
-// hashes and cause spurious reconciliation restarts.
-func manifestHash(manifest *types.AgentManifest) (string, error) {
-	// Create a stable representation by sorting map keys.
-	// We hash a canonical form: sort the struct's map fields.
-	type stableManifest struct {
-		// Top-level
-		APIVersion string
-		Kind       string
+// The field order in this struct determines the JSON field order, which in turn
+// determines the hash output. Do NOT reorder, rename, or remove fields without
+// understanding that this will change all computed hashes and trigger spurious
+// reconciliation restarts.
+//
+// If any embedded types (e.g., AgentNetwork, AgentHealth, AgentRestart,
+// AgentReplicas, AgentIngress) gain map fields in the future, those maps MUST
+// be broken out and sorted the same way, otherwise Go's non-deterministic map
+// iteration will produce unstable hashes.
+type stableSpec struct {
+	// Spec top-level
+	Tier string
+	Mode string
 
-		// Metadata
-		ID     string
-		Team   string
-		Labels [][2]string // sorted key-value pairs
+	// Resources (all fields)
+	Memory string
+	VCPUs  int
+	Disk   string
 
-		// Spec top-level
-		Tier string
-		Mode string
+	// Runtime - broken out so we can sort the Model.Env map
+	RuntimeType    string
+	RuntimeBackend string
+	RuntimeCommand string
+	RuntimeImage   string
+	ModelProvider  string
+	ModelName      string
+	Env            [][2]string // sorted Runtime.Model.Env
 
-		// Resources (all fields)
-		Memory string
-		VCPUs  int
-		Disk   string
+	// Capabilities
+	Caps []types.AgentCapability
 
-		// Runtime - broken out so we can sort the Model.Env map
-		RuntimeType    string
-		RuntimeBackend string
-		RuntimeCommand string
-		RuntimeImage   string
-		ModelProvider  string
-		ModelName      string
-		Env            [][2]string // sorted Runtime.Model.Env
+	// Network
+	Network types.AgentNetwork
 
-		// Capabilities
-		Caps []types.AgentCapability
+	// Volumes
+	Volumes []types.AgentVolume
 
-		// Network
-		Network types.AgentNetwork
+	// Mounts
+	Mounts []types.AgentMount
 
-		// Volumes
-		Volumes []types.AgentVolume
+	// Secrets
+	Secrets []types.AgentSecret
 
-		// Mounts
-		Mounts []types.AgentMount
+	// Replicas
+	Replicas types.AgentReplicas
 
-		// Secrets
-		Secrets []types.AgentSecret
+	// Health
+	Health types.AgentHealth
 
-		// Replicas
-		Replicas types.AgentReplicas
+	// Restart
+	Restart types.AgentRestart
 
-		// Health
-		Health types.AgentHealth
+	// Placement - broken out so we can sort NodeLabels map
+	PlacementNodeID string
+	PlacementArch   string
+	NodeLabels      [][2]string
 
-		// Restart
-		Restart types.AgentRestart
+	// Hardware - broken out so we can sort Custom map
+	HardwareGPIO      bool
+	HardwareCamera    bool
+	HardwareSensors   []string
+	HardwareActuators []string
+	HardwareGPU       string
+	HardwareCustom    [][2]string
 
-		// Placement - broken out so we can sort NodeLabels map
-		PlacementNodeID string
-		PlacementArch   string
-		NodeLabels      [][2]string
+	// Ingress
+	Ingress types.AgentIngress
+}
 
-		// Hardware - broken out so we can sort Custom map
-		HardwareGPIO      bool
-		HardwareCamera    bool
-		HardwareSensors   []string
-		HardwareActuators []string
-		HardwareGPU       string
-		HardwareCustom    [][2]string
-
-		// Ingress
-		Ingress types.AgentIngress
-	}
-
-	sortMap := func(m map[string]string) [][2]string {
-		if len(m) == 0 {
-			return nil
-		}
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		pairs := make([][2]string, len(keys))
-		for i, k := range keys {
-			pairs[i] = [2]string{k, m[k]}
-		}
-		return pairs
-	}
-
+// buildStableSpec extracts spec-level fields from a manifest into a stableSpec,
+// sorting all map fields and capabilities for deterministic serialization.
+func buildStableSpec(manifest *types.AgentManifest) stableSpec {
 	// Sort capabilities by name for deterministic hashing regardless of
 	// declaration order in the manifest file.
 	sortedCaps := make([]types.AgentCapability, len(manifest.Spec.Capabilities))
@@ -778,73 +773,80 @@ func manifestHash(manifest *types.AgentManifest) (string, error) {
 		network.EgressAllowlist = sorted
 	}
 
-	sm := stableManifest{
-		// Top-level
-		APIVersion: manifest.APIVersion,
-		Kind:       manifest.Kind,
-
-		// Metadata
-		ID:     manifest.Metadata.ID,
-		Team:   manifest.Metadata.Team,
-		Labels: sortMap(manifest.Metadata.Labels),
-
-		// Spec top-level
-		Tier: manifest.Spec.Tier,
-		Mode: manifest.Spec.Mode,
-
-		// Resources
+	return stableSpec{
+		Tier:   manifest.Spec.Tier,
+		Mode:   manifest.Spec.Mode,
 		Memory: manifest.Spec.Resources.Memory,
 		VCPUs:  manifest.Spec.Resources.VCPUs,
 		Disk:   manifest.Spec.Resources.Disk,
 
-		// Runtime (broken out for stable Env hashing)
 		RuntimeType:    manifest.Spec.Runtime.Type,
 		RuntimeBackend: manifest.Spec.Runtime.Backend,
 		RuntimeCommand: manifest.Spec.Runtime.Command,
 		RuntimeImage:   manifest.Spec.Runtime.Image,
 		ModelProvider:  manifest.Spec.Runtime.Model.Provider,
 		ModelName:      manifest.Spec.Runtime.Model.Name,
-		Env:            sortMap(manifest.Spec.Runtime.Model.Env),
+		Env:            sortMapPairs(manifest.Spec.Runtime.Model.Env),
 
-		// Capabilities
-		Caps: sortedCaps,
-
-		// Network
+		Caps:    sortedCaps,
 		Network: network,
-
-		// Volumes
 		Volumes: manifest.Spec.Volumes,
-
-		// Mounts
-		Mounts: manifest.Spec.Mounts,
-
-		// Secrets
+		Mounts:  manifest.Spec.Mounts,
 		Secrets: manifest.Spec.Secrets,
 
-		// Replicas
 		Replicas: manifest.Spec.Replicas,
+		Health:   manifest.Spec.Health,
+		Restart:  manifest.Spec.Restart,
 
-		// Health
-		Health: manifest.Spec.Health,
-
-		// Restart
-		Restart: manifest.Spec.Restart,
-
-		// Placement (broken out for stable NodeLabels hashing)
 		PlacementNodeID: manifest.Spec.Placement.NodeID,
 		PlacementArch:   manifest.Spec.Placement.Arch,
-		NodeLabels:      sortMap(manifest.Spec.Placement.NodeLabels),
+		NodeLabels:      sortMapPairs(manifest.Spec.Placement.NodeLabels),
 
-		// Hardware (broken out for stable Custom map hashing)
 		HardwareGPIO:      manifest.Spec.Hardware.GPIO,
 		HardwareCamera:    manifest.Spec.Hardware.Camera,
 		HardwareSensors:   manifest.Spec.Hardware.Sensors,
 		HardwareActuators: manifest.Spec.Hardware.Actuators,
 		HardwareGPU:       manifest.Spec.Hardware.GPU,
-		HardwareCustom:    sortMap(manifest.Spec.Hardware.Custom),
+		HardwareCustom:    sortMapPairs(manifest.Spec.Hardware.Custom),
 
-		// Ingress
 		Ingress: manifest.Spec.Ingress,
+	}
+}
+
+// manifestHash computes a stable SHA-256 hash of the manifest.
+// Uses sorted map keys for deterministic output regardless of iteration order.
+// All fields from AgentManifest/AgentSpec are included so that any change
+// triggers drift detection.
+//
+// The stableManifest struct embeds stableSpec (anonymously) so that its fields
+// are promoted and serialized flat — producing the same JSON layout as the
+// original inline struct definition. The metadata fields (APIVersion, Kind,
+// ID, Team, Labels) appear first, followed by all spec fields from stableSpec.
+func manifestHash(manifest *types.AgentManifest) (string, error) {
+	// stableManifest wraps stableSpec with top-level and metadata fields.
+	// The anonymous embed of stableSpec causes json.Marshal to promote
+	// its fields inline, preserving the original flat JSON structure.
+	type stableManifest struct {
+		// Top-level
+		APIVersion string
+		Kind       string
+
+		// Metadata
+		ID     string
+		Team   string
+		Labels [][2]string // sorted key-value pairs
+
+		// Spec fields (promoted from embedded stableSpec)
+		stableSpec
+	}
+
+	sm := stableManifest{
+		APIVersion: manifest.APIVersion,
+		Kind:       manifest.Kind,
+		ID:         manifest.Metadata.ID,
+		Team:       manifest.Metadata.Team,
+		Labels:     sortMapPairs(manifest.Metadata.Labels),
+		stableSpec: buildStableSpec(manifest),
 	}
 
 	data, err := json.Marshal(sm)
@@ -887,143 +889,8 @@ func isLightweightChange(manifest *types.AgentManifest, agentState *state.AgentS
 // fields of a manifest, excluding metadata-only fields like labels, team, and
 // the agent ID. This allows detecting whether a manifest change requires a
 // restart or is just a metadata update.
-//
-// IMPORTANT: Same hash stability caveat as manifestHash applies here. If any
-// embedded types gain map fields, they must be broken out and sorted to
-// preserve deterministic hashing.
 func specHash(manifest *types.AgentManifest) (string, error) {
-	type stableSpec struct {
-		// Spec top-level
-		Tier string
-		Mode string
-
-		// Resources
-		Memory string
-		VCPUs  int
-		Disk   string
-
-		// Runtime
-		RuntimeType    string
-		RuntimeBackend string
-		RuntimeCommand string
-		RuntimeImage   string
-		ModelProvider  string
-		ModelName      string
-		Env            [][2]string
-
-		// Capabilities
-		Caps []types.AgentCapability
-
-		// Network
-		Network types.AgentNetwork
-
-		// Volumes
-		Volumes []types.AgentVolume
-
-		// Mounts
-		Mounts []types.AgentMount
-
-		// Secrets
-		Secrets []types.AgentSecret
-
-		// Replicas
-		Replicas types.AgentReplicas
-
-		// Health
-		Health types.AgentHealth
-
-		// Restart
-		Restart types.AgentRestart
-
-		// Placement
-		PlacementNodeID string
-		PlacementArch   string
-		NodeLabels      [][2]string
-
-		// Hardware
-		HardwareGPIO      bool
-		HardwareCamera    bool
-		HardwareSensors   []string
-		HardwareActuators []string
-		HardwareGPU       string
-		HardwareCustom    [][2]string
-
-		// Ingress
-		Ingress types.AgentIngress
-	}
-
-	sortMap := func(m map[string]string) [][2]string {
-		if len(m) == 0 {
-			return nil
-		}
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		pairs := make([][2]string, len(keys))
-		for i, k := range keys {
-			pairs[i] = [2]string{k, m[k]}
-		}
-		return pairs
-	}
-
-	// Sort capabilities by name for deterministic hashing regardless of
-	// declaration order in the manifest file.
-	sortedCaps := make([]types.AgentCapability, len(manifest.Spec.Capabilities))
-	copy(sortedCaps, manifest.Spec.Capabilities)
-	sort.Slice(sortedCaps, func(i, j int) bool {
-		return sortedCaps[i].Name < sortedCaps[j].Name
-	})
-
-	// Copy Network and sort EgressAllowlist for deterministic hashing
-	// regardless of declaration order in the manifest file.
-	network := manifest.Spec.Network
-	if len(network.EgressAllowlist) > 0 {
-		sorted := make([]string, len(network.EgressAllowlist))
-		copy(sorted, network.EgressAllowlist)
-		sort.Strings(sorted)
-		network.EgressAllowlist = sorted
-	}
-
-	ss := stableSpec{
-		Tier:   manifest.Spec.Tier,
-		Mode:   manifest.Spec.Mode,
-		Memory: manifest.Spec.Resources.Memory,
-		VCPUs:  manifest.Spec.Resources.VCPUs,
-		Disk:   manifest.Spec.Resources.Disk,
-
-		RuntimeType:    manifest.Spec.Runtime.Type,
-		RuntimeBackend: manifest.Spec.Runtime.Backend,
-		RuntimeCommand: manifest.Spec.Runtime.Command,
-		RuntimeImage:   manifest.Spec.Runtime.Image,
-		ModelProvider:  manifest.Spec.Runtime.Model.Provider,
-		ModelName:      manifest.Spec.Runtime.Model.Name,
-		Env:            sortMap(manifest.Spec.Runtime.Model.Env),
-
-		Caps:    sortedCaps,
-		Network: network,
-		Volumes: manifest.Spec.Volumes,
-		Mounts:  manifest.Spec.Mounts,
-		Secrets: manifest.Spec.Secrets,
-
-		Replicas: manifest.Spec.Replicas,
-		Health:   manifest.Spec.Health,
-		Restart:  manifest.Spec.Restart,
-
-		PlacementNodeID: manifest.Spec.Placement.NodeID,
-		PlacementArch:   manifest.Spec.Placement.Arch,
-		NodeLabels:      sortMap(manifest.Spec.Placement.NodeLabels),
-
-		HardwareGPIO:      manifest.Spec.Hardware.GPIO,
-		HardwareCamera:    manifest.Spec.Hardware.Camera,
-		HardwareSensors:   manifest.Spec.Hardware.Sensors,
-		HardwareActuators: manifest.Spec.Hardware.Actuators,
-		HardwareGPU:       manifest.Spec.Hardware.GPU,
-		HardwareCustom:    sortMap(manifest.Spec.Hardware.Custom),
-
-		Ingress: manifest.Spec.Ingress,
-	}
+	ss := buildStableSpec(manifest)
 
 	data, err := json.Marshal(ss)
 	if err != nil {

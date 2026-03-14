@@ -390,6 +390,17 @@ func ValidateDesiredState(ds *types.DesiredState) error {
 func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, teams map[string]*types.TeamManifest, cluster *types.ClusterConfig) {
 	prefix := fmt.Sprintf("agent %q", id)
 
+	validateAgentMetadata(ve, prefix, agent, teams)
+	validateAgentRuntime(ve, prefix, agent, cluster)
+	validateAgentResources(ve, prefix, agent)
+	validateAgentNetwork(ve, prefix, agent)
+	validateAgentMounts(ve, prefix, agent, teams, cluster)
+	validateAgentCapabilities(ve, prefix, id, agent)
+}
+
+// validateAgentMetadata validates agent apiVersion, kind, metadata.id, metadata.team,
+// and label maps.
+func validateAgentMetadata(ve *ValidationError, prefix string, agent *types.AgentManifest, teams map[string]*types.TeamManifest) {
 	// Validate apiVersion and kind
 	if agent.APIVersion != apiVersionV1 {
 		ve.addf("%s: apiVersion must be \"hive/v1\", got %q", prefix, agent.APIVersion)
@@ -414,6 +425,15 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Validate map fields for safe keys and values (no control chars, no NATS wildcards).
+	validateMapLabels(ve, prefix, "metadata.labels", agent.Metadata.Labels)
+	validateMapLabels(ve, prefix, "spec.hardware.custom", agent.Spec.Hardware.Custom)
+	validateMapLabels(ve, prefix, "spec.placement.nodeLabels", agent.Spec.Placement.NodeLabels)
+}
+
+// validateAgentRuntime validates runtime type, backend, command, image, tier,
+// mode, and model environment variables including secret references.
+func validateAgentRuntime(ve *ValidationError, prefix string, agent *types.AgentManifest, cluster *types.ClusterConfig) {
 	// Validate runtime.type is required
 	validRuntimeTypes := map[string]bool{
 		"openclaw": true, "custom": true, "process": true,
@@ -486,6 +506,42 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		}
 	}
 
+	// Cap environment variables per agent to prevent excessive resource usage.
+	if len(agent.Spec.Runtime.Model.Env) > 1000 {
+		ve.addf("%s: spec.runtime.model.env has %d entries, maximum is 1000", prefix, len(agent.Spec.Runtime.Model.Env))
+	}
+
+	// Validate runtime.model.env keys.
+	for envKey := range agent.Spec.Runtime.Model.Env {
+		if !envKeyRegex.MatchString(envKey) {
+			ve.addf("%s: spec.runtime.model.env key %q is not a valid environment variable name", prefix, envKey)
+		}
+		if blockedEnvKeys[envKey] {
+			ve.addf("%s: spec.runtime.model.env key %q is a blocked security-sensitive environment variable", prefix, envKey)
+		}
+	}
+
+	// Rule 6: Validate secret references (${SECRET_NAME}) in runtime.model.env
+	// resolve against spec.secrets in cluster config.
+	if cluster != nil && len(agent.Spec.Runtime.Model.Env) > 0 {
+		secrets := cluster.Spec.Secrets
+		for envKey, envVal := range agent.Spec.Runtime.Model.Env {
+			matches := secretRefRegex.FindAllStringSubmatch(envVal, -1)
+			for _, match := range matches {
+				secretName := match[1]
+				if secrets == nil {
+					ve.addf("%s: env %q references secret ${%s} but spec.secrets is not defined", prefix, envKey, secretName)
+				} else if _, ok := secrets[secretName]; !ok {
+					ve.addf("%s: env %q references secret ${%s} which is not in spec.secrets", prefix, envKey, secretName)
+				}
+			}
+		}
+	}
+}
+
+// validateAgentResources validates memory, CPU, disk resource parsing and bounds,
+// and replica count limits.
+func validateAgentResources(ve *ValidationError, prefix string, agent *types.AgentManifest) {
 	// Validate resources
 	if agent.Spec.Resources.Memory != "" {
 		memBytes, err := ParseMemory(agent.Spec.Resources.Memory)
@@ -502,36 +558,164 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		ve.addf("%s: spec.resources.vcpus exceeds maximum of 256, got %d", prefix, agent.Spec.Resources.VCPUs)
 	}
 
-	// Validate capabilities (rule 7: unique names within agent)
-	validParamTypes := map[string]bool{"string": true, "int": true, "float": true, "bool": true, "bytes": true}
-	capNames := make(map[string]bool)
-	for _, cap := range agent.Spec.Capabilities {
-		if cap.Name == "" {
-			ve.addf("%s: capability name is required", prefix)
+	// Validate disk size.
+	if agent.Spec.Resources.Disk != "" {
+		diskBytes, err := ParseDiskSize(agent.Spec.Resources.Disk)
+		if err != nil {
+			ve.addf("%s: spec.resources.disk %q is invalid: %v", prefix, agent.Spec.Resources.Disk, err)
+		} else if diskBytes > 10*1024*1024*1024*1024 { // 10 TB upper bound
+			ve.addf("%s: spec.resources.disk %q exceeds maximum of 10TB", prefix, agent.Spec.Resources.Disk)
+		}
+	}
+
+	// Validate replicas.
+	if agent.Spec.Replicas.Min < 0 {
+		ve.addf("%s: spec.replicas.min must be >= 0", prefix)
+	}
+	if agent.Spec.Replicas.Max < 0 {
+		ve.addf("%s: spec.replicas.max must be >= 0", prefix)
+	}
+	if agent.Spec.Replicas.Max > 10000 {
+		ve.addf("%s: spec.replicas.max must be <= 10000, got %d", prefix, agent.Spec.Replicas.Max)
+	}
+	if agent.Spec.Replicas.Min > 0 && agent.Spec.Replicas.Max > 0 && agent.Spec.Replicas.Min > agent.Spec.Replicas.Max {
+		ve.addf("%s: spec.replicas.min (%d) must be <= max (%d)", prefix, agent.Spec.Replicas.Min, agent.Spec.Replicas.Max)
+	}
+}
+
+// validateAgentNetwork validates network egress/ingress mode, egress allowlist
+// entries, DNS hostnames, hardware fields, and ingress configuration.
+func validateAgentNetwork(ve *ValidationError, prefix string, agent *types.AgentManifest) {
+	// Validate network egress only for vm tier (rule 10).
+	// Always validate if egress is set, even when tier is empty string (VAL-H1).
+	if agent.Spec.Network.Egress != "" && agent.Spec.Tier != "vm" {
+		ve.addf("%s: network egress is only valid for vm tier", prefix)
+	}
+	if agent.Spec.Network.Egress != "" {
+		validEgress := map[string]bool{"none": true, "restricted": true, "full": true}
+		if !validEgress[agent.Spec.Network.Egress] {
+			ve.addf("%s: spec.network.egress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Egress)
+		}
+	}
+
+	// Validate network ingress only for vm tier (same guard as egress).
+	// Always validate if ingress is set, even when tier is empty string (VAL-H1).
+	if agent.Spec.Network.Ingress != "" && agent.Spec.Tier != "vm" {
+		ve.addf("%s: network ingress is only valid for vm tier", prefix)
+	}
+	if agent.Spec.Network.Ingress != "" {
+		// Note: "restricted" is reserved for future use when ingress allowlist support is added.
+		// Until then, only "none" and "full" are accepted to avoid a false sense of restriction.
+		validIngress := map[string]bool{"none": true, "full": true}
+		if !validIngress[agent.Spec.Network.Ingress] {
+			ve.addf("%s: spec.network.ingress must be one of [none, full], got %q", prefix, agent.Spec.Network.Ingress)
+		}
+	}
+
+	// Ingress requires egress to be set (NET-C1).
+	if agent.Spec.Network.Ingress != "" && agent.Spec.Network.Egress == "" {
+		ve.addf("%s: spec.network.ingress requires spec.network.egress to be set", prefix)
+	}
+
+	// Validate egress_allowlist is only used with restricted egress.
+	if len(agent.Spec.Network.EgressAllowlist) > 0 && agent.Spec.Network.Egress != "restricted" {
+		ve.addf("%s: spec.network.egress_allowlist is only valid when egress is \"restricted\"", prefix)
+	}
+
+	// Egress "restricted" requires a non-empty allowlist (VAL-H5).
+	if agent.Spec.Network.Egress == "restricted" && len(agent.Spec.Network.EgressAllowlist) == 0 {
+		ve.addf("%s: spec.network.egress is \"restricted\" but egress_allowlist is empty", prefix)
+	}
+
+	// Validate egress_allowlist size limit.
+	if len(agent.Spec.Network.EgressAllowlist) > 100 {
+		ve.addf("%s: spec.network.egress_allowlist has %d entries, maximum is 100", prefix, len(agent.Spec.Network.EgressAllowlist))
+	}
+
+	// Validate egress_allowlist entries are valid hostnames or IPs.
+	for _, entry := range agent.Spec.Network.EgressAllowlist {
+		if entry == "" {
+			ve.addf("%s: spec.network.egress_allowlist contains empty entry", prefix)
 			continue
 		}
-		if err := types.ValidateSubjectComponent("capability name", cap.Name); err != nil {
-			ve.addf("%s: capability %q: %v", prefix, cap.Name, err)
+		if !isValidAllowlistEntry(entry) {
+			ve.addf("%s: spec.network.egress_allowlist entry %q is not a valid hostname, IP, or CIDR", prefix, entry)
+			continue
 		}
-		if cap.Description == "" {
-			ve.addf("%s: capability %q description is required", prefix, cap.Name)
+		// SEC-P3-003: Reject IPv6 addresses and CIDRs. The nftables enforcement
+		// layer uses iptables (IPv4 only), so IPv6 entries would be silently
+		// ignored, providing a false sense of security.
+		if isIPv6Entry(entry) {
+			ve.addf("%s: spec.network.egress_allowlist entry %q is IPv6, which is not currently supported for network policies (enforcement is IPv4 only)", prefix, entry)
+			continue
 		}
-		if capNames[cap.Name] {
-			ve.addf("%s: duplicate capability name %q", prefix, cap.Name)
-		}
-		capNames[cap.Name] = true
-		for _, param := range cap.Inputs {
-			if param.Type != "" && !validParamTypes[param.Type] {
-				ve.addf("%s: capability %q input %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
-			}
-		}
-		for _, param := range cap.Outputs {
-			if param.Type != "" && !validParamTypes[param.Type] {
-				ve.addf("%s: capability %q output %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
+		// Reject overly broad CIDR prefixes (VAL-C1).
+		if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+			ones, _ := ipNet.Mask.Size()
+			if ones <= 4 {
+				// IPv4 with prefix /0 through /4 is too broad.
+				ve.addf("%s: spec.network.egress_allowlist entry %q has overly broad IPv4 prefix /%d (minimum /5)", prefix, entry, ones)
 			}
 		}
 	}
 
+	// Validate hardware fields (GPU, sensors, actuators).
+	if agent.Spec.Hardware.GPU != "" {
+		if strings.ContainsAny(agent.Spec.Hardware.GPU, "/\\") {
+			ve.addf("%s: spec.hardware.gpu %q must not contain path separators", prefix, agent.Spec.Hardware.GPU)
+		}
+		for _, c := range agent.Spec.Hardware.GPU {
+			if c < 0x20 || c == 0x7f {
+				ve.addf("%s: spec.hardware.gpu %q contains control characters", prefix, agent.Spec.Hardware.GPU)
+				break
+			}
+		}
+	}
+	for _, sensor := range agent.Spec.Hardware.Sensors {
+		if strings.ContainsAny(sensor, "/\\") {
+			ve.addf("%s: spec.hardware.sensors entry %q must not contain path separators", prefix, sensor)
+		}
+		for _, c := range sensor {
+			if c < 0x20 || c == 0x7f {
+				ve.addf("%s: spec.hardware.sensors entry %q contains control characters", prefix, sensor)
+				break
+			}
+		}
+	}
+	for _, actuator := range agent.Spec.Hardware.Actuators {
+		if strings.ContainsAny(actuator, "/\\") {
+			ve.addf("%s: spec.hardware.actuators entry %q must not contain path separators", prefix, actuator)
+		}
+		for _, c := range actuator {
+			if c < 0x20 || c == 0x7f {
+				ve.addf("%s: spec.hardware.actuators entry %q contains control characters", prefix, actuator)
+				break
+			}
+		}
+	}
+
+	// Validate ingress configuration.
+	if agent.Spec.Ingress.Port != 0 || agent.Spec.Ingress.Path != "" {
+		if agent.Spec.Ingress.Port <= 0 || agent.Spec.Ingress.Port > 65535 {
+			ve.addf("%s: spec.ingress.port must be between 1 and 65535, got %d", prefix, agent.Spec.Ingress.Port)
+		}
+		if agent.Spec.Ingress.Path != "" {
+			if agent.Spec.Ingress.Path[0] != '/' {
+				ve.addf("%s: spec.ingress.path must start with '/', got %q", prefix, agent.Spec.Ingress.Path)
+			}
+			if strings.Contains(agent.Spec.Ingress.Path, "..") {
+				ve.addf("%s: spec.ingress.path %q contains path traversal (..)", prefix, agent.Spec.Ingress.Path)
+			}
+			if ingressPathInvalidChars.MatchString(agent.Spec.Ingress.Path) {
+				ve.addf("%s: spec.ingress.path %q contains invalid characters", prefix, agent.Spec.Ingress.Path)
+			}
+		}
+	}
+}
+
+// validateAgentMounts validates volumes, shared volume references, mount paths,
+// dangerous path checks, cross-overlap detection, and secret references.
+func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentManifest, teams map[string]*types.TeamManifest, cluster *types.ClusterConfig) {
 	// Collect cleaned volume mount paths for cross-overlap detection with mounts (VAL-H2).
 	type volumeMountEntry struct {
 		name      string
@@ -758,125 +942,37 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			}
 		}
 	}
+}
 
-	// Validate replicas.
-	if agent.Spec.Replicas.Min < 0 {
-		ve.addf("%s: spec.replicas.min must be >= 0", prefix)
-	}
-	if agent.Spec.Replicas.Max < 0 {
-		ve.addf("%s: spec.replicas.max must be >= 0", prefix)
-	}
-	if agent.Spec.Replicas.Max > 10000 {
-		ve.addf("%s: spec.replicas.max must be <= 10000, got %d", prefix, agent.Spec.Replicas.Max)
-	}
-	if agent.Spec.Replicas.Min > 0 && agent.Spec.Replicas.Max > 0 && agent.Spec.Replicas.Min > agent.Spec.Replicas.Max {
-		ve.addf("%s: spec.replicas.min (%d) must be <= max (%d)", prefix, agent.Spec.Replicas.Min, agent.Spec.Replicas.Max)
-	}
-
-	// Validate network egress only for vm tier (rule 10).
-	// Always validate if egress is set, even when tier is empty string (VAL-H1).
-	if agent.Spec.Network.Egress != "" && agent.Spec.Tier != "vm" {
-		ve.addf("%s: network egress is only valid for vm tier", prefix)
-	}
-	if agent.Spec.Network.Egress != "" {
-		validEgress := map[string]bool{"none": true, "restricted": true, "full": true}
-		if !validEgress[agent.Spec.Network.Egress] {
-			ve.addf("%s: spec.network.egress must be one of [none, restricted, full], got %q", prefix, agent.Spec.Network.Egress)
-		}
-	}
-
-	// Validate network ingress only for vm tier (same guard as egress).
-	// Always validate if ingress is set, even when tier is empty string (VAL-H1).
-	if agent.Spec.Network.Ingress != "" && agent.Spec.Tier != "vm" {
-		ve.addf("%s: network ingress is only valid for vm tier", prefix)
-	}
-	if agent.Spec.Network.Ingress != "" {
-		// Note: "restricted" is reserved for future use when ingress allowlist support is added.
-		// Until then, only "none" and "full" are accepted to avoid a false sense of restriction.
-		validIngress := map[string]bool{"none": true, "full": true}
-		if !validIngress[agent.Spec.Network.Ingress] {
-			ve.addf("%s: spec.network.ingress must be one of [none, full], got %q", prefix, agent.Spec.Network.Ingress)
-		}
-	}
-
-	// Ingress requires egress to be set (NET-C1).
-	if agent.Spec.Network.Ingress != "" && agent.Spec.Network.Egress == "" {
-		ve.addf("%s: spec.network.ingress requires spec.network.egress to be set", prefix)
-	}
-
-	// Validate egress_allowlist is only used with restricted egress.
-	if len(agent.Spec.Network.EgressAllowlist) > 0 && agent.Spec.Network.Egress != "restricted" {
-		ve.addf("%s: spec.network.egress_allowlist is only valid when egress is \"restricted\"", prefix)
-	}
-
-	// Egress "restricted" requires a non-empty allowlist (VAL-H5).
-	if agent.Spec.Network.Egress == "restricted" && len(agent.Spec.Network.EgressAllowlist) == 0 {
-		ve.addf("%s: spec.network.egress is \"restricted\" but egress_allowlist is empty", prefix)
-	}
-
-	// Validate egress_allowlist size limit.
-	if len(agent.Spec.Network.EgressAllowlist) > 100 {
-		ve.addf("%s: spec.network.egress_allowlist has %d entries, maximum is 100", prefix, len(agent.Spec.Network.EgressAllowlist))
-	}
-
-	// Validate egress_allowlist entries are valid hostnames or IPs.
-	for _, entry := range agent.Spec.Network.EgressAllowlist {
-		if entry == "" {
-			ve.addf("%s: spec.network.egress_allowlist contains empty entry", prefix)
+// validateAgentCapabilities validates capability definitions, restart/health
+// settings, and placement configuration.
+func validateAgentCapabilities(ve *ValidationError, prefix string, id string, agent *types.AgentManifest) {
+	// Validate capabilities (rule 7: unique names within agent)
+	validParamTypes := map[string]bool{"string": true, "int": true, "float": true, "bool": true, "bytes": true}
+	capNames := make(map[string]bool)
+	for _, cap := range agent.Spec.Capabilities {
+		if cap.Name == "" {
+			ve.addf("%s: capability name is required", prefix)
 			continue
 		}
-		if !isValidAllowlistEntry(entry) {
-			ve.addf("%s: spec.network.egress_allowlist entry %q is not a valid hostname, IP, or CIDR", prefix, entry)
-			continue
+		if err := types.ValidateSubjectComponent("capability name", cap.Name); err != nil {
+			ve.addf("%s: capability %q: %v", prefix, cap.Name, err)
 		}
-		// SEC-P3-003: Reject IPv6 addresses and CIDRs. The nftables enforcement
-		// layer uses iptables (IPv4 only), so IPv6 entries would be silently
-		// ignored, providing a false sense of security.
-		if isIPv6Entry(entry) {
-			ve.addf("%s: spec.network.egress_allowlist entry %q is IPv6, which is not currently supported for network policies (enforcement is IPv4 only)", prefix, entry)
-			continue
+		if cap.Description == "" {
+			ve.addf("%s: capability %q description is required", prefix, cap.Name)
 		}
-		// Reject overly broad CIDR prefixes (VAL-C1).
-		if _, ipNet, err := net.ParseCIDR(entry); err == nil {
-			ones, _ := ipNet.Mask.Size()
-			if ones <= 4 {
-				// IPv4 with prefix /0 through /4 is too broad.
-				ve.addf("%s: spec.network.egress_allowlist entry %q has overly broad IPv4 prefix /%d (minimum /5)", prefix, entry, ones)
+		if capNames[cap.Name] {
+			ve.addf("%s: duplicate capability name %q", prefix, cap.Name)
+		}
+		capNames[cap.Name] = true
+		for _, param := range cap.Inputs {
+			if param.Type != "" && !validParamTypes[param.Type] {
+				ve.addf("%s: capability %q input %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
 			}
 		}
-	}
-
-	// Validate hardware fields (GPU, sensors, actuators).
-	if agent.Spec.Hardware.GPU != "" {
-		if strings.ContainsAny(agent.Spec.Hardware.GPU, "/\\") {
-			ve.addf("%s: spec.hardware.gpu %q must not contain path separators", prefix, agent.Spec.Hardware.GPU)
-		}
-		for _, c := range agent.Spec.Hardware.GPU {
-			if c < 0x20 || c == 0x7f {
-				ve.addf("%s: spec.hardware.gpu %q contains control characters", prefix, agent.Spec.Hardware.GPU)
-				break
-			}
-		}
-	}
-	for _, sensor := range agent.Spec.Hardware.Sensors {
-		if strings.ContainsAny(sensor, "/\\") {
-			ve.addf("%s: spec.hardware.sensors entry %q must not contain path separators", prefix, sensor)
-		}
-		for _, c := range sensor {
-			if c < 0x20 || c == 0x7f {
-				ve.addf("%s: spec.hardware.sensors entry %q contains control characters", prefix, sensor)
-				break
-			}
-		}
-	}
-	for _, actuator := range agent.Spec.Hardware.Actuators {
-		if strings.ContainsAny(actuator, "/\\") {
-			ve.addf("%s: spec.hardware.actuators entry %q must not contain path separators", prefix, actuator)
-		}
-		for _, c := range actuator {
-			if c < 0x20 || c == 0x7f {
-				ve.addf("%s: spec.hardware.actuators entry %q contains control characters", prefix, actuator)
-				break
+		for _, param := range cap.Outputs {
+			if param.Type != "" && !validParamTypes[param.Type] {
+				ve.addf("%s: capability %q output %q type must be one of [string, int, float, bool, bytes], got %q", prefix, cap.Name, param.Name, param.Type)
 			}
 		}
 	}
@@ -899,66 +995,6 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		ve.addf("%s: spec.health.maxFailures must be <= 10000, got %d", prefix, agent.Spec.Health.MaxFailures)
 	}
 
-	// Validate ingress configuration.
-	if agent.Spec.Ingress.Port != 0 || agent.Spec.Ingress.Path != "" {
-		if agent.Spec.Ingress.Port <= 0 || agent.Spec.Ingress.Port > 65535 {
-			ve.addf("%s: spec.ingress.port must be between 1 and 65535, got %d", prefix, agent.Spec.Ingress.Port)
-		}
-		if agent.Spec.Ingress.Path != "" {
-			if agent.Spec.Ingress.Path[0] != '/' {
-				ve.addf("%s: spec.ingress.path must start with '/', got %q", prefix, agent.Spec.Ingress.Path)
-			}
-			if strings.Contains(agent.Spec.Ingress.Path, "..") {
-				ve.addf("%s: spec.ingress.path %q contains path traversal (..)", prefix, agent.Spec.Ingress.Path)
-			}
-			if ingressPathInvalidChars.MatchString(agent.Spec.Ingress.Path) {
-				ve.addf("%s: spec.ingress.path %q contains invalid characters", prefix, agent.Spec.Ingress.Path)
-			}
-		}
-	}
-
-	// Validate disk size.
-	if agent.Spec.Resources.Disk != "" {
-		diskBytes, err := ParseDiskSize(agent.Spec.Resources.Disk)
-		if err != nil {
-			ve.addf("%s: spec.resources.disk %q is invalid: %v", prefix, agent.Spec.Resources.Disk, err)
-		} else if diskBytes > 10*1024*1024*1024*1024 { // 10 TB upper bound
-			ve.addf("%s: spec.resources.disk %q exceeds maximum of 10TB", prefix, agent.Spec.Resources.Disk)
-		}
-	}
-
-	// Cap environment variables per agent to prevent excessive resource usage.
-	if len(agent.Spec.Runtime.Model.Env) > 1000 {
-		ve.addf("%s: spec.runtime.model.env has %d entries, maximum is 1000", prefix, len(agent.Spec.Runtime.Model.Env))
-	}
-
-	// Validate runtime.model.env keys.
-	for envKey := range agent.Spec.Runtime.Model.Env {
-		if !envKeyRegex.MatchString(envKey) {
-			ve.addf("%s: spec.runtime.model.env key %q is not a valid environment variable name", prefix, envKey)
-		}
-		if blockedEnvKeys[envKey] {
-			ve.addf("%s: spec.runtime.model.env key %q is a blocked security-sensitive environment variable", prefix, envKey)
-		}
-	}
-
-	// Rule 6: Validate secret references (${SECRET_NAME}) in runtime.model.env
-	// resolve against spec.secrets in cluster config.
-	if cluster != nil && len(agent.Spec.Runtime.Model.Env) > 0 {
-		secrets := cluster.Spec.Secrets
-		for envKey, envVal := range agent.Spec.Runtime.Model.Env {
-			matches := secretRefRegex.FindAllStringSubmatch(envVal, -1)
-			for _, match := range matches {
-				secretName := match[1]
-				if secrets == nil {
-					ve.addf("%s: env %q references secret ${%s} but spec.secrets is not defined", prefix, envKey, secretName)
-				} else if _, ok := secrets[secretName]; !ok {
-					ve.addf("%s: env %q references secret ${%s} which is not in spec.secrets", prefix, envKey, secretName)
-				}
-			}
-		}
-	}
-
 	// Rule 16: Placement nodeId warning if set (node may not be registered at
 	// parse time, so this is a warning, not an error).
 	// NOTE: Uses global slog logger. A future refactor could accept a logger
@@ -968,11 +1004,6 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 		slog.Warn("agent placement.nodeId is set; node registration cannot be verified at parse time",
 			"agent_id", id, "node_id", agent.Spec.Placement.NodeID)
 	}
-
-	// Validate map fields for safe keys and values (no control chars, no NATS wildcards).
-	validateMapLabels(ve, prefix, "metadata.labels", agent.Metadata.Labels)
-	validateMapLabels(ve, prefix, "spec.hardware.custom", agent.Spec.Hardware.Custom)
-	validateMapLabels(ve, prefix, "spec.placement.nodeLabels", agent.Spec.Placement.NodeLabels)
 }
 
 func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agents map[string]*types.AgentManifest) {

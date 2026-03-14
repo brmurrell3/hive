@@ -19,63 +19,59 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show cluster overview",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newDaemonClient()
-			if err != nil {
-				return err
-			}
-			defer client.Close()
+			return withClient(func(client *DaemonClient) error {
+				resp, err := client.request(protocol.SubjStatus, nil)
+				if err != nil {
+					return fmt.Errorf("requesting cluster status: %w", err)
+				}
+				if err := resp.Err(); err != nil {
+					return err
+				}
 
-			resp, err := client.request(protocol.SubjStatus, nil)
-			if err != nil {
-				return fmt.Errorf("requesting cluster status: %w", err)
-			}
-			if err := resp.Err(); err != nil {
-				return err
-			}
+				var status struct {
+					ClusterName  string         `json:"cluster_name"`
+					NodeCount    int            `json:"node_count"`
+					TeamCount    int            `json:"team_count"`
+					AgentCount   int            `json:"agent_count"`
+					StatusCounts map[string]int `json:"status_counts,omitempty"`
+					NATSPort     int            `json:"nats_port"`
+				}
+				if err := json.Unmarshal(resp.Data, &status); err != nil {
+					return fmt.Errorf("parsing response: %w", err)
+				}
 
-			var status struct {
-				ClusterName  string         `json:"cluster_name"`
-				NodeCount    int            `json:"node_count"`
-				TeamCount    int            `json:"team_count"`
-				AgentCount   int            `json:"agent_count"`
-				StatusCounts map[string]int `json:"status_counts,omitempty"`
-				NATSPort     int            `json:"nats_port"`
-			}
-			if err := json.Unmarshal(resp.Data, &status); err != nil {
-				return fmt.Errorf("parsing response: %w", err)
-			}
+				natsStatus := "configured"
+				if status.NATSPort > 0 {
+					natsStatus = fmt.Sprintf("configured (port %d)", status.NATSPort)
+				}
 
-			natsStatus := "configured"
-			if status.NATSPort > 0 {
-				natsStatus = fmt.Sprintf("configured (port %d)", status.NATSPort)
-			}
+				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintf(w, "Cluster:\t%s\n", status.ClusterName)
+				fmt.Fprintf(w, "Nodes:\t%d\n", status.NodeCount)
+				fmt.Fprintf(w, "Teams:\t%d\n", status.TeamCount)
+				fmt.Fprintf(w, "Agents:\t%d\n", status.AgentCount)
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintf(w, "Cluster:\t%s\n", status.ClusterName)
-			fmt.Fprintf(w, "Nodes:\t%d\n", status.NodeCount)
-			fmt.Fprintf(w, "Teams:\t%d\n", status.TeamCount)
-			fmt.Fprintf(w, "Agents:\t%d\n", status.AgentCount)
-
-			if status.AgentCount > 0 {
-				for _, s := range []state.AgentStatus{
-					state.AgentStatusRunning,
-					state.AgentStatusStopped,
-					state.AgentStatusFailed,
-					state.AgentStatusPending,
-					state.AgentStatusCreating,
-					state.AgentStatusStarting,
-					state.AgentStatusStopping,
-				} {
-					if count, ok := status.StatusCounts[string(s)]; ok && count > 0 {
-						fmt.Fprintf(w, "  %s:\t%d\n", s, count)
+				if status.AgentCount > 0 {
+					for _, s := range []state.AgentStatus{
+						state.AgentStatusRunning,
+						state.AgentStatusStopped,
+						state.AgentStatusFailed,
+						state.AgentStatusPending,
+						state.AgentStatusCreating,
+						state.AgentStatusStarting,
+						state.AgentStatusStopping,
+					} {
+						if count, ok := status.StatusCounts[string(s)]; ok && count > 0 {
+							fmt.Fprintf(w, "  %s:\t%d\n", s, count)
+						}
 					}
 				}
-			}
 
-			fmt.Fprintf(w, "NATS:\t%s\n", natsStatus)
-			w.Flush()
+				fmt.Fprintf(w, "NATS:\t%s\n", natsStatus)
+				w.Flush()
 
-			return nil
+				return nil
+			})
 		},
 	}
 }
