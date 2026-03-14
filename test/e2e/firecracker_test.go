@@ -592,7 +592,8 @@ metadata:
 spec:
   tier: vm
   runtime:
-    type: noop
+    type: command
+    command: "sleep 3600"
 %s  capabilities:
     - name: test-cap
       description: Test capability
@@ -634,7 +635,8 @@ metadata:
 spec:
   tier: vm
   runtime:
-    type: noop
+    type: command
+    command: "sleep 3600"
   resources:
     memory: "256Mi"
     vcpus: 1
@@ -664,7 +666,8 @@ metadata:
 spec:
   tier: vm
   runtime:
-    type: noop
+    type: command
+    command: "sleep 3600"
   resources:
     memory: "256Mi"
     vcpus: 1

@@ -503,7 +503,7 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 	if err != nil {
 		return fmt.Errorf("creating gzip reader: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	// MEDIUM-1: Use 0600 for file permissions.
 	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
