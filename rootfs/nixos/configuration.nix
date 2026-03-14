@@ -156,6 +156,10 @@ in
     # Read sidecar.conf from the agent drive to get per-agent configuration.
     # The conf file contains KEY=VALUE pairs (AGENT_ID, TEAM_ID, NATS_URL,
     # NATS_TOKEN, VSOCK_PORT).
+    #
+    # SEC-P3-004: The sidecar.conf file is written by the host via
+    # os.WriteFile which is not atomic. A retry loop ensures the file is
+    # fully written (non-empty and ends with a newline) before sourcing.
     script = ''
       AGENT_ID="unknown"
       TEAM_ID=""
@@ -163,8 +167,25 @@ in
       NATS_TOKEN=""
       VSOCK_PORT="4222"
 
-      if [ -f /agent/sidecar.conf ]; then
-        . /agent/sidecar.conf
+      # Wait for sidecar.conf to be fully written (retry up to 30 times, 1s apart).
+      _conf="/agent/sidecar.conf"
+      _retries=0
+      while [ "$_retries" -lt 30 ]; do
+        if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+          # Check that the file ends with a newline (complete write).
+          if tail -c 1 "$_conf" | od -An -tx1 | grep -q '0a'; then
+            break
+          fi
+        fi
+        _retries=$((_retries + 1))
+        echo "Waiting for $_conf to be fully written (attempt $_retries/30)..." >&2
+        sleep 1
+      done
+
+      if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+        . "$_conf"
+      else
+        echo "WARNING: $_conf not found or empty after 30s, using defaults" >&2
       fi
 
       # Build arguments safely using positional parameters to avoid eval injection.
@@ -225,13 +246,29 @@ in
 
     path = [ pkgs.iptables pkgs.iproute2 pkgs.dnsutils ];
 
+    # SEC-P3-004: Wait for sidecar.conf to be fully written before sourcing.
     script = ''
       HIVE_EGRESS_MODE=""
       HIVE_EGRESS_ALLOWLIST=""
       HIVE_DNS_SERVER=""
 
-      if [ -f /agent/sidecar.conf ]; then
-        . /agent/sidecar.conf
+      _conf="/agent/sidecar.conf"
+      _retries=0
+      while [ "$_retries" -lt 30 ]; do
+        if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+          if tail -c 1 "$_conf" | od -An -tx1 | grep -q '0a'; then
+            break
+          fi
+        fi
+        _retries=$((_retries + 1))
+        echo "Waiting for $_conf to be fully written (attempt $_retries/30)..." >&2
+        sleep 1
+      done
+
+      if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+        . "$_conf"
+      else
+        echo "WARNING: $_conf not found or empty after 30s, using defaults" >&2
       fi
 
       # Configure DNS resolver
@@ -315,11 +352,27 @@ in
 
     path = [ pkgs.util-linux pkgs.coreutils ];
 
+    # SEC-P3-004: Wait for sidecar.conf to be fully written before sourcing.
     script = ''
       HIVE_VOLUMES=""
 
-      if [ -f /agent/sidecar.conf ]; then
-        . /agent/sidecar.conf
+      _conf="/agent/sidecar.conf"
+      _retries=0
+      while [ "$_retries" -lt 30 ]; do
+        if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+          if tail -c 1 "$_conf" | od -An -tx1 | grep -q '0a'; then
+            break
+          fi
+        fi
+        _retries=$((_retries + 1))
+        echo "Waiting for $_conf to be fully written (attempt $_retries/30)..." >&2
+        sleep 1
+      done
+
+      if [ -f "$_conf" ] && [ -s "$_conf" ]; then
+        . "$_conf"
+      else
+        echo "WARNING: $_conf not found or empty after 30s, using defaults" >&2
       fi
 
       [ -z "''${HIVE_VOLUMES:-}" ] && exit 0

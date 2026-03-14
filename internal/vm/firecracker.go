@@ -669,7 +669,12 @@ func apiPut(ctx context.Context, client *http.Client, socketPath string, path st
 	if err != nil {
 		return fmt.Errorf("sending request to %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// FC-S8: Drain the response body remainder before closing so the
+		// underlying connection can be reused by the transport pool.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var respBody bytes.Buffer
@@ -746,7 +751,7 @@ func isProcessGone(err error) bool {
 	if errors.Is(err, syscall.ESRCH) {
 		return true
 	}
-	return err.Error() == "os: process already finished"
+	return false
 }
 
 // deterministicMAC generates a deterministic locally-administered MAC address

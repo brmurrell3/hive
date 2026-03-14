@@ -45,9 +45,13 @@ const maxBufSize = 10 * 1024 * 1024
 // safeBuf is a thread-safe bytes.Buffer with a maximum size limit.
 // It implements io.Writer so it can be used directly as cmd.Stdout/Stderr.
 type safeBuf struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool // set when data is dropped due to maxBufSize
 }
+
+// truncationMsg is appended to output when truncation has occurred.
+const truncationMsg = "\n... output truncated (10MB limit) ...\n"
 
 // Write implements io.Writer. This intentionally violates the io.Writer
 // contract by always returning len(p), nil even when data is truncated.
@@ -61,11 +65,13 @@ func (s *safeBuf) Write(p []byte) (int, error) {
 	n := len(p) // always report full write to caller
 	remaining := maxBufSize - s.buf.Len()
 	if remaining <= 0 {
-		// Buffer full — silently discard.
+		// Buffer full — record truncation and discard.
+		s.truncated = true
 		return n, nil
 	}
 	if len(p) > remaining {
 		p = p[:remaining]
+		s.truncated = true
 	}
 	// Ignore the bytes-written count from the underlying buffer; we
 	// always report n (original len) to avoid aborting the child process.
@@ -74,9 +80,16 @@ func (s *safeBuf) Write(p []byte) (int, error) {
 }
 
 // Bytes returns a copy of the buffered data, safe for concurrent use.
+// If truncation occurred, a truncation indicator is appended to the output.
 func (s *safeBuf) Bytes() []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.truncated {
+		cp := make([]byte, s.buf.Len()+len(truncationMsg))
+		copy(cp, s.buf.Bytes())
+		copy(cp[s.buf.Len():], truncationMsg)
+		return cp
+	}
 	cp := make([]byte, s.buf.Len())
 	copy(cp, s.buf.Bytes())
 	return cp

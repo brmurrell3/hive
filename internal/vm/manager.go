@@ -737,7 +737,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	// constructed earlier to avoid drift between VMConfig and nftables.
 	needsNftables := netPolicy != nil &&
 		((netPolicy.Egress != "" && netPolicy.Egress != egressFull) ||
-			(netPolicy.Ingress != "" && netPolicy.Ingress != egressFull))
+			(netPolicy.Ingress != "" && netPolicy.Ingress != ingressFull))
 	if needsNftables {
 		rules, nftGenErr := GenerateNftables(*netPolicy)
 		if nftGenErr != nil {
@@ -822,10 +822,10 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			tapDevice := TapDeviceName(agentID)
 			nftCmd, nftArgs := CleanupNftables(tapDevice)
 			nftCtx2, nftCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+			defer nftCancel2()
 			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
 				m.logger.Debug("nftables cleanup after CheckTransition failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
 			}
-			nftCancel2()
 		}
 		// Explicitly destroy the VM and release resources since the deferred
 		// function considers them committed.
@@ -845,10 +845,10 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			tapDevice := TapDeviceName(agentID)
 			nftCmd, nftArgs := CleanupNftables(tapDevice)
 			nftCtx2, nftCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+			defer nftCancel2()
 			if out, cleanErr := exec.CommandContext(nftCtx2, nftCmd, nftArgs...).CombinedOutput(); cleanErr != nil {
 				m.logger.Debug("nftables cleanup after SetAgent RUNNING failure", "agent_id", agentID, "error", cleanErr, "output", string(out))
 			}
-			nftCancel2()
 		}
 		// Explicitly destroy the VM and release resources since the deferred
 		// function considers them committed.
@@ -1245,10 +1245,10 @@ func (m *Manager) ReconcileOnStartup() error {
 				tapDevice := TapDeviceName(agent.ID)
 				nftCmd, nftArgs := CleanupNftables(tapDevice)
 				nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer nftCancel()
 				if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
 					m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
 				}
-				nftCancel()
 
 				// Clean up disk artifacts left behind by the dead VM.
 				m.cleanupAgentArtifacts(agent.ID)
@@ -1296,10 +1296,10 @@ func (m *Manager) ReconcileOnStartup() error {
 				tapDevice := TapDeviceName(agent.ID)
 				nftCmd, nftArgs := CleanupNftables(tapDevice)
 				nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer nftCancel()
 				if out, err := exec.CommandContext(nftCtx, nftCmd, nftArgs...).CombinedOutput(); err != nil {
 					m.logger.Warn("nftables cleanup failed during reconciliation", "agent_id", agent.ID, "error", err, "output", string(out))
 				}
-				nftCancel()
 
 				// Clean up disk artifacts.
 				m.cleanupAgentArtifacts(agent.ID)

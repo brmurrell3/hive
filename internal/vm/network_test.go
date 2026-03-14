@@ -86,10 +86,10 @@ func TestGenerateNftables_EgressFull(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GenerateNftables: IPv6 allowlist entries use ip6 daddr
+// SEC-P3-003: IPv6 allowlist entries are filtered out (nftables is IPv4 only)
 // ---------------------------------------------------------------------------
 
-func TestGenerateNftables_IPv6Allowlist(t *testing.T) {
+func TestGenerateNftables_IPv6AllowlistFiltered(t *testing.T) {
 	rules, err := GenerateNftables(NetworkPolicy{
 		TapDevice: "tap0",
 		Egress:    "restricted",
@@ -99,14 +99,45 @@ func TestGenerateNftables_IPv6Allowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(rules, "ip6 daddr") {
-		t.Error("IPv6 allowlist: expected 'ip6 daddr' directive")
+	// IPv6 entries should be filtered out by resolveAllowlistHosts.
+	if strings.Contains(rules, "ip6 daddr") {
+		t.Error("IPv6 allowlist: should NOT contain 'ip6 daddr' (IPv6 is filtered out)")
 	}
-	if !strings.Contains(rules, "2001:db8::1") {
-		t.Error("IPv6 allowlist: expected address 2001:db8::1 in rules")
+	if strings.Contains(rules, "2001:db8::1") {
+		t.Error("IPv6 allowlist: should NOT contain address 2001:db8::1 (IPv6 is filtered out)")
 	}
-	if !strings.Contains(rules, "fd00::/64") {
-		t.Error("IPv6 allowlist: expected CIDR fd00::/64 in rules")
+	if strings.Contains(rules, "fd00::/64") {
+		t.Error("IPv6 allowlist: should NOT contain CIDR fd00::/64 (IPv6 is filtered out)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SEC-P3-003: Mixed IPv4+IPv6 allowlist — only IPv4 entries appear in rules
+// ---------------------------------------------------------------------------
+
+func TestGenerateNftables_MixedAllowlistOnlyIPv4(t *testing.T) {
+	rules, err := GenerateNftables(NetworkPolicy{
+		TapDevice: "tap0",
+		Egress:    "restricted",
+		Allowlist: []string{"10.0.0.1", "2001:db8::1", "192.168.1.0/24", "fd00::/64"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// IPv4 entries should be present.
+	if !strings.Contains(rules, "10.0.0.1") {
+		t.Error("mixed allowlist: expected IPv4 address 10.0.0.1 in rules")
+	}
+	if !strings.Contains(rules, "192.168.1.0/24") {
+		t.Error("mixed allowlist: expected IPv4 CIDR 192.168.1.0/24 in rules")
+	}
+	// IPv6 entries should be filtered out.
+	if strings.Contains(rules, "2001:db8::1") {
+		t.Error("mixed allowlist: should NOT contain IPv6 address 2001:db8::1")
+	}
+	if strings.Contains(rules, "fd00::/64") {
+		t.Error("mixed allowlist: should NOT contain IPv6 CIDR fd00::/64")
 	}
 }
 
@@ -408,34 +439,31 @@ func TestResolveAllowlistHosts_CIDRPassthrough(t *testing.T) {
 	}
 }
 
-func TestResolveAllowlistHosts_IPv6Passthrough(t *testing.T) {
-	// IPv6 addresses and CIDRs should pass through unchanged.
+func TestResolveAllowlistHosts_IPv6Filtered(t *testing.T) {
+	// SEC-P3-003: IPv6 addresses and CIDRs should be filtered out (not passed through).
 	hosts := []string{"::1", "2001:db8::1", "fe80::/10", "fd00::/64"}
 	resolved, err := resolveAllowlistHosts(hosts)
 	if err != nil {
 		t.Fatalf("resolveAllowlistHosts with IPv6 returned error: %v", err)
 	}
-	if len(resolved) != len(hosts) {
-		t.Fatalf("expected %d resolved hosts, got %d", len(hosts), len(resolved))
-	}
-	for i, h := range hosts {
-		if resolved[i] != h {
-			t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], h)
-		}
+	if len(resolved) != 0 {
+		t.Errorf("expected all IPv6 entries to be filtered out, got %v", resolved)
 	}
 }
 
 func TestResolveAllowlistHosts_MixedIPsAndCIDRs(t *testing.T) {
-	// Mixed list of IPv4 IPs, IPv6 IPs, and CIDRs should all pass through.
+	// SEC-P3-003: Mixed list — IPv4 entries pass through, IPv6 entries are filtered.
 	hosts := []string{"10.0.0.1", "192.168.0.0/16", "::1", "fd00::/64"}
 	resolved, err := resolveAllowlistHosts(hosts)
 	if err != nil {
 		t.Fatalf("resolveAllowlistHosts with mixed list returned error: %v", err)
 	}
-	if len(resolved) != len(hosts) {
-		t.Fatalf("expected %d resolved hosts, got %d", len(hosts), len(resolved))
+	// Only the 2 IPv4 entries should remain.
+	expectedResolved := []string{"10.0.0.1", "192.168.0.0/16"}
+	if len(resolved) != len(expectedResolved) {
+		t.Fatalf("expected %d resolved hosts (IPv4 only), got %d: %v", len(expectedResolved), len(resolved), resolved)
 	}
-	for i, h := range hosts {
+	for i, h := range expectedResolved {
 		if resolved[i] != h {
 			t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], h)
 		}

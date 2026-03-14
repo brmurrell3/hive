@@ -824,15 +824,19 @@ func validateAgent(ve *ValidationError, id string, agent *types.AgentManifest, t
 			ve.addf("%s: spec.network.egress_allowlist entry %q is not a valid hostname, IP, or CIDR", prefix, entry)
 			continue
 		}
+		// SEC-P3-003: Reject IPv6 addresses and CIDRs. The nftables enforcement
+		// layer uses iptables (IPv4 only), so IPv6 entries would be silently
+		// ignored, providing a false sense of security.
+		if isIPv6Entry(entry) {
+			ve.addf("%s: spec.network.egress_allowlist entry %q is IPv6, which is not currently supported for network policies (enforcement is IPv4 only)", prefix, entry)
+			continue
+		}
 		// Reject overly broad CIDR prefixes (VAL-C1).
 		if _, ipNet, err := net.ParseCIDR(entry); err == nil {
-			ones, bits := ipNet.Mask.Size()
-			if bits == 32 && ones <= 4 {
+			ones, _ := ipNet.Mask.Size()
+			if ones <= 4 {
 				// IPv4 with prefix /0 through /4 is too broad.
 				ve.addf("%s: spec.network.egress_allowlist entry %q has overly broad IPv4 prefix /%d (minimum /5)", prefix, entry, ones)
-			} else if bits == 128 && ones <= 8 {
-				// IPv6 with prefix /0 through /8 is too broad.
-				ve.addf("%s: spec.network.egress_allowlist entry %q has overly broad IPv6 prefix /%d (minimum /9)", prefix, entry, ones)
 			}
 		}
 	}
@@ -1238,4 +1242,19 @@ func isValidAllowlistEntry(entry string) bool {
 		return false
 	}
 	return hostnameRegex.MatchString(entry)
+}
+
+// isIPv6Entry returns true if the entry is an IPv6 address or IPv6 CIDR range.
+// SEC-P3-003: IPv6 entries must be rejected at validation time because the
+// nftables enforcement layer only supports IPv4 rules.
+func isIPv6Entry(entry string) bool {
+	// Check for IPv6 IP address.
+	if ip := net.ParseIP(entry); ip != nil {
+		return ip.To4() == nil // To4() returns nil for IPv6 addresses
+	}
+	// Check for IPv6 CIDR range.
+	if ip, _, err := net.ParseCIDR(entry); err == nil {
+		return ip.To4() == nil
+	}
+	return false
 }

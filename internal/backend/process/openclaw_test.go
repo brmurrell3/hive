@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -428,5 +429,187 @@ func TestCopyDir(t *testing.T) {
 	}
 	if string(data) != "b" {
 		t.Errorf("sub/b.txt = %q, want %q", string(data), "b")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TEST-PORT: releaseGatewayPort and port recycling
+// ---------------------------------------------------------------------------
+
+func TestReleaseGatewayPort_Recycling(t *testing.T) {
+	// Modifies global state — must not run in parallel with other port tests.
+	resetGatewayPort()
+	defer resetGatewayPort()
+
+	// Allocate three sequential ports.
+	p1, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [1]: %v", err)
+	}
+	p2, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [2]: %v", err)
+	}
+	_, err = nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [3]: %v", err)
+	}
+
+	// Release the first two ports.
+	releaseGatewayPort(p1)
+	releaseGatewayPort(p2)
+
+	// Next allocation should recycle p2 (LIFO — last released is returned first).
+	recycled1, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [recycled1]: %v", err)
+	}
+	if recycled1 != p2 {
+		t.Errorf("first recycled port = %d, want %d (LIFO order)", recycled1, p2)
+	}
+
+	// Next allocation should recycle p1.
+	recycled2, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [recycled2]: %v", err)
+	}
+	if recycled2 != p1 {
+		t.Errorf("second recycled port = %d, want %d (LIFO order)", recycled2, p1)
+	}
+
+	// Next allocation should resume sequential (the next new port after p3).
+	p4, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [4]: %v", err)
+	}
+	if p4 != openClawBasePort+3 {
+		t.Errorf("post-recycling port = %d, want %d", p4, openClawBasePort+3)
+	}
+}
+
+func TestReleaseGatewayPort_DuplicateRelease(t *testing.T) {
+	// Modifies global state — must not run in parallel with other port tests.
+	resetGatewayPort()
+	defer resetGatewayPort()
+
+	port, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort(): %v", err)
+	}
+
+	// Release the same port three times — should not panic and should not
+	// add duplicates to the pool.
+	releaseGatewayPort(port)
+	releaseGatewayPort(port)
+	releaseGatewayPort(port)
+
+	// Allocate once — we should get the released port back.
+	recycled, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [recycled]: %v", err)
+	}
+	if recycled != port {
+		t.Errorf("recycled port = %d, want %d", recycled, port)
+	}
+
+	// The next allocation should be a NEW sequential port (not the duplicate).
+	next, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() [next]: %v", err)
+	}
+	if next == port {
+		t.Errorf("got duplicate port %d after single release should have been consumed", port)
+	}
+	if next != openClawBasePort+1 {
+		t.Errorf("next port = %d, want %d", next, openClawBasePort+1)
+	}
+}
+
+func TestNextGatewayPort_Exhaustion(t *testing.T) {
+	// Modifies global state — must not run in parallel with other port tests.
+	resetGatewayPort()
+	defer resetGatewayPort()
+
+	// Force the allocator to a state near exhaustion.
+	openClawPortAllocator.mu.Lock()
+	openClawPortAllocator.next = openClawMaxPort
+	openClawPortAllocator.released = nil
+	openClawPortAllocator.mu.Unlock()
+
+	// Should succeed for the last available port (65535).
+	port, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() at max port: %v", err)
+	}
+	if port != openClawMaxPort {
+		t.Errorf("port = %d, want %d", port, openClawMaxPort)
+	}
+
+	// Next allocation should fail — all ports exhausted.
+	_, err = nextGatewayPort()
+	if err == nil {
+		t.Fatal("nextGatewayPort() should return error when ports exhausted")
+	}
+	if !strings.Contains(err.Error(), "port exhaustion") {
+		t.Errorf("error message = %q, want to contain 'port exhaustion'", err.Error())
+	}
+
+	// Releasing a port should make allocation succeed again.
+	releaseGatewayPort(port)
+
+	recycled, err := nextGatewayPort()
+	if err != nil {
+		t.Fatalf("nextGatewayPort() after release: %v", err)
+	}
+	if recycled != port {
+		t.Errorf("recycled port = %d, want %d", recycled, port)
+	}
+}
+
+func TestReleaseGatewayPort_ConcurrentReleaseAndAllocate(t *testing.T) {
+	resetGatewayPort()
+	defer resetGatewayPort()
+
+	const count = 100
+
+	// Allocate ports.
+	ports := make([]int, count)
+	for i := range count {
+		var err error
+		ports[i], err = nextGatewayPort()
+		if err != nil {
+			t.Fatalf("nextGatewayPort() [%d]: %v", i, err)
+		}
+	}
+
+	// Release all ports concurrently.
+	var wg sync.WaitGroup
+	wg.Add(count)
+	for i := range count {
+		go func(p int) {
+			defer wg.Done()
+			releaseGatewayPort(p)
+		}(ports[i])
+	}
+	wg.Wait()
+
+	// Reallocate all ports — they should all come from the recycled pool.
+	seen := make(map[int]bool, count)
+	for range count {
+		p, err := nextGatewayPort()
+		if err != nil {
+			t.Fatalf("nextGatewayPort() during re-allocation: %v", err)
+		}
+		if seen[p] {
+			t.Errorf("duplicate port %d during re-allocation", p)
+		}
+		seen[p] = true
+	}
+
+	// All reallocated ports should be from the original set.
+	for _, orig := range ports {
+		if !seen[orig] {
+			t.Errorf("original port %d was not recycled", orig)
+		}
 	}
 }

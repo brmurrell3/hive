@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"regexp"
 	"strings"
@@ -219,15 +220,29 @@ func TapDeviceName(agentID string) string {
 // addresses using DNS lookup. IPs and CIDRs are passed through unchanged.
 // Returns an error if any hostname cannot be resolved (NET-H3: fail loudly
 // instead of silently skipping DNS failures).
+//
+// SEC-P3-003: IPv6 addresses and CIDRs are filtered out with a warning because
+// the nftables enforcement rules are IPv4-only. IPv6 entries should be rejected
+// at config validation time, but this serves as a defense-in-depth filter for
+// addresses that arrive via DNS resolution of hostnames.
 func resolveAllowlistHosts(hosts []string) ([]string, error) {
 	var resolved []string
 	for _, host := range hosts {
-		// If it's already a valid IP or CIDR, keep it as-is.
-		if net.ParseIP(host) != nil {
+		// If it's already a valid IP, keep it if IPv4.
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.To4() == nil {
+				slog.Warn("SEC-P3-003: skipping IPv6 allowlist entry (nftables rules are IPv4 only)", "entry", host)
+				continue
+			}
 			resolved = append(resolved, host)
 			continue
 		}
-		if _, _, err := net.ParseCIDR(host); err == nil {
+		// If it's a CIDR, keep it if IPv4.
+		if ip, _, err := net.ParseCIDR(host); err == nil {
+			if ip.To4() == nil {
+				slog.Warn("SEC-P3-003: skipping IPv6 CIDR allowlist entry (nftables rules are IPv4 only)", "entry", host)
+				continue
+			}
 			resolved = append(resolved, host)
 			continue
 		}
@@ -237,6 +252,11 @@ func resolveAllowlistHosts(hosts []string) ([]string, error) {
 			return nil, fmt.Errorf("resolving allowlist hostname %q: %w", host, err)
 		}
 		for _, ip := range ips {
+			parsedIP := net.ParseIP(ip)
+			if parsedIP != nil && parsedIP.To4() == nil {
+				slog.Warn("SEC-P3-003: skipping IPv6 resolved address (nftables rules are IPv4 only)", "hostname", host, "address", ip)
+				continue
+			}
 			resolved = append(resolved, ip)
 		}
 	}
