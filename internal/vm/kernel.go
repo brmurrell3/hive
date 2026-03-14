@@ -249,7 +249,7 @@ func (km *KernelManager) buildDownloadURLs(arch string) (downloadURL, checksumUR
 			return "", "", fmt.Errorf("invalid custom image URL %q: %w", km.imageURL, parseErr)
 		}
 		// Allow file:// for local paths and https:// for remote.
-		if parsed.Scheme != "https" && parsed.Scheme != "file" {
+		if parsed.Scheme != schemeHTTPS && parsed.Scheme != "file" {
 			return "", "", fmt.Errorf("custom image URL must use https:// or file:// scheme, got %q", parsed.Scheme)
 		}
 		// No checksum URL for custom URLs — the operator is responsible for
@@ -288,7 +288,7 @@ func (km *KernelManager) downloadKernel(ctx context.Context, rawURL, destPath st
 
 	// HTTPS download — reuse the same httpClient as ImageManager for
 	// consistent TLS and redirect policies.
-	if parsed.Scheme != "https" {
+	if parsed.Scheme != schemeHTTPS {
 		return fmt.Errorf("refusing non-HTTPS download URL: %s", rawURL)
 	}
 
@@ -401,7 +401,7 @@ func (km *KernelManager) validateKernelChecksum(ctx context.Context, checksumURL
 	if err != nil {
 		return fmt.Errorf("invalid checksum URL %q: %w", checksumURL, err)
 	}
-	if parsed.Scheme != "https" {
+	if parsed.Scheme != schemeHTTPS {
 		return fmt.Errorf("refusing non-HTTPS checksum URL: %s", checksumURL)
 	}
 

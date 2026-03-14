@@ -180,7 +180,10 @@ func run(clusterRoot string, logger *slog.Logger, forceProcessBackend bool, root
 		}
 	}
 
-	if hasCriticalFailure && !forceProcessBackend {
+	// KVM failure is only fatal if we'll actually need KVM: not using
+	// --force-process-backend AND not running with the mock hypervisor.
+	useMockEnv := os.Getenv("HIVE_TEST_FIRECRACKER") == "mock"
+	if hasCriticalFailure && !forceProcessBackend && !useMockEnv && runtime.GOOS == "linux" {
 		return fmt.Errorf("critical preflight check failed: /dev/kvm is not available; " +
 			"Firecracker requires KVM — use --force-process-backend to run without VM support")
 	}

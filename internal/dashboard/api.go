@@ -100,15 +100,15 @@ type LogQuerier interface {
 type Config struct {
 	Store          StoreReader
 	NATSConn       NATSConn
-	Logs           LogQuerier      // optional; if nil, log queries return empty results
+	Logs           LogQuerier // optional; if nil, log queries return empty results
 	Logger         *slog.Logger
-	Addr           string          // e.g. ":8080"
-	CORSOrigin     string          // Allowed CORS origin; defaults to same-origin only (empty string)
-	AllowedOrigins []string        // Allowed WebSocket origins; defaults to dashboard's own address; ["*"] allows all
-	AuthToken      string          // If set, API and WebSocket connections require this token
+	Addr           string           // e.g. ":8080"
+	CORSOrigin     string           // Allowed CORS origin; defaults to same-origin only (empty string)
+	AllowedOrigins []string         // Allowed WebSocket origins; defaults to dashboard's own address; ["*"] allows all
+	AuthToken      string           // If set, API and WebSocket connections require this token
 	Authorizer     *auth.Authorizer // If set, per-user RBAC is enforced; tokens are matched against user token hashes
-	Version        string          // Version string for health endpoint; defaults to "dev"
-	Reconciler     ReadyzChecker   // optional; if set, /readyz includes reconciler health
+	Version        string           // Version string for health endpoint; defaults to "dev"
+	Reconciler     ReadyzChecker    // optional; if set, /readyz includes reconciler health
 }
 
 // UserResponse is the JSON representation of a user in API responses.

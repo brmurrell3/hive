@@ -49,6 +49,9 @@ func (s checkStatus) String() string {
 	}
 }
 
+// osLinux is the Linux operating system identifier used in runtime.GOOS checks.
+const osLinux = "linux"
+
 // doctorMinDiskGB is the minimum free disk space before a warning is issued.
 const doctorMinDiskGB = 10
 
@@ -158,7 +161,7 @@ func checkGo() checkResult {
 
 // checkFirecracker verifies that the firecracker binary is available.
 func checkFirecracker() checkResult {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return checkResult{
 			name:   "firecracker",
 			status: checkSKIP,
@@ -200,7 +203,7 @@ func checkFirecracker() checkResult {
 
 // checkKVM verifies that /dev/kvm is available.
 func checkKVM() checkResult {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return checkResult{
 			name:   "kvm",
 			status: checkSKIP,
@@ -239,7 +242,7 @@ func checkKVM() checkResult {
 
 // checkNftables verifies that the nft binary is available.
 func checkNftables() checkResult {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return checkResult{
 			name:   "nftables",
 			status: checkSKIP,
@@ -340,7 +343,7 @@ func checkRootfs() []checkResult {
 		}
 	}
 
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return []checkResult{{
 			name:   "rootfs",
 			status: checkSKIP,
@@ -387,7 +390,7 @@ func checkKernel() checkResult {
 		}
 	}
 
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return checkResult{
 			name:   "kernel",
 			status: checkSKIP,
@@ -517,7 +520,7 @@ func checkNATSConnectivity() checkResult {
 
 // checkVhostVsock verifies that the vhost_vsock kernel module is loaded.
 func checkVhostVsock() checkResult {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return checkResult{
 			name:   "vhost_vsock",
 			status: checkSKIP,
