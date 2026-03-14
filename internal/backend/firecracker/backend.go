@@ -86,6 +86,15 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	agentID := spec.Metadata.ID
 
 	if err := b.vmMgr.StartAgent(ctx, spec); err != nil {
+		// BM-H2: Clean up any partial state left by a failed StartAgent.
+		// DestroyAgent is idempotent and safe to call even if StartAgent
+		// failed partway through VM provisioning.
+		if destroyErr := b.vmMgr.DestroyAgent(ctx, agentID); destroyErr != nil {
+			b.logger.Warn("failed to clean up after StartAgent failure",
+				"agent_id", agentID,
+				"destroy_error", destroyErr,
+			)
+		}
 		return nil, fmt.Errorf("creating firecracker VM: %w", err)
 	}
 
@@ -111,6 +120,17 @@ func (b *Backend) Stop(ctx context.Context, id string) error {
 }
 
 func (b *Backend) Destroy(ctx context.Context, id string) error {
+	// BM-H3: Check that the instance is tracked before attempting destruction.
+	// This prevents calling vmMgr.DestroyAgent for agents not managed by this
+	// backend, which could produce confusing errors or corrupt other backends.
+	b.mu.RLock()
+	_, exists := b.instances[id]
+	b.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("firecracker instance %q not found", id)
+	}
+
 	err := b.vmMgr.DestroyAgent(ctx, id)
 	if err != nil {
 		// Keep the instance in the map so the caller can retry.

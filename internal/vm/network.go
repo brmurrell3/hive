@@ -17,6 +17,7 @@ import (
 var tapDevicePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
 const egressFull = "full"
+const ingressFull = "full"
 
 // NetworkPolicy describes the network restrictions for an agent.
 type NetworkPolicy struct {
@@ -150,7 +151,7 @@ func GenerateNftables(p NetworkPolicy) (string, error) {
 	)
 
 	switch p.Ingress {
-	case egressFull:
+	case ingressFull:
 		rules = append(rules,
 			fmt.Sprintf("    oifname %q accept", p.TapDevice),
 		)

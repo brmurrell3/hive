@@ -162,18 +162,30 @@ fi
 
 # Configure DNS resolver
 if [ -n "${HIVE_DNS_SERVER:-}" ]; then
-    echo "nameserver $HIVE_DNS_SERVER" > /etc/resolv.conf
+    if echo "$HIVE_DNS_SERVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "nameserver $HIVE_DNS_SERVER" > /etc/resolv.conf
+    else
+        echo "ERROR: invalid DNS server IP: $HIVE_DNS_SERVER" >&2
+    fi
 fi
 
 # Network policy enforcement
 if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
     case "$HIVE_EGRESS_MODE" in
         none)
-            # No network device attached, vsock only - restrict INPUT
+            # No network device attached, vsock only - restrict INPUT and OUTPUT
             echo "Network policy: egress=none (vsock only)"
-            iptables -P INPUT DROP
+            # Add ALLOW rules before setting policies to DROP
             iptables -A INPUT -i lo -j ACCEPT
             iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+            iptables -A OUTPUT -o lo -j ACCEPT
+            iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+            # Allow NATS communication (port 4222) on OUTPUT
+            iptables -A OUTPUT -p tcp --dport 4222 -j ACCEPT
+            # Now set all chain policies to DROP
+            iptables -P INPUT DROP
+            iptables -P FORWARD DROP
+            iptables -P OUTPUT DROP
             ;;
         restricted)
             echo "Network policy: egress=restricted"
@@ -206,7 +218,11 @@ if [ -n "${HIVE_EGRESS_MODE:-}" ]; then
                         [ -z "$domain" ] && continue
                         # Resolve domain and add iptables rules for each IP
                         for ip in $(nslookup "$domain" 2>/dev/null | awk '/^Address: / { print $2 }'); do
-                            iptables -A OUTPUT -d "$ip" -j ACCEPT
+                            if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                                iptables -A OUTPUT -d "$ip" -j ACCEPT
+                            else
+                                echo "WARNING: skipping invalid IP from nslookup: $ip" >&2
+                            fi
                         done
                     done
                 fi
@@ -236,6 +252,28 @@ if [ -n "${HIVE_VOLUMES:-}" ]; then
         device=$(echo "$volspec" | cut -d: -f1)
         mountpoint=$(echo "$volspec" | cut -d: -f2)
         access=$(echo "$volspec" | cut -d: -f3)
+
+        # Reject dangerous guest mount paths to prevent overwriting critical system directories
+        case "$mountpoint" in
+            /|/etc|/bin|/sbin|/usr|/lib|/dev|/proc|/sys|/boot|/run)
+                echo "ERROR: refusing to mount volume to dangerous path: $mountpoint" >&2
+                continue
+                ;;
+            /etc/*|/bin/*|/sbin/*|/usr/*|/lib/*|/dev/*|/proc/*|/sys/*|/boot/*|/run/*)
+                echo "ERROR: refusing to mount volume under dangerous path: $mountpoint" >&2
+                continue
+                ;;
+        esac
+
+        # Validate device name matches expected virtio block device pattern
+        case "$device" in
+            /dev/vd[a-z]) ;;
+            *)
+                echo "ERROR: invalid device name: $device (expected /dev/vd[a-z])" >&2
+                continue
+                ;;
+        esac
+
         mkdir -p "$mountpoint"
         mount_opts="rw"
         if [ "$access" = "ro" ]; then

@@ -114,6 +114,16 @@ func prepareOpenClawWorkspace(clusterRoot, agentID string, spec *types.AgentMani
 		return "", 0, fmt.Errorf("creating openclaw workspace for %q: %w", agentID, err)
 	}
 
+	// BE-H1/BE-C2: Deferred cleanup of workspace directory if any subsequent
+	// step fails. The success flag is set just before the final return so
+	// that early error returns trigger cleanup.
+	success := false
+	defer func() {
+		if !success {
+			os.RemoveAll(workspacePath) //nolint:errcheck // best-effort cleanup on failure path
+		}
+	}()
+
 	// Copy optional agent files from the agent source directory.
 	agentDir := filepath.Join(clusterRoot, "agents", agentID)
 	filesToCopy := []string{"SOUL.md", "USER.md", "IDENTITY.md"}
@@ -151,6 +161,7 @@ func prepareOpenClawWorkspace(clusterRoot, agentID string, spec *types.AgentMani
 		return "", 0, fmt.Errorf("writing openclaw.json for %q: %w", agentID, err)
 	}
 
+	success = true
 	return workspacePath, port, nil
 }
 
@@ -224,6 +235,14 @@ func nextGatewayPort() (int, error) {
 func releaseGatewayPort(port int) {
 	openClawPortAllocator.mu.Lock()
 	defer openClawPortAllocator.mu.Unlock()
+
+	// BE-H2: Check if the port is already in the released slice to prevent
+	// duplicate releases from corrupting the pool.
+	for _, p := range openClawPortAllocator.released {
+		if p == port {
+			return
+		}
+	}
 	openClawPortAllocator.released = append(openClawPortAllocator.released, port)
 }
 
@@ -270,7 +289,7 @@ func copyFile(src, dst string) error {
 // copyDir recursively copies a directory tree from src to dst.
 // BE-C2: Symlink entries are skipped to prevent filesystem escape attacks.
 func copyDir(src, dst string) error {
-	srcInfo, err := os.Stat(src)
+	srcInfo, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}

@@ -437,7 +437,8 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 				return m.failAgent(agentState, fmt.Errorf("marshaling egress allowlist for %s: %w", agentID, jsonErr))
 			}
 			if bytes.ContainsAny(allowlistJSON, "\n\r") {
-				return fmt.Errorf("egress allowlist JSON contains newline characters")
+				os.Remove(rootfsCopy)
+				return m.failAgent(agentState, fmt.Errorf("egress allowlist JSON contains newline characters"))
 			}
 			// Shell-escape single quotes for safe embedding in single-quoted strings.
 			escapedAllowlist := strings.ReplaceAll(string(allowlistJSON), "'", "'\\''")
@@ -461,7 +462,8 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			return m.failAgent(agentState, fmt.Errorf("marshaling capabilities for %s: %w", agentID, jsonErr))
 		}
 		if bytes.ContainsAny(capsJSON, "\n\r") {
-			return fmt.Errorf("capabilities JSON contains newline characters")
+			os.Remove(rootfsCopy)
+			return m.failAgent(agentState, fmt.Errorf("capabilities JSON contains newline characters"))
 		}
 		// Shell-escape single quotes for safe embedding in single-quoted strings.
 		escapedCaps := strings.ReplaceAll(string(capsJSON), "'", "'\\''")
@@ -712,7 +714,9 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 			fmt.Sprintf("127.0.0.1:%d", m.natsPort),
 			m.logger.With("agent_id", agentID),
 		)
-		if err := fwd.Start(context.Background()); err != nil {
+		vsockStartCtx, vsockStartCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer vsockStartCancel()
+		if err := fwd.Start(vsockStartCtx); err != nil {
 			m.logger.Warn("failed to start vsock forwarder, VM will lack NATS connectivity",
 				"agent_id", agentID,
 				"error", err,

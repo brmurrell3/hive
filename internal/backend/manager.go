@@ -111,6 +111,16 @@ func (m *AgentManager) StartAgent(ctx context.Context, spec *types.AgentManifest
 		m.mu.Unlock()
 	}()
 
+	return m.startAgentLocked(ctx, spec)
+}
+
+// startAgentLocked performs the actual create+start sequence. The caller must
+// have already placed agentID in the `creating` map to prevent concurrent
+// StartAgent or RestartAgent calls from racing. This method does NOT manage
+// the creating sentinel — that is the caller's responsibility.
+func (m *AgentManager) startAgentLocked(ctx context.Context, spec *types.AgentManifest) error {
+	agentID := spec.Metadata.ID
+
 	b, err := m.resolveBackend(spec)
 	if err != nil {
 		return fmt.Errorf("resolving backend for agent %s: %w", agentID, err)
@@ -185,13 +195,31 @@ func (m *AgentManager) DestroyAgent(ctx context.Context, agentID string) error {
 // fresh one. It calls Stop/Destroy on the existing backend first, only
 // removing the agent from tracking after Destroy succeeds (BE-H3). If
 // Destroy fails, the tracking entry is kept so the agent can be retried.
+//
+// BM-C3: The agent is added to the `creating` map before releasing the lock,
+// preventing concurrent StartAgent calls from racing with the in-flight
+// restart. The sentinel is removed via defer on all exit paths.
 func (m *AgentManager) RestartAgent(ctx context.Context, spec *types.AgentManifest) error {
 	agentID := spec.Metadata.ID
 	m.logger.Info("restarting agent", "agent_id", agentID)
 
-	m.mu.RLock()
+	// Acquire write lock to atomically check state and place the creating
+	// sentinel, preventing concurrent StartAgent from racing (BM-C3).
+	m.mu.Lock()
+	if _, inProgress := m.creating[agentID]; inProgress {
+		m.mu.Unlock()
+		return fmt.Errorf("agent %s is already being created", agentID)
+	}
+	m.creating[agentID] = struct{}{}
 	backendName, exists := m.agentBackends[agentID]
-	m.mu.RUnlock()
+	m.mu.Unlock()
+
+	// Ensure the creating sentinel is removed on all exit paths.
+	defer func() {
+		m.mu.Lock()
+		delete(m.creating, agentID)
+		m.mu.Unlock()
+	}()
 
 	if exists {
 		b, err := m.registry.Get(backendName)
@@ -219,7 +247,8 @@ func (m *AgentManager) RestartAgent(ctx context.Context, spec *types.AgentManife
 		m.mu.Unlock()
 	}
 
-	return m.StartAgent(ctx, spec)
+	// Use startAgentLocked since we already hold the creating sentinel.
+	return m.startAgentLocked(ctx, spec)
 }
 
 // Status returns the status of an agent.

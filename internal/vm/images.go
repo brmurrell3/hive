@@ -49,7 +49,7 @@ var errChecksumUnavailable = errors.New("checksum file unavailable")
 var variantPattern = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 
 // versionPattern validates version/tag strings before URL interpolation.
-var versionPattern = regexp.MustCompile(`^(latest|v[0-9]+\.[0-9]+\.[0-9]+.*)$`)
+var versionPattern = regexp.MustCompile(`^(latest|v[0-9]+\.[0-9]+\.[0-9]+([-._a-zA-Z0-9]*)?)$`)
 
 // httpClient is used for all image downloads. It rejects HTTP-downgrade
 // redirects (HTTPS -> HTTP) to prevent man-in-the-middle attacks.
@@ -407,6 +407,10 @@ func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePa
 	// Validate hex format.
 	if len(expectedHash) != 64 {
 		return fmt.Errorf("invalid checksum format (expected 64 hex chars, got %d)", len(expectedHash))
+	}
+	// IMG-H2: Validate that the hash is valid hexadecimal.
+	if _, err := hex.DecodeString(expectedHash); err != nil {
+		return fmt.Errorf("invalid checksum hex encoding: %w", err)
 	}
 
 	// Compute SHA-256 of the downloaded file.

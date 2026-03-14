@@ -291,6 +291,28 @@ func TestGenerateNftables_IngressNoneVsRestricted(t *testing.T) {
 	if !strings.Contains(fullRules, `oifname "tap0" accept`) {
 		t.Error("ingress full: expected unconditional accept rule for tap0")
 	}
+
+	// TEST-H2: Assert the semantic difference between "none" and "restricted".
+	// Ingress "none" scopes established/related to NATS port 4222 only,
+	// while "restricted" allows established/related for all traffic.
+	if noneRules == restrictedRules {
+		t.Error("ingress 'none' and 'restricted' should produce different rules")
+	}
+
+	// "none" must contain the NATS-sport-scoped established/related rule.
+	if !strings.Contains(noneRules, `tcp sport 4222 ct state established,related accept`) {
+		t.Error("ingress none: expected NATS-scoped (sport 4222) established/related rule")
+	}
+
+	// "restricted" must NOT contain the sport 4222 scope — it allows all established/related.
+	if strings.Contains(restrictedRules, "sport 4222") {
+		t.Error("ingress restricted: should NOT scope established/related to sport 4222")
+	}
+
+	// "restricted" must have a general established/related accept on oifname.
+	if !strings.Contains(restrictedRules, `oifname "tap0" ct state established,related accept`) {
+		t.Error("ingress restricted: expected general established/related accept on oifname tap0")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +366,170 @@ func TestNftAddrDirective(t *testing.T) {
 		got := nftAddrDirective(tt.addr)
 		if got != tt.want {
 			t.Errorf("nftAddrDirective(%q) = %q, want %q", tt.addr, got, tt.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TEST-C1: resolveAllowlistHosts — IP/CIDR passthrough (no DNS lookup)
+// ---------------------------------------------------------------------------
+
+func TestResolveAllowlistHosts_IPPassthrough(t *testing.T) {
+	// IPv4 addresses should pass through unchanged.
+	hosts := []string{"10.0.0.1", "192.168.1.1", "255.255.255.255"}
+	resolved, err := resolveAllowlistHosts(hosts)
+	if err != nil {
+		t.Fatalf("resolveAllowlistHosts with IPs returned error: %v", err)
+	}
+	if len(resolved) != len(hosts) {
+		t.Fatalf("expected %d resolved hosts, got %d", len(hosts), len(resolved))
+	}
+	for i, h := range hosts {
+		if resolved[i] != h {
+			t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], h)
+		}
+	}
+}
+
+func TestResolveAllowlistHosts_CIDRPassthrough(t *testing.T) {
+	// CIDR ranges should pass through unchanged without DNS lookup.
+	hosts := []string{"10.0.0.0/8", "192.168.1.0/24", "172.16.0.0/12"}
+	resolved, err := resolveAllowlistHosts(hosts)
+	if err != nil {
+		t.Fatalf("resolveAllowlistHosts with CIDRs returned error: %v", err)
+	}
+	if len(resolved) != len(hosts) {
+		t.Fatalf("expected %d resolved hosts, got %d", len(hosts), len(resolved))
+	}
+	for i, h := range hosts {
+		if resolved[i] != h {
+			t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], h)
+		}
+	}
+}
+
+func TestResolveAllowlistHosts_IPv6Passthrough(t *testing.T) {
+	// IPv6 addresses and CIDRs should pass through unchanged.
+	hosts := []string{"::1", "2001:db8::1", "fe80::/10", "fd00::/64"}
+	resolved, err := resolveAllowlistHosts(hosts)
+	if err != nil {
+		t.Fatalf("resolveAllowlistHosts with IPv6 returned error: %v", err)
+	}
+	if len(resolved) != len(hosts) {
+		t.Fatalf("expected %d resolved hosts, got %d", len(hosts), len(resolved))
+	}
+	for i, h := range hosts {
+		if resolved[i] != h {
+			t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], h)
+		}
+	}
+}
+
+func TestResolveAllowlistHosts_MixedIPsAndCIDRs(t *testing.T) {
+	// Mixed list of IPv4 IPs, IPv6 IPs, and CIDRs should all pass through.
+	hosts := []string{"10.0.0.1", "192.168.0.0/16", "::1", "fd00::/64"}
+	resolved, err := resolveAllowlistHosts(hosts)
+	if err != nil {
+		t.Fatalf("resolveAllowlistHosts with mixed list returned error: %v", err)
+	}
+	if len(resolved) != len(hosts) {
+		t.Fatalf("expected %d resolved hosts, got %d", len(hosts), len(resolved))
+	}
+	for i, h := range hosts {
+		if resolved[i] != h {
+			t.Errorf("resolved[%d] = %q, want %q", i, resolved[i], h)
+		}
+	}
+}
+
+func TestResolveAllowlistHosts_EmptyList(t *testing.T) {
+	// Empty input should return nil/empty without error.
+	resolved, err := resolveAllowlistHosts([]string{})
+	if err != nil {
+		t.Fatalf("resolveAllowlistHosts with empty list returned error: %v", err)
+	}
+	if len(resolved) != 0 {
+		t.Errorf("expected empty resolved list, got %v", resolved)
+	}
+}
+
+func TestResolveAllowlistHosts_NilList(t *testing.T) {
+	// Nil input should return nil/empty without error.
+	resolved, err := resolveAllowlistHosts(nil)
+	if err != nil {
+		t.Fatalf("resolveAllowlistHosts with nil list returned error: %v", err)
+	}
+	if len(resolved) != 0 {
+		t.Errorf("expected empty resolved list, got %v", resolved)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TEST-C2: CleanupNftables
+// ---------------------------------------------------------------------------
+
+func TestCleanupNftables_ValidTapDevice(t *testing.T) {
+	cmd, args := CleanupNftables("tap0")
+
+	// Command should be "nft".
+	if cmd != "nft" {
+		t.Errorf("CleanupNftables command = %q, want %q", cmd, "nft")
+	}
+
+	// Args should delete the inet table named hive_<tapDevice>.
+	expectedArgs := []string{"delete", "table", "inet", "hive_tap0"}
+	if len(args) != len(expectedArgs) {
+		t.Fatalf("CleanupNftables args length = %d, want %d", len(args), len(expectedArgs))
+	}
+	for i, a := range expectedArgs {
+		if args[i] != a {
+			t.Errorf("CleanupNftables args[%d] = %q, want %q", i, args[i], a)
+		}
+	}
+}
+
+func TestCleanupNftables_HyphenInDeviceName(t *testing.T) {
+	// Hyphens in tap device names should be replaced with underscores
+	// in the table name (to match GenerateNftables table naming).
+	cmd, args := CleanupNftables("tap-device-1")
+
+	if cmd != "nft" {
+		t.Errorf("CleanupNftables command = %q, want %q", cmd, "nft")
+	}
+
+	expectedTable := "hive_tap_device_1"
+	if len(args) < 4 {
+		t.Fatalf("CleanupNftables args too short: %v", args)
+	}
+	if args[3] != expectedTable {
+		t.Errorf("CleanupNftables table name = %q, want %q", args[3], expectedTable)
+	}
+}
+
+func TestCleanupNftables_EmptyDeviceName(t *testing.T) {
+	// Empty device name should produce an empty table suffix but still
+	// return the "nft" command structure (caller is responsible for
+	// validation before calling CleanupNftables).
+	cmd, args := CleanupNftables("")
+
+	if cmd != "nft" {
+		t.Errorf("CleanupNftables command = %q, want %q", cmd, "nft")
+	}
+
+	// Table name with empty device = "hive_"
+	expectedTable := "hive_"
+	if len(args) < 4 {
+		t.Fatalf("CleanupNftables args too short: %v", args)
+	}
+	if args[3] != expectedTable {
+		t.Errorf("CleanupNftables table name = %q, want %q", args[3], expectedTable)
+	}
+
+	// Full args should still be well-formed.
+	expectedArgs := []string{"delete", "table", "inet", "hive_"}
+	for i, a := range expectedArgs {
+		if args[i] != a {
+			t.Errorf("CleanupNftables args[%d] = %q, want %q", i, args[i], a)
 		}
 	}
 }

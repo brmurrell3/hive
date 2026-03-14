@@ -298,6 +298,11 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	}
 
 	b.mu.Lock()
+	if _, exists := b.instances[agentID]; exists {
+		b.mu.Unlock()
+		cancel()
+		return nil, fmt.Errorf("agent %q already exists; concurrent Create() detected", agentID)
+	}
 	b.instances[agentID] = inst
 	b.mu.Unlock()
 
@@ -428,17 +433,21 @@ func (b *Backend) Destroy(ctx context.Context, id string) error {
 	}
 
 	b.mu.Lock()
-	inst := b.instances[id]
+	inst, exists := b.instances[id]
+	if !exists {
+		b.mu.Unlock()
+		return fmt.Errorf("instance %q not found; nothing to destroy", id)
+	}
 	delete(b.instances, id)
 	b.mu.Unlock()
 
 	// BE-C1: Release the OpenClaw gateway port back to the pool.
-	if inst != nil && inst.gatewayPort > 0 {
+	if inst.gatewayPort > 0 {
 		releaseGatewayPort(inst.gatewayPort)
 	}
 
 	// Clean up the OpenClaw workspace directory if one was created (BE-H5).
-	if inst != nil && inst.workspacePath != "" {
+	if inst.workspacePath != "" {
 		if err := os.RemoveAll(inst.workspacePath); err != nil {
 			b.logger.Warn("failed to remove workspace directory",
 				"agent_id", id, "path", inst.workspacePath, "error", err)

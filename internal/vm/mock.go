@@ -87,8 +87,14 @@ func (m *MockHypervisor) StopVM(socketPath string, pid int) error {
 		return m.StopErr
 	}
 
-	if _, exists := m.running[socketPath]; !exists {
+	storedPID, exists := m.running[socketPath]
+	if !exists {
 		return fmt.Errorf("mock: no VM at socket %s", socketPath)
+	}
+
+	// FC-C3: Verify PID matches to prevent stopping the wrong process.
+	if storedPID != pid && storedPID != -pid {
+		return fmt.Errorf("mock: PID mismatch for socket %s: stored %d, provided %d", socketPath, storedPID, pid)
 	}
 
 	delete(m.running, socketPath)
@@ -102,6 +108,16 @@ func (m *MockHypervisor) DestroyVM(socketPath string, pid int) error {
 
 	if m.DestroyErr != nil {
 		return m.DestroyErr
+	}
+
+	// FC-C3: Check existence and verify PID matches before destroying.
+	storedPID, exists := m.running[socketPath]
+	if !exists {
+		return fmt.Errorf("mock: no VM at socket %s", socketPath)
+	}
+
+	if storedPID != pid && storedPID != -pid {
+		return fmt.Errorf("mock: PID mismatch for socket %s: stored %d, provided %d", socketPath, storedPID, pid)
 	}
 
 	delete(m.running, socketPath)

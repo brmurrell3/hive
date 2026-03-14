@@ -292,7 +292,7 @@ func (f *FirecrackerHypervisor) CreateVM(ctx context.Context, cfg VMConfig) (int
 	cleanupNeeded := true
 	defer func() {
 		if cleanupNeeded {
-			cleanupSocket(cfg.SocketPath)
+			f.cleanupSocket(cfg.SocketPath)
 		}
 	}()
 
@@ -311,7 +311,7 @@ func (f *FirecrackerHypervisor) CreateVM(ctx context.Context, cfg VMConfig) (int
 	}
 
 	// Wait for the API socket to appear.
-	if err := waitForSocket(cfg.SocketPath, 5*time.Second); err != nil {
+	if err := waitForSocket(ctx, cfg.SocketPath, 5*time.Second); err != nil {
 		killAndReap()
 		return 0, fmt.Errorf("waiting for API socket: %w", err)
 	}
@@ -472,7 +472,7 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 			"pid", pid,
 			"socket", socketPath,
 		)
-		cleanupSocket(socketPath)
+		f.cleanupSocket(socketPath)
 		return nil
 	}
 
@@ -482,7 +482,7 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 		select {
 		case <-fp.done:
 			f.logger.Info("VM process already exited before SIGTERM", "pid", pid)
-			cleanupSocket(socketPath)
+			f.cleanupSocket(socketPath)
 			return nil
 		default:
 		}
@@ -501,7 +501,7 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 			if fp != nil {
 				waitForReap(fp, 5*time.Second)
 			}
-			cleanupSocket(socketPath)
+			f.cleanupSocket(socketPath)
 			return nil
 		}
 		return fmt.Errorf("sending SIGTERM to PID %d: %w", pid, err)
@@ -526,7 +526,10 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 	} else {
 		// No tracked process (e.g. hived restarted and lost the cmd handle).
 		// Fall back to polling-based wait, accepting that we cannot call Wait().
-		exited := waitForProcessExit(pid, 5*time.Second)
+		// Use context.Background() for the cleanup path because the caller's
+		// context may already be cancelled during shutdown, and we still need
+		// to wait for the process to exit before cleaning up.
+		exited := waitForProcessExit(context.Background(), pid, 5*time.Second)
 		if !exited {
 			f.logger.Warn("VM process did not exit after SIGTERM, sending SIGKILL",
 				"pid", pid,
@@ -534,11 +537,11 @@ func (f *FirecrackerHypervisor) StopVM(socketPath string, pid int) error {
 			if err := proc.Signal(syscall.SIGKILL); err != nil && !isProcessGone(err) {
 				return fmt.Errorf("sending SIGKILL to PID %d: %w", pid, err)
 			}
-			waitForProcessExit(pid, 2*time.Second)
+			waitForProcessExit(context.Background(), pid, 2*time.Second)
 		}
 	}
 
-	cleanupSocket(socketPath)
+	f.cleanupSocket(socketPath)
 	f.logger.Info("Firecracker VM stopped", "socket", socketPath, "pid", pid)
 	return nil
 }
@@ -585,12 +588,14 @@ func (f *FirecrackerHypervisor) DestroyVM(socketPath string, pid int) error {
 			} else {
 				// FC-H4: When fp is nil, wait for process exit after SIGKILL
 				// to avoid leaving zombies or proceeding before cleanup.
-				waitForProcessExit(pid, 5*time.Second)
+				// Use context.Background() because destroy is a force-kill
+				// cleanup path and the caller's context may be cancelled.
+				waitForProcessExit(context.Background(), pid, 5*time.Second)
 			}
 		}
 	}
 
-	cleanupSocket(socketPath)
+	f.cleanupSocket(socketPath)
 	return nil
 }
 
@@ -630,6 +635,8 @@ func (f *FirecrackerHypervisor) IsRunning(pid int) bool {
 }
 
 // socketHTTPClient creates an HTTP client that communicates over a Unix socket.
+// FC-H2: MaxIdleConnsPerHost and MaxConnsPerHost are set to bound the transport
+// pool, preventing unbounded connection accumulation to the local socket.
 func socketHTTPClient(socketPath string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
@@ -637,6 +644,8 @@ func socketHTTPClient(socketPath string) *http.Client {
 				var d net.Dialer
 				return d.DialContext(ctx, "unix", socketPath)
 			},
+			MaxIdleConnsPerHost: 1,
+			MaxConnsPerHost:     2,
 		},
 		Timeout: 10 * time.Second,
 	}
@@ -674,23 +683,30 @@ func apiPut(ctx context.Context, client *http.Client, socketPath string, path st
 }
 
 // waitForSocket polls for the existence of a Unix socket file up to the
-// given timeout.
-func waitForSocket(socketPath string, timeout time.Duration) error {
+// given timeout. The context is checked before each sleep so that callers
+// can cancel the wait early.
+func waitForSocket(ctx context.Context, socketPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(socketPath); err == nil {
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while waiting for socket %s: %w", socketPath, ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("socket %s did not appear within %s", socketPath, timeout)
 }
 
 // waitForProcessExit polls for process exit up to the given timeout.
-// Returns true if the process exited, false if the timeout was reached.
+// Returns true if the process exited, false if the timeout was reached or the
+// context was cancelled. The context is checked before each sleep so that
+// callers can cancel the wait early.
 // FC-C2: EPERM is treated as "still alive" (consistent with IsRunning),
 // since it means the process exists but belongs to another user.
-func waitForProcessExit(pid int, timeout time.Duration) bool {
+func waitForProcessExit(ctx context.Context, pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		proc, err := os.FindProcess(pid)
@@ -701,12 +717,20 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 			// FC-C2: EPERM means the process exists but we can't signal it.
 			// Continue polling instead of treating it as exited.
 			if errors.Is(err, syscall.EPERM) {
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return false
+				case <-time.After(100 * time.Millisecond):
+				}
 				continue
 			}
 			return true
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	return false
 }
@@ -734,8 +758,13 @@ func deterministicMAC(identifier string) string {
 	return fmt.Sprintf("06:%02x:%02x:%02x:%02x:%02x", h[0], h[1], h[2], h[3], h[4])
 }
 
-// cleanupSocket removes the API socket and vsock files.
-func cleanupSocket(socketPath string) {
+// cleanupSocket removes the API socket and vsock files. It acquires f.mu to
+// synchronize with concurrent operations that may be modifying the process map
+// or accessing the socket path.
+func (f *FirecrackerHypervisor) cleanupSocket(socketPath string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	os.Remove(socketPath)
 	os.Remove(socketPath + ".vsock")
 	// Clean up port-specific vsock UDS files (e.g., firecracker.sock.vsock_4222)
@@ -743,13 +772,13 @@ func cleanupSocket(socketPath string) {
 	expectedPrefix := socketPath + ".vsock_"
 	matches, globErr := filepath.Glob(socketPath + ".vsock_*")
 	if globErr != nil {
-		slog.Warn("filepath.Glob failed during socket cleanup", "pattern", socketPath+".vsock_*", "error", globErr)
+		f.logger.Warn("filepath.Glob failed during socket cleanup", "pattern", socketPath+".vsock_*", "error", globErr)
 	}
 	for _, m := range matches {
 		// FC-H5: Verify each match starts with the expected prefix to
 		// prevent removing unintended files if the glob pattern is abused.
 		if !strings.HasPrefix(m, expectedPrefix) {
-			slog.Warn("skipping unexpected glob match during socket cleanup", "match", m, "expected_prefix", expectedPrefix)
+			f.logger.Warn("skipping unexpected glob match during socket cleanup", "match", m, "expected_prefix", expectedPrefix)
 			continue
 		}
 		os.Remove(m)
