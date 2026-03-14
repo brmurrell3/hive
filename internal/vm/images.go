@@ -319,7 +319,7 @@ func (m *ImageManager) downloadFile(ctx context.Context, rawURL, destPath string
 		probe := make([]byte, 1)
 		if n, probeErr := resp.Body.Read(probe); n > 0 {
 			return fmt.Errorf("download of %s truncated: data exceeds maximum size (%d bytes)", rawURL, maxImageDownloadSize)
-		} else if probeErr != nil && probeErr != io.EOF {
+		} else if probeErr != nil && !errors.Is(probeErr, io.EOF) {
 			return fmt.Errorf("probing for truncated download of %s: %w", rawURL, probeErr)
 		}
 	}
@@ -380,13 +380,13 @@ func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePa
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
 	if err != nil {
-		return fmt.Errorf("%w: creating checksum request: %v", errChecksumUnavailable, err)
+		return fmt.Errorf("%w: creating checksum request: %w", errChecksumUnavailable, err)
 	}
 
 	// CRITICAL-2: Use httpClient for checksum downloads too.
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: fetching checksum: %v", errChecksumUnavailable, err)
+		return fmt.Errorf("%w: fetching checksum: %w", errChecksumUnavailable, err)
 	}
 	defer resp.Body.Close()
 
@@ -398,7 +398,7 @@ func (m *ImageManager) validateChecksum(ctx context.Context, checksumURL, filePa
 	// Limit to 1 KB to prevent abuse.
 	checksumData, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	if err != nil {
-		return fmt.Errorf("%w: reading checksum: %v", errChecksumUnavailable, err)
+		return fmt.Errorf("%w: reading checksum: %w", errChecksumUnavailable, err)
 	}
 
 	// Parse the expected hash from the checksum file content.
@@ -530,7 +530,7 @@ func (m *ImageManager) decompressGzip(ctx context.Context, src, dest string) err
 	if n, probeErr := ctxProbe.Read(probe); n > 0 {
 		out.Close()
 		return fmt.Errorf("decompressed data exceeds maximum size (%d bytes): possible zip bomb", maxImageDownloadSize)
-	} else if probeErr != nil && probeErr != io.EOF {
+	} else if probeErr != nil && !errors.Is(probeErr, io.EOF) {
 		// Read error that isn't EOF — could indicate corruption.
 		out.Close()
 		return fmt.Errorf("checking for truncated decompression: %w", probeErr)

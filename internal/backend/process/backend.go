@@ -100,7 +100,7 @@ type processInstance struct {
 	stderr        *safeBuf
 	cancel        context.CancelFunc
 	done          chan struct{}
-	closeOnce     sync.Once // BE-H2: prevents double-close of done channel
+	closeOnce     sync.Once  // BE-H2: prevents double-close of done channel
 	mu            sync.Mutex // guards started and stopped flags
 	started       bool       // BE-H8: prevents double-Start
 	stopped       bool       // BE-H7: prevents Start after Stop
@@ -215,7 +215,7 @@ func (b *Backend) Create(ctx context.Context, spec *types.AgentManifest) (backen
 	// Build environment from a minimal allow-list of parent variables
 	// instead of inheriting the full parent environment, which could
 	// leak secrets (BE-H2).
-	var env []string
+	env := make([]string, 0, 16)
 	for _, key := range []string{"PATH", "HOME", "USER", "TMPDIR", "LANG", "TERM"} {
 		if v := os.Getenv(key); v != "" {
 			env = append(env, fmt.Sprintf("%s=%s", key, v))

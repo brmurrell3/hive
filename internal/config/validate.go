@@ -19,6 +19,7 @@ import (
 const (
 	apiVersionV1     = "hive/v1"
 	restartOnFailure = "on-failure"
+	backendProcess   = "process"
 )
 
 // ValidationError collects multiple validation errors.
@@ -436,7 +437,7 @@ func validateAgentMetadata(ve *ValidationError, prefix string, agent *types.Agen
 func validateAgentRuntime(ve *ValidationError, prefix string, agent *types.AgentManifest, cluster *types.ClusterConfig) {
 	// Validate runtime.type is required
 	validRuntimeTypes := map[string]bool{
-		"openclaw": true, "custom": true, "process": true,
+		"openclaw": true, "custom": true, backendProcess: true,
 	}
 	if agent.Spec.Runtime.Type == "" {
 		ve.addf("%s: spec.runtime.type is required", prefix)
@@ -446,14 +447,14 @@ func validateAgentRuntime(ve *ValidationError, prefix string, agent *types.Agent
 
 	// Validate runtime.backend
 	if agent.Spec.Runtime.Backend != "" {
-		validBackends := map[string]bool{"firecracker": true, "process": true}
+		validBackends := map[string]bool{"firecracker": true, backendProcess: true}
 		if !validBackends[agent.Spec.Runtime.Backend] {
 			ve.addf("%s: spec.runtime.backend must be one of [firecracker, process], got %q", prefix, agent.Spec.Runtime.Backend)
 		}
 	}
 
 	// Validate runtime.command is required for process and custom types
-	if agent.Spec.Runtime.Type == "process" || agent.Spec.Runtime.Type == "custom" {
+	if agent.Spec.Runtime.Type == backendProcess || agent.Spec.Runtime.Type == "custom" {
 		if agent.Spec.Runtime.Command == "" {
 			ve.addf("%s: spec.runtime.command is required when runtime.type is %q", prefix, agent.Spec.Runtime.Type)
 		}
@@ -490,7 +491,7 @@ func validateAgentRuntime(ve *ValidationError, prefix string, agent *types.Agent
 	if agent.Spec.Runtime.Backend == "firecracker" && agent.Spec.Tier != "" && agent.Spec.Tier != "vm" {
 		ve.addf("%s: spec.runtime.backend \"firecracker\" requires tier \"vm\", got %q", prefix, agent.Spec.Tier)
 	}
-	if agent.Spec.Runtime.Backend == "process" && agent.Spec.Tier == "vm" {
+	if agent.Spec.Runtime.Backend == backendProcess && agent.Spec.Tier == "vm" {
 		ve.addf("%s: spec.runtime.backend \"process\" is incompatible with tier \"vm\"", prefix)
 	}
 
@@ -760,22 +761,21 @@ func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentM
 				sv, svExists := svByName[vol.Name]
 				if !svExists {
 					ve.addf("%s: volume %q references nonexistent shared_volume in team %q", prefix, vol.Name, agent.Metadata.Team)
-				} else {
+				} else if sv.HostPath == "" {
 					// Validate the team shared_volume has a hostPath.
-					if sv.HostPath == "" {
-						ve.addf("%s: volume %q references team shared_volume %q which has no hostPath", prefix, vol.Name, sv.Name)
-					}
+					ve.addf("%s: volume %q references team shared_volume %q which has no hostPath", prefix, vol.Name, sv.Name)
 				}
 				// MountPath must be an absolute path with safe characters only.
-				if vol.MountPath == "" {
+				switch {
+				case vol.MountPath == "":
 					ve.addf("%s: volume %q mountPath is required", prefix, vol.Name)
-				} else if !strings.HasPrefix(vol.MountPath, "/") {
+				case !strings.HasPrefix(vol.MountPath, "/"):
 					ve.addf("%s: volume %q mountPath must be an absolute path, got %q", prefix, vol.Name, vol.MountPath)
-				} else if strings.Contains(vol.MountPath, "..") {
+				case strings.Contains(vol.MountPath, ".."):
 					ve.addf("%s: volume %q mountPath %q contains path traversal (..)", prefix, vol.Name, vol.MountPath)
-				} else if !validMountPathRegex.MatchString(vol.MountPath) {
+				case !validMountPathRegex.MatchString(vol.MountPath):
 					ve.addf("%s: volume %q mountPath %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, vol.Name, vol.MountPath)
-				} else {
+				default:
 					// Use prefix match for dangerous guest paths (e.g. /etc/foo is also dangerous).
 					cleanMount := filepath.Clean(vol.MountPath)
 					for dp := range dangerousGuestPaths {
@@ -813,13 +813,14 @@ func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentM
 				ve.addf("%s: duplicate mount name %q", prefix, m.Name)
 			}
 			mountNames[m.Name] = true
-			if m.Host == "" {
+			switch {
+			case m.Host == "":
 				ve.addf("%s: mount %q host path is required", prefix, m.Name)
-			} else if !strings.HasPrefix(m.Host, "/") {
+			case !strings.HasPrefix(m.Host, "/"):
 				ve.addf("%s: mount %q host path must be an absolute path, got %q", prefix, m.Name, m.Host)
-			} else if strings.Contains(m.Host, "..") {
+			case strings.Contains(m.Host, ".."):
 				ve.addf("%s: mount %q host path %q contains path traversal (..)", prefix, m.Name, m.Host)
-			} else {
+			default:
 				// Validate character set (VAL-C2).
 				if !validMountPathRegex.MatchString(m.Host) {
 					ve.addf("%s: mount %q host path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Host)
@@ -833,11 +834,12 @@ func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentM
 					}
 				}
 			}
-			if m.Guest == "" {
+			switch {
+			case m.Guest == "":
 				ve.addf("%s: mount %q guest path is required", prefix, m.Name)
-			} else if !strings.HasPrefix(m.Guest, "/") {
+			case !strings.HasPrefix(m.Guest, "/"):
 				ve.addf("%s: mount %q guest path must be an absolute path, got %q", prefix, m.Name, m.Guest)
-			} else {
+			default:
 				// Validate character set (VAL-C2).
 				if !validMountPathRegex.MatchString(m.Guest) {
 					ve.addf("%s: mount %q guest path %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, m.Name, m.Guest)
@@ -873,13 +875,14 @@ func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentM
 		for i := 0; i < len(guestPaths); i++ {
 			for j := i + 1; j < len(guestPaths); j++ {
 				a, b := guestPaths[i], guestPaths[j]
-				if a.cleanPath == b.cleanPath {
+				switch {
+				case a.cleanPath == b.cleanPath:
 					// Exact duplicates are already caught by the rw check above;
 					// report here for any mode combination.
 					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
-				} else if strings.HasPrefix(b.cleanPath, a.cleanPath+"/") {
+				case strings.HasPrefix(b.cleanPath, a.cleanPath+"/"):
 					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, b.cleanPath, b.name, a.cleanPath, a.name)
-				} else if strings.HasPrefix(a.cleanPath, b.cleanPath+"/") {
+				case strings.HasPrefix(a.cleanPath, b.cleanPath+"/"):
 					ve.addf("%s: mount path %q (mount %q) overlaps with %q (mount %q)", prefix, a.cleanPath, a.name, b.cleanPath, b.name)
 				}
 			}
@@ -894,11 +897,12 @@ func validateAgentMounts(ve *ValidationError, prefix string, agent *types.AgentM
 					continue
 				}
 				cleanMountGuest := filepath.Clean(m.Guest)
-				if vm.cleanPath == cleanMountGuest {
+				switch {
+				case vm.cleanPath == cleanMountGuest:
 					ve.addf("%s: volume %q mountPath %q conflicts with mount %q guest path %q", prefix, vm.name, vm.cleanPath, m.Name, cleanMountGuest)
-				} else if strings.HasPrefix(cleanMountGuest, vm.cleanPath+"/") {
+				case strings.HasPrefix(cleanMountGuest, vm.cleanPath+"/"):
 					ve.addf("%s: mount %q guest path %q overlaps with volume %q mountPath %q", prefix, m.Name, cleanMountGuest, vm.name, vm.cleanPath)
-				} else if strings.HasPrefix(vm.cleanPath, cleanMountGuest+"/") {
+				case strings.HasPrefix(vm.cleanPath, cleanMountGuest+"/"):
 					ve.addf("%s: volume %q mountPath %q overlaps with mount %q guest path %q", prefix, vm.name, vm.cleanPath, m.Name, cleanMountGuest)
 				}
 			}
@@ -1078,13 +1082,14 @@ func validateTeam(ve *ValidationError, id string, team *types.TeamManifest, agen
 		volumeNames[vol.Name] = true
 
 		// HostPath is required for shared volumes.
-		if vol.HostPath == "" {
+		switch {
+		case vol.HostPath == "":
 			ve.addf("%s: shared_volume %q hostPath is required", prefix, vol.Name)
-		} else if !strings.HasPrefix(vol.HostPath, "/") {
+		case !strings.HasPrefix(vol.HostPath, "/"):
 			ve.addf("%s: shared_volume %q hostPath must be an absolute path, got %q", prefix, vol.Name, vol.HostPath)
-		} else if strings.Contains(vol.HostPath, "..") {
+		case strings.Contains(vol.HostPath, ".."):
 			ve.addf("%s: shared_volume %q hostPath %q contains path traversal (..)", prefix, vol.Name, vol.HostPath)
-		} else {
+		default:
 			// Validate hostPath character set to prevent injection attacks (VAL-C1).
 			if !validMountPathRegex.MatchString(vol.HostPath) {
 				ve.addf("%s: shared_volume %q hostPath %q contains invalid characters (only [a-zA-Z0-9/_.-] allowed)", prefix, vol.Name, vol.HostPath)

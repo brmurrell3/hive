@@ -401,10 +401,8 @@ metadata:
   team: default
 spec:
   runtime:
-    type: openclaw
-    model:
-      provider: anthropic
-      name: claude-sonnet-4-5
+    type: command
+    command: "sleep 3600"
   capabilities:
     - name: answer-questions
       description: Answers general knowledge questions

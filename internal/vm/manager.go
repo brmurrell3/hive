@@ -64,7 +64,7 @@ type VMConfig struct {
 	KernelPath     string
 	MemoryMB       int
 	VCPUs          int
-	DiskMB         int            // disk size in megabytes for the agent drive image
+	DiskMB         int // disk size in megabytes for the agent drive image
 	CID            uint32
 	AgentDrivePath string         // path to ext4 disk image for agent files
 	NetworkPolicy  *NetworkPolicy // nil means egress: full (default)
@@ -473,7 +473,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		confContent += fmt.Sprintf("HIVE_EGRESS_MODE='%s'\n", escapedEgressMode)
 
 		// Pass allowlist as JSON array when egress is restricted.
-		if egressMode == "restricted" && len(agent.Spec.Network.EgressAllowlist) > 0 {
+		if egressMode == egressRestricted && len(agent.Spec.Network.EgressAllowlist) > 0 {
 			allowlistJSON, jsonErr := json.Marshal(agent.Spec.Network.EgressAllowlist)
 			if jsonErr != nil {
 				os.Remove(rootfsCopy)
@@ -492,7 +492,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 		// the gateway (host side of the TAP interface at 172.16.0.1) so that
 		// /etc/resolv.conf can be configured by the init script. Without this,
 		// domain-based allowlist entries cannot be resolved inside the guest.
-		if egressMode == "restricted" || egressMode == "none" {
+		if egressMode == egressRestricted || egressMode == "none" {
 			confContent += "HIVE_DNS_SERVER='172.16.0.1'\n"
 		}
 	}
@@ -710,7 +710,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 
 	if err := state.CheckTransition(agentState.Status, state.AgentStatusStarting); err != nil {
 		// VM process is spawned — must destroy it to avoid orphan.
-		m.hypervisor.DestroyVM(socketPath, vmPID)
+		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
 		m.stopForwarder(agentID)
 		for _, imgPath := range volumeImgPaths {
 			os.Remove(imgPath)
@@ -730,7 +730,7 @@ func (m *Manager) StartAgent(ctx context.Context, agent *types.AgentManifest) er
 	agentState.LastTransition = time.Now()
 	if err := m.store.SetAgent(agentState); err != nil {
 		// VM process is spawned — must destroy it to avoid orphan.
-		m.hypervisor.DestroyVM(socketPath, vmPID)
+		_ = m.hypervisor.DestroyVM(socketPath, vmPID)
 		m.stopForwarder(agentID)
 		for _, imgPath := range volumeImgPaths {
 			os.Remove(imgPath)
@@ -954,7 +954,7 @@ func (m *Manager) StopAgent(ctx context.Context, agentID string) error {
 	m.stopForwarder(agentID)
 
 	if err := m.hypervisor.StopVM(agentState.VMSocketPath, agentState.VMPID); err != nil {
-		m.failAgent(agentState, fmt.Errorf("stopping VM for agent %s: %w", agentID, err))
+		_ = m.failAgent(agentState, fmt.Errorf("stopping VM for agent %s: %w", agentID, err))
 		// StopVM failed; failAgent marks the agent as FAILED but doesn't release
 		// resources. Capture and release the agent's memory/vCPU/CID allocations
 		// to prevent resource leaks.

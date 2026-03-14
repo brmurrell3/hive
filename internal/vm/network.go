@@ -19,6 +19,7 @@ var tapDevicePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
 const egressFull = "full"
 const ingressFull = "full"
+const egressRestricted = "restricted"
 
 // NetworkPolicy describes the network restrictions for an agent.
 type NetworkPolicy struct {
@@ -68,7 +69,7 @@ func GenerateNftables(p NetworkPolicy) (string, error) {
 		rules = append(rules,
 			fmt.Sprintf("    iifname %q accept", p.TapDevice),
 		)
-	case "restricted":
+	case egressRestricted:
 		// Allow DNS scoped to the gateway IP (host-side of TAP) to prevent
 		// DNS traffic from reaching arbitrary destinations. If no gateway IP
 		// is configured, fall back to unscoped rules for backward compatibility.
@@ -156,7 +157,7 @@ func GenerateNftables(p NetworkPolicy) (string, error) {
 		rules = append(rules,
 			fmt.Sprintf("    oifname %q accept", p.TapDevice),
 		)
-	case "restricted", "":
+	case egressRestricted, "":
 		// Only allow established/related connections (replies to outbound).
 		rules = append(rules,
 			fmt.Sprintf("    oifname %q ct state established,related accept", p.TapDevice),

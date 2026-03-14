@@ -24,9 +24,9 @@ type AgentManager struct {
 	defaultBackend string
 	logger         *slog.Logger
 	mu             sync.RWMutex
-	agentBackends  map[string]string      // agentID -> backend name
-	creating       map[string]struct{}    // agentIDs currently in the Create/Start pipeline (TOCTOU guard)
-	forceProcess   bool                   // when true, always use "process" backend regardless of manifest
+	agentBackends  map[string]string   // agentID -> backend name
+	creating       map[string]struct{} // agentIDs currently in the Create/Start pipeline (TOCTOU guard)
+	forceProcess   bool                // when true, always use "process" backend regardless of manifest
 }
 
 // NewAgentManager creates a new AgentManager with the given backend registry.

@@ -277,7 +277,7 @@ func ParseAgent(data []byte) (*types.AgentManifest, error) {
 
 	// Map tier to runtime backend when backend is not explicitly set.
 	if agent.Spec.Runtime.Backend == "" && agent.Spec.Tier == "native" {
-		agent.Spec.Runtime.Backend = "process"
+		agent.Spec.Runtime.Backend = backendProcess
 	}
 	agent.Spec.Capabilities = raw.Spec.Capabilities
 	agent.Spec.Network = raw.Spec.Network
