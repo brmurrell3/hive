@@ -1,6 +1,6 @@
-# Hive API Reference
+# Hive API & Schema Reference
 
-Comprehensive reference for the sidecar HTTP API, NATS subject hierarchy, dashboard REST API, and SDKs.
+Comprehensive reference for the sidecar HTTP API, NATS subjects, dashboard REST API, SDKs, and YAML manifest schemas.
 
 ---
 
@@ -484,7 +484,7 @@ All NATS messages use a unified JSON envelope:
 - Maximum subject length: validated per component
 - Timestamps must not be more than 5 minutes in the future
 
-See [Communication](communication.md) for the full protocol specification including error codes, retry behavior, and circuit breaker details.
+See [Architecture](architecture.md#communication-protocol) for error codes, retry behavior, and circuit breaker details.
 
 ---
 
@@ -578,65 +578,142 @@ Features:
 
 ---
 
-## CLI Reference Summary
+## CLI Reference
 
-Full command reference: [CLI Reference](cli-reference.md)
+See [CLI Reference](cli-reference.md) for all hivectl commands, flags, and examples.
 
-### Cluster commands
+---
 
-| Command | Description |
-|---------|-------------|
-| `hivectl init [--template NAME] PATH` | Scaffold a new cluster |
-| `hivectl validate --cluster-root PATH` | Validate all manifests |
-| `hivectl status --cluster-root PATH` | Cluster overview |
-| `hivectl dev --cluster-root PATH` | Start local dev environment |
-| `hivectl trigger --cluster-root PATH --team TEAM --payload JSON` | Trigger a team pipeline |
+## YAML Manifest Schemas
 
-### Agent commands
+### Cluster Config (cluster.yaml)
 
-| Command | Description |
-|---------|-------------|
-| `hivectl agents list` | List all agents |
-| `hivectl agents status AGENT_ID` | Agent detail |
-| `hivectl agents start AGENT_ID` | Start an agent |
-| `hivectl agents stop AGENT_ID` | Stop an agent |
-| `hivectl agents restart AGENT_ID` | Restart an agent |
-| `hivectl agents destroy AGENT_ID` | Destroy an agent |
-| `hivectl agents logs AGENT_ID [--follow] [--tail N]` | Agent logs |
+```yaml
+apiVersion: hive/v1
+kind: Cluster
+metadata:
+  name: string  # REQUIRED
+spec:
+  nats:
+    port: int              # default 4222
+    clusterPort: int       # default 6222
+    jetstream:
+      enabled: bool        # default true
+      maxMemory: string    # default "1GB"
+      maxStorage: string   # default "10GB"
+  defaults:
+    resources:
+      memory: string       # e.g. "512Mi"
+      vcpus: int           # VM tier only
+    health:
+      interval: duration   # default "30s"
+      timeout: duration    # default "5s"
+      maxFailures: int     # default 3
+    restart:
+      policy: enum(always|on-failure|never)  # default "on-failure"
+      maxRestarts: int     # default 5
+      backoff: duration    # default "10s"
+  secrets: map[string]string
+  models:
+    - name: string         # MUST NOT shadow provider names
+      provider: string     # "anthropic", "ollama", "openai", etc.
+      endpoint: string     # for local models
+  users:
+    - id: string
+      role: enum(operator|viewer)
+      token: string        # SHA-256 hash
+      teams: list[string]  # "all" = all teams
+```
 
-### Token commands
+### Agent Manifest (agents/AGENT_ID/manifest.yaml)
 
-| Command | Description |
-|---------|-------------|
-| `hivectl tokens create [--ttl DURATION]` | Generate join token |
-| `hivectl tokens list` | List active tokens |
-| `hivectl tokens revoke PREFIX` | Revoke a token |
+```yaml
+apiVersion: hive/v1
+kind: Agent
+metadata:
+  id: string               # [a-z0-9][a-z0-9-]{0,62}, globally unique
+  team: string             # references team ID
+spec:
+  tier: enum(vm|native)    # auto-inferred if omitted
+  resources:
+    memory: string
+    vcpus: int             # VM only
+  runtime:
+    type: enum(openclaw|custom|process)
+    backend: enum(firecracker|process)  # inferred from tier
+    model:
+      provider: string     # cloud provider or model registry name
+      name: string         # e.g. "claude-sonnet-4-5"
+  capabilities:
+    - name: string         # becomes tool name for invokers
+      description: string  # used in auto-generated tool docs
+      inputs:
+        - name: string
+          type: enum(string|int|float|bool|bytes)
+          description: string
+          required: bool   # default true
+      outputs: [...]       # same schema as inputs
+      async: bool          # default false
+  network:                 # VM only
+    egress: enum(none|restricted|full)
+    egress_allowlist: list[string]
+  health:
+    interval: duration     # default "30s"
+    maxFailures: int       # default 3
+  restart:
+    policy: enum(always|on-failure|never)
+    maxRestarts: int       # default 5
+  placement:
+    nodeId: string
+    nodeLabels: map[string]string
+    arch: enum(amd64|arm64|armv7|armv6)
+```
 
-### Node commands
+### Team Manifest (teams/TEAM_ID.yaml)
 
-| Command | Description |
-|---------|-------------|
-| `hivectl nodes list` | List all nodes |
-| `hivectl nodes cordon NODE_ID` | Prevent new scheduling |
-| `hivectl nodes drain NODE_ID` | Drain a node |
-| `hivectl nodes uncordon NODE_ID` | Return to online |
-| `hivectl nodes label NODE_ID KEY=VALUE` | Add labels |
+```yaml
+apiVersion: hive/v1
+kind: Team
+metadata:
+  id: string               # globally unique
+spec:
+  lead: string             # agent ID, must be team member
+  communication:
+    persistent: bool       # default false, enables JetStream
+    historyDepth: int      # default 100
+  shared_volumes:          # VM only
+    - name: string
+      hostPath: string
+      access: enum(read-only|read-write)
+```
 
-### User commands
+### Eval Manifest (evals/EVAL_NAME/eval.yaml)
 
-| Command | Description |
-|---------|-------------|
-| `hivectl users create USER_ID --role ROLE` | Create user |
-| `hivectl users list` | List users |
-| `hivectl users update USER_ID` | Update user |
-| `hivectl users revoke USER_ID` | Revoke user |
-
-### Global flags
-
-| Flag | Description |
-|------|-------------|
-| `--cluster-root PATH` | Path to cluster root directory |
-| `--control-plane ADDRESS` | Remote control plane address |
-| `--output json` | JSON output format |
-| `--user USER_ID` | User ID for RBAC |
-| `--token TOKEN` | Auth token for RBAC |
+```yaml
+apiVersion: hive/v1
+kind: Eval
+metadata:
+  name: string             # e.g. "ci-pipeline-accuracy"
+  team: string             # team under test
+spec:
+  dataset:
+    - name: string
+      payload: object
+      expected:
+        fields: map[string]any
+        assertions:
+          - type: enum(contains|equals|regex|json_path)
+            path: string   # dot-separated JSON path
+            value: any
+  scoring:
+    metrics:
+      - name: string
+        type: enum(accuracy|latency|cost|custom)
+  runs:
+    count: int             # default 1
+    parallel: int          # default 1
+    timeout: duration      # default "60s"
+  models:
+    - provider: string
+      name: string         # e.g. "claude-sonnet-4-5", "gpt-4o"
+```

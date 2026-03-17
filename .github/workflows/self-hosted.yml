@@ -36,25 +36,56 @@ jobs:
 
   vm-tests:
     name: VM Tests (Real KVM)
-    # Requires /dev/kvm — only runs on hosts with hardware virtualization
-    if: false
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, nixos, kvm]
+    needs: [nix-build]
     steps:
       - uses: actions/checkout@v4
 
       - name: Verify KVM access
         run: |
-          test -e /dev/kvm || { echo "ERROR: /dev/kvm not found"; exit 1; }
-          test -r /dev/kvm || { echo "ERROR: /dev/kvm not readable"; exit 1; }
-          echo "KVM access OK"
+          ls -la /dev/kvm 2>&1 || true
+          stat /dev/kvm 2>&1 || { echo "ERROR: /dev/kvm not found"; exit 1; }
+          # Functional check: try to open the device via bash fd
+          exec 3< /dev/kvm && exec 3<&- && echo "KVM access OK" || { echo "ERROR: cannot open /dev/kvm"; exit 1; }
+          test -e /dev/vhost-vsock || echo "WARN: /dev/vhost-vsock not found (vsock tests will skip)"
 
-      - name: Enter dev shell and run VM tests
+      - name: Verify Firecracker and networking tools
+        run: |
+          firecracker --version
+          command -v nft && command -v ip
+          nft list tables || echo "nft list tables failed (may need CAP_NET_ADMIN)"
+
+      - name: Build binaries and VM images
+        run: |
+          nix develop --command bash -c '
+            make build
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
+          '
+          git add -f bin/linux-amd64/hive-sidecar
+          nix build ./rootfs/nixos#rootfs --out-link result-rootfs
+          nix build ./rootfs/nixos#kernel --out-link result-kernel
+          cp result-rootfs rootfs/rootfs.ext4
+          cp result-kernel/vmlinux rootfs/vmlinux
+
+      - name: Run VM tests with real KVM
         run: |
           nix develop --command bash -c '
             echo "Go version: $(go version)"
             echo "Running VM tests with real KVM..."
-            go test -tags vm -count=1 -timeout 10m -v ./...
+            go test -tags vm -race -count=1 -timeout 10m -v ./internal/vm/...
           '
+
+      - name: Run E2E tests with real Firecracker
+        run: |
+          nix develop --command bash -c '
+            echo "Running E2E tests with real Firecracker..."
+            go test -tags e2e -race -count=1 -timeout 10m -v ./test/e2e/
+          '
+
+      - name: Cleanup
+        if: always()
+        run: rm -f rootfs/rootfs.ext4 rootfs/vmlinux result-rootfs result-kernel
 
   e2e-linux:
     name: E2E (Linux Native)
@@ -105,38 +136,36 @@ jobs:
           HIVE_TEST_FIRECRACKER: mock
 
   rootfs-build:
-    name: Rootfs Build
-    # Requires Docker on the runner — enable after adding virtualisation.docker.enable = true to NixOS config
-    if: false
+    name: Rootfs Build (Nix)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, nixos]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build hive-sidecar for rootfs
+      - name: Build sidecar binary
         run: |
           nix develop --command bash -c '
-            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o hive-sidecar ./cmd/hive-sidecar/
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
           '
+          # Stage the binary so nix flake evaluation can see it
+          git add -f bin/linux-amd64/hive-sidecar
 
-      - name: Build base rootfs
+      - name: Build NixOS rootfs and kernel
+        run: |
+          nix build ./rootfs/nixos#rootfs --out-link result-rootfs
+          nix build ./rootfs/nixos#kernel --out-link result-kernel
+          ls -lh result-rootfs result-kernel/vmlinux
+
+      - name: Verify rootfs image
         run: |
           nix develop --command bash -c '
-            cd rootfs
-            chmod +x build-rootfs.sh
-            ./build-rootfs.sh test-rootfs.ext4 512M ../hive-sidecar
-          '
-
-      - name: Verify rootfs
-        run: |
-          nix develop --command bash -c '
-            file rootfs/test-rootfs.ext4
-            ls -lh rootfs/test-rootfs.ext4
-            e2fsck -n rootfs/test-rootfs.ext4
+            file result-rootfs
+            e2fsck -n result-rootfs
           '
 
       - name: Cleanup
         if: always()
-        run: rm -f rootfs/test-rootfs.ext4 hive-sidecar
+        run: rm -f result-rootfs result-kernel
 
   full-suite:
     name: Full Test Suite

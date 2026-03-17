@@ -14,6 +14,8 @@ PORT = int(os.environ.get('HIVE_CALLBACK_PORT', '9200'))
 SIDECAR_URL = os.environ.get('HIVE_SIDECAR_URL', 'http://127.0.0.1:9100')
 API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 WORKSPACE = os.path.realpath(os.environ.get('HIVE_WORKSPACE', os.getcwd()))
+SOUL = os.environ.get('HIVE_SOUL', '')
+MEMORY = os.environ.get('HIVE_MEMORY', '')
 
 def safe_path(file_path):
     \"\"\"Resolve file_path and ensure it stays within the workspace.\"\"\"
@@ -38,10 +40,17 @@ def review_code(file_path, diff=None):
 
     if API_KEY:
         try:
+            # Use SOUL.md as system prompt if available, otherwise fall back to inline prompt.
+            system_prompt = SOUL if SOUL else 'You are a code reviewer. Review code concisely. List bugs, style issues, improvements. Return JSON with keys: review (string), severity (info/warning/critical), findings_count (int).'
+            user_prompt = f'Review this code:\\n\\n{content}'
+            if MEMORY:
+                user_prompt = f'Context from previous reviews:\\n{MEMORY}\\n\\n{user_prompt}'
+            messages = [{'role': 'user', 'content': user_prompt}]
             data = json.dumps({
                 'model': 'claude-sonnet-4-5-20250514',
                 'max_tokens': 1024,
-                'messages': [{'role': 'user', 'content': f'Review this code concisely. List bugs, style issues, improvements. Return JSON with keys: review (string), severity (info/warning/critical), findings_count (int).\\n\\n{content}'}]
+                'system': system_prompt,
+                'messages': messages
             }).encode()
             req = urllib.request.Request('https://api.anthropic.com/v1/messages',
                 data=data,

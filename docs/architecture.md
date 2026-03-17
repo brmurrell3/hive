@@ -93,7 +93,6 @@ Responsibilities:
 | `internal/plugin` | Plugin system with lifecycle management |
 | `internal/types` | Shared types: Envelope, CorrelationID, subject validation |
 | `internal/mqtt` | MQTT-NATS bridge for IoT integration |
-| `internal/firmware` | Tier 3 firmware tracking, OTA updates, Ed25519 signing |
 
 ---
 

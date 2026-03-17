@@ -132,6 +132,105 @@ See the [Operations Guide](docs/operations.md) for full prerequisites, configura
 - **Reconciliation loop** that converges actual state to desired state
 - **SDKs** for Python, Go, and TypeScript (zero external dependencies)
 
+## Agent Design
+
+Hive agents are defined by three layers:
+
+**Identity (SOUL.md)** — Each agent has an optional SOUL.md that defines its
+role, behavioral constraints, and output expectations. This acts as the agent's
+system prompt and is injected by the sidecar when the agent starts.
+
+**Memory (MEMORY.md)** — Agents maintain persistent memory across restarts via
+MEMORY.md. The workspace state model uses last-modified-wins sync, allowing
+agents to accumulate knowledge over time while operators can seed or reset
+memory from the cluster root.
+
+**Capabilities** — Declared in the manifest with typed inputs and outputs.
+The sidecar auto-generates LLM tool definitions from capability schemas,
+enabling agents to discover and invoke each other's functions without
+hard-coded integrations.
+
+```yaml
+# Example: test-runner exposes a "run-tests" capability
+capabilities:
+  - name: run-tests
+    description: "Run test suite for a given file and return results"
+    inputs:
+      - name: file_path
+        type: string
+        description: "Path to the file under test"
+      - name: test_command
+        type: string
+        description: "Test command to execute"
+    outputs:
+      - name: passed
+        type: bool
+        description: "Whether all tests passed"
+      - name: output
+        type: string
+        description: "Test runner stdout/stderr"
+```
+
+When the code-reviewer agent (backed by Claude) needs test results, it sees
+`run-tests` as an available tool with typed parameters. The sidecar handles
+routing the invocation over NATS to the test-runner agent and returning the
+structured result. See [Architecture](docs/architecture.md#agent-identity-and-memory)
+for details on SOUL.md, MEMORY.md, and capability-to-tool generation.
+
+## Model Support
+
+Hive is model-agnostic. The cluster manifest includes a model registry, and
+each agent specifies its provider and model:
+
+```yaml
+# cluster.yaml
+spec:
+  models:
+    - name: local-llama
+      provider: ollama
+      endpoint: http://localhost:11434
+
+# agent manifest
+spec:
+  runtime:
+    type: openclaw
+    model:
+      provider: anthropic
+      name: claude-sonnet-4-5
+```
+
+Supported providers: Anthropic, OpenAI, Ollama, Google, Mistral, Cohere.
+Swap models per-agent without code changes -- useful for cost optimization
+(fast model for triage, strong model for analysis) and A/B evaluation.
+
+## Evaluation
+
+Hive includes a built-in eval framework for measuring agent and team
+performance across models and prompt strategies.
+
+```bash
+# Run the CI pipeline eval across two models
+hivectl eval run \
+  --eval-root evals/ci-pipeline-accuracy \
+  --cluster-root my-pipeline
+
+# Example output:
+# Eval: ci-pipeline-accuracy
+# Time: 2026-03-16 14:30:00 UTC
+#
+# Model                      Accuracy  p50 Latency  p99 Latency  Passed  Total
+# -----                      --------  -----------  -----------  ------  -----
+# anthropic/claude-sonnet-4-5  90%     4.2s         8.1s         9       10
+# openai/gpt-4o               80%     3.8s         7.4s         8       10
+```
+
+Define eval manifests with test cases, expected outputs, and scoring
+metrics. The eval dataset includes known-buggy code (nil pointer derefs,
+SQL injection, race conditions), clean code, and security-relevant files
+(path traversal, command injection, weak crypto). See
+[evals/ci-pipeline-accuracy/](evals/ci-pipeline-accuracy/) for the starter
+eval.
+
 ## Cluster Layout
 
 ```
@@ -231,12 +330,10 @@ sdk/
 
 | Document | Description |
 |----------|-------------|
-| [Getting Started](docs/getting-started.md) | From zero to running agents in 4 parts |
-| [Operations](docs/operations.md) | Prerequisites, installation, configuration, troubleshooting |
-| [Architecture](docs/architecture.md) | Tiers, components, VM lifecycle, capability routing |
-| [API Reference](docs/api-reference.md) | Sidecar HTTP API, NATS subjects, SDK overview |
-| [Schemas](docs/schemas.md) | YAML manifest specification |
-| [Communication](docs/communication.md) | NATS subjects, envelope format, capability protocol |
+| [Getting Started](docs/getting-started.md) | From zero to running agents |
+| [Operations](docs/operations.md) | Installation, configuration, troubleshooting |
+| [Architecture](docs/architecture.md) | Design, agent identity, capability routing, vol research deployment |
+| [API & Schema Reference](docs/api-reference.md) | HTTP APIs, NATS subjects, YAML manifests, SDKs |
 | [CLI Reference](docs/cli-reference.md) | All hivectl commands |
 
 ## Contributing

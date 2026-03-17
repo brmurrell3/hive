@@ -112,6 +112,5 @@ A Homebrew formula is a lower-barrier entry point for users not on Nix. It would
 
 ## Non-Goals
 
-- macOS support for Tier 3 firmware agents (those are embedded devices)
 - Running the Hive sidecar VM image on macOS (the guest OS is always Linux)
 - Supporting macOS versions before 13 (Ventura), which is the minimum for the Apple VZ APIs used here

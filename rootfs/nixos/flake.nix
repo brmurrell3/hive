@@ -23,14 +23,20 @@
       packages = forAllSystems (system:
         let
           nixosSystem = mkNixosSystem system;
+          pkgs = nixpkgs.legacyPackages.${system};
+          linuxKernel = nixosSystem.config.boot.kernelPackages.kernel;
         in
         {
           # Full ext4 rootfs image ready for Firecracker.
           rootfs = nixosSystem.config.system.build.rootfsImage;
 
-          # Kernel binary (vmlinux) suitable for Firecracker direct boot.
-          # The vmlinux file is at: result/bzImage (or result/vmlinux depending on config).
-          kernel = nixosSystem.config.boot.kernelPackages.kernel;
+          # Uncompressed vmlinux for Firecracker direct boot.
+          # Stock NixOS kernel puts vmlinux in the `dev` output;
+          # this wrapper copies it so `result/vmlinux` works directly.
+          kernel = pkgs.runCommand "hive-vmlinux" {} ''
+            mkdir -p $out
+            cp ${linuxKernel.dev}/vmlinux $out/vmlinux
+          '';
 
           # The complete NixOS system closure (useful for debugging).
           toplevel = nixosSystem.config.system.build.toplevel;

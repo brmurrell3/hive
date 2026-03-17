@@ -1,0 +1,152 @@
+apiVersion: hive/v1
+kind: Eval
+
+metadata:
+  name: ci-pipeline-accuracy
+  team: ci-pipeline
+
+spec:
+  dataset:
+    # --- Known-buggy files: reviewer should catch the bug ---
+
+    - name: nil-pointer-deref
+      payload:
+        file_path: "testdata/nil_pointer.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: severity
+            value: critical
+          - type: json_path
+            path: findings_count
+            value: true
+
+    - name: sql-injection
+      payload:
+        file_path: "testdata/sql_injection.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: severity
+            value: critical
+          - type: contains
+            path: review
+            value: injection
+
+    - name: race-condition
+      payload:
+        file_path: "testdata/race_condition.go"
+        test_command: "go test -race ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: severity
+            value: warning
+          - type: contains
+            path: review
+            value: race
+
+    - name: hardcoded-secret
+      payload:
+        file_path: "testdata/hardcoded_secret.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: severity
+            value: critical
+          - type: contains
+            path: review
+            value: secret
+
+    - name: unchecked-error
+      payload:
+        file_path: "testdata/unchecked_error.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: review
+            value: error
+
+    # --- Clean files: reviewer should pass these ---
+
+    - name: clean-handler
+      payload:
+        file_path: "testdata/clean_handler.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: equals
+            path: severity
+            value: info
+
+    - name: clean-config
+      payload:
+        file_path: "testdata/clean_config.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: equals
+            path: severity
+            value: info
+
+    # --- Security-relevant files ---
+
+    - name: path-traversal
+      payload:
+        file_path: "testdata/path_traversal.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: severity
+            value: critical
+          - type: contains
+            path: review
+            value: traversal
+
+    - name: command-injection
+      payload:
+        file_path: "testdata/command_injection.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: severity
+            value: critical
+          - type: contains
+            path: review
+            value: injection
+
+    - name: weak-crypto
+      payload:
+        file_path: "testdata/weak_crypto.go"
+        test_command: "go test ./..."
+      expected:
+        assertions:
+          - type: contains
+            path: review
+            value: crypto
+
+  scoring:
+    metrics:
+      - name: accuracy
+        type: accuracy
+      - name: latency_p50
+        type: latency
+      - name: latency_p99
+        type: latency
+
+  runs:
+    count: 1
+    parallel: 2
+    timeout: "120s"
+
+  models:
+    - provider: anthropic
+      name: claude-sonnet-4-5
+    - provider: openai
+      name: gpt-4o

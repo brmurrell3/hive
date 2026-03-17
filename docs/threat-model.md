@@ -49,18 +49,7 @@ Tier 2 agents run as native processes on the host:
 agents that need host hardware access (GPIO, USB, etc.) on trusted
 hardware.
 
-### 4. Tier 3 Agents (Firmware/Embedded)
-
-Tier 3 agents run on embedded devices (ESP32, STM32, etc.):
-
-- Communicate via MQTT bridge to NATS
-- Ed25519 firmware signing for OTA updates
-- Limited compute and memory resources
-
-**Trust level:** Semi-trusted. Physical access to devices is assumed
-possible. Firmware signing prevents unauthorized code execution.
-
-### 5. External Network
+### 4. External Network
 
 All external network traffic is untrusted:
 
@@ -71,7 +60,7 @@ All external network traffic is untrusted:
 
 **Trust level:** Untrusted. All external input is validated.
 
-### 6. CLI Tools (hivectl)
+### 5. CLI Tools (hivectl)
 
 The CLI is a client-side tool that:
 
@@ -170,17 +159,7 @@ rogue node.
 - Maximum follower limits prevent WebSocket resource exhaustion
 - Scheduler resource accounting prevents memory/CPU overcommit
 
-### A8: Supply Chain Attacks on Firmware
-
-**Vector:** Malicious firmware pushed to Tier 3 devices via OTA.
-
-**Mitigations:**
-- Ed25519 firmware signing required for all OTA updates
-- Signature verification on device before applying update
-- Streaming OTA transfer (no full binary buffered in memory)
-- Build provenance tracking in firmware metadata
-
-### A9: Dashboard and API Attacks
+### A8: Dashboard and API Attacks
 
 **Vector:** XSS, CSRF, or unauthorized access via the dashboard.
 
@@ -193,7 +172,7 @@ rogue node.
 - RBAC filtering on all query responses (users only see their scope)
 - JSON marshaling before WriteHeader prevents partial responses
 
-### A10: Log Injection
+### A9: Log Injection
 
 **Vector:** Malicious agents publish crafted log entries to inject
 false information or exploit log viewers.
@@ -214,8 +193,7 @@ false information or exploit log viewers.
 | Authentication | NATS token auth, RBAC tokens, join tokens (SHA-256) |
 | Authorization | Three-tier RBAC (admin/operator/viewer) |
 | Network Isolation | nftables rules per VM, no default external access |
-| Communication | vsock (VM-to-host), NATS (inter-agent), MQTT bridge (Tier 3) |
-| Firmware Security | Ed25519 signing and verification for OTA |
+| Communication | vsock (VM-to-host), NATS (inter-agent) |
 | Input Validation | Subject injection prevention, payload size limits, path traversal checks |
 | Audit Logging | Failed auth logging, operation logging |
 | Resource Limits | Connection limits, rate limiting, bounded metrics cardinality |

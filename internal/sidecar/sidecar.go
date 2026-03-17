@@ -403,9 +403,14 @@ func (s *Sidecar) startRuntime(_ context.Context) error {
 		s.logger,
 	)
 	// Merge secret env vars with any env vars set via SetEnvVars.
-	envs := make([]string, 0, len(s.envVars)+len(secretEnv))
+	envs := make([]string, 0, len(s.envVars)+len(secretEnv)+2)
 	envs = append(envs, s.envVars...)
 	envs = append(envs, secretEnv...)
+
+	// Inject SOUL.md and MEMORY.md content as environment variables so the
+	// runtime process can use them as system prompt and context without
+	// needing to read the filesystem.
+	envs = append(envs, s.loadAgentFiles()...)
 	s.runtime.EnvVars = envs
 	if err := s.runtime.Start(); err != nil {
 		return fmt.Errorf("starting runtime: %w", err)
@@ -954,6 +959,49 @@ func (s *Sidecar) fetchSecrets(names []string) (map[string]string, error) {
 	}
 
 	return resp.Secrets, nil
+}
+
+// loadAgentFiles reads SOUL.md and MEMORY.md from the workspace directory
+// and returns them as environment variable entries (HIVE_SOUL, HIVE_MEMORY).
+// Missing files are silently skipped. Content is capped at 64KB per file
+// to avoid bloating the process environment.
+func (s *Sidecar) loadAgentFiles() []string {
+	if s.config.WorkspacePath == "" {
+		return nil
+	}
+
+	const maxSize = 64 * 1024
+	envs := make([]string, 0, 2)
+
+	for _, entry := range []struct {
+		file   string
+		envVar string
+	}{
+		{"SOUL.md", "HIVE_SOUL"},
+		{"MEMORY.md", "HIVE_MEMORY"},
+	} {
+		path := filepath.Join(s.config.WorkspacePath, entry.file)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // file doesn't exist or isn't readable
+		}
+		content := string(data)
+		if len(content) > maxSize {
+			content = content[:maxSize]
+			s.logger.Warn("truncated agent file to 64KB",
+				"file", entry.file,
+				"agent_id", s.agentID,
+			)
+		}
+		envs = append(envs, fmt.Sprintf("%s=%s", entry.envVar, content))
+		s.logger.Info("loaded agent file",
+			"file", entry.file,
+			"agent_id", s.agentID,
+			"bytes", len(content),
+		)
+	}
+
+	return envs
 }
 
 // SetEnvVars sets additional environment variables to pass to the runtime process.

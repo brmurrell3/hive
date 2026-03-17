@@ -12,6 +12,8 @@ import http.server, json, urllib.request, os, sys, signal
 PORT = int(os.environ.get('HIVE_CALLBACK_PORT', '9202'))
 API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 WORKSPACE = os.path.realpath(os.environ.get('HIVE_WORKSPACE', os.getcwd()))
+SOUL = os.environ.get('HIVE_SOUL', '')
+MEMORY = os.environ.get('HIVE_MEMORY', '')
 
 def safe_path(file_path):
     \"\"\"Resolve file_path and ensure it stays within the workspace.\"\"\"
@@ -36,10 +38,16 @@ def scan_security(file_path):
 
     if API_KEY:
         try:
+            system_prompt = SOUL if SOUL else 'You are a security scanner. Scan code for security vulnerabilities (injection, hardcoded secrets, auth issues, OWASP top 10). Return JSON with keys: vulnerabilities (string, JSON array of findings), risk_level (low/medium/high/critical), findings_count (int).'
+            user_prompt = f'Scan this code for security vulnerabilities:\\n\\n{content}'
+            if MEMORY:
+                user_prompt = f'Context from previous scans:\\n{MEMORY}\\n\\n{user_prompt}'
+            messages = [{'role': 'user', 'content': user_prompt}]
             data = json.dumps({
                 'model': 'claude-sonnet-4-5-20250514',
                 'max_tokens': 1024,
-                'messages': [{'role': 'user', 'content': f'Scan this code for security vulnerabilities (injection, hardcoded secrets, auth issues, OWASP top 10). Return JSON with keys: vulnerabilities (string, JSON array of findings), risk_level (low/medium/high/critical), findings_count (int).\\n\\n{content}'}]
+                'system': system_prompt,
+                'messages': messages
             }).encode()
             req = urllib.request.Request('https://api.anthropic.com/v1/messages',
                 data=data,

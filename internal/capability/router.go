@@ -39,6 +39,11 @@ const (
 	// this size, an immediate sweep is forced and the oldest entries are dropped.
 	dedupHardLimit = 2 * dedupMaxSize
 
+	// Status values for InvocationResponse.
+	statusSuccess = "success"
+	statusError   = "error"
+	statusTimeout = "timeout"
+
 	// workerPoolSize is the number of worker goroutines that process incoming
 	// capability requests from the work channel.
 	workerPoolSize = 16
@@ -569,7 +574,7 @@ func (r *Router) Invoke(targetAgentID, capability string, inputs map[string]inte
 		if errors.Is(err, nats.ErrTimeout) {
 			return &InvocationResponse{
 				Capability: capability,
-				Status:     "timeout",
+				Status:     statusTimeout,
 				Error: &InvocationError{
 					Code:      "TIMEOUT",
 					Message:   fmt.Sprintf("capability invocation timed out after %s", timeout),
@@ -750,11 +755,11 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 			"error", handlerErr,
 			"duration_ms", durationMs,
 		)
-		status := "error"
+		status := statusError
 		code := "HANDLER_ERROR"
 		retryable := false
 		if errors.Is(handlerErr, errHandlerTimeout) {
-			status = "timeout"
+			status = statusTimeout
 			code = "HANDLER_TIMEOUT"
 			retryable = true
 		}
@@ -771,7 +776,7 @@ func (r *Router) handleRequest(msg *nats.Msg, capName string, handler Handler) {
 	} else {
 		resp = InvocationResponse{
 			Capability: capName,
-			Status:     "success",
+			Status:     statusSuccess,
 			Outputs:    outputs,
 			DurationMs: durationMs,
 		}
@@ -851,7 +856,7 @@ func (r *Router) CallLocal(capability string, inputs map[string]interface{}) *In
 	if !ok {
 		return &InvocationResponse{
 			Capability: capability,
-			Status:     "error",
+			Status:     statusError,
 			Error: &InvocationError{
 				Code:      "NOT_FOUND",
 				Message:   fmt.Sprintf("no handler registered for capability %q", capability),
@@ -867,7 +872,7 @@ func (r *Router) CallLocal(capability string, inputs map[string]interface{}) *In
 	if err != nil {
 		return &InvocationResponse{
 			Capability: capability,
-			Status:     "error",
+			Status:     statusError,
 			Error: &InvocationError{
 				Code:      "HANDLER_ERROR",
 				Message:   err.Error(),
@@ -879,7 +884,7 @@ func (r *Router) CallLocal(capability string, inputs map[string]interface{}) *In
 
 	return &InvocationResponse{
 		Capability: capability,
-		Status:     "success",
+		Status:     statusSuccess,
 		Outputs:    outputs,
 		DurationMs: durationMs,
 	}
@@ -895,7 +900,7 @@ func (r *Router) publishErrorResponse(msg *nats.Msg, replyTo, capName, code, mes
 
 	resp := InvocationResponse{
 		Capability: capName,
-		Status:     "error",
+		Status:     statusError,
 		Error: &InvocationError{
 			Code:      code,
 			Message:   message,

@@ -24,46 +24,32 @@
 { config, pkgs, lib, modulesPath, ... }:
 
 let
-  # Custom kernel with only the subsystems Firecracker needs.
-  customKernel = import ./kernel.nix { inherit pkgs lib; };
+  # Use the stock NixOS kernel — it includes all the virtio/vsock modules
+  # Firecracker needs and pulls from the binary cache (no compile needed).
 
   # ---------------------------------------------------------------------------
   # Sidecar binary
   #
-  # We import the pre-compiled static Linux binary as a Nix derivation so it
-  # participates in the image closure.  The binary must exist at
-  # HIVE_SIDECAR_BIN before invoking `nix build`.
-  #
-  # Default search path (relative to this flake's root, two levels up):
-  #   ../../bin/linux-amd64/hive-sidecar
-  #
-  # Override at build time:
-  #   nix build .#rootfs \
-  #     --override-input sidecarSrc path:/path/to/hive-sidecar
+  # The pre-compiled static Linux binary is imported as a Nix path so it
+  # gets copied into the store and registered as a build dependency.
+  # The binary must exist at bin/linux-amd64/hive-sidecar (relative to the
+  # repo root) before invoking `nix build`.  In CI, `git add -f` stages it
+  # past .gitignore so the flake source includes it.
   # ---------------------------------------------------------------------------
-  sidecarBinPath = builtins.getEnv "HIVE_SIDECAR_BIN";
+  sidecarSrc = ../../bin/linux-amd64/hive-sidecar;
 
-  # Resolve: env var takes priority; fall back to conventional repo path.
-  resolvedSidecarPath =
-    if sidecarBinPath != ""
-    then sidecarBinPath
-    else toString (../../bin/linux-amd64/hive-sidecar);
-
-  # Wrap the binary in a derivation so Nix can track it as a store path.
-  # If the file does not exist the build aborts immediately — a silently
-  # broken image without the sidecar is worse than a clear build failure.
   sidecarBin =
-    if builtins.pathExists resolvedSidecarPath
+    if builtins.pathExists sidecarSrc
     then
       pkgs.runCommand "hive-sidecar" {} ''
-        install -Dm755 ${resolvedSidecarPath} $out/bin/hive-sidecar
+        install -Dm755 ${sidecarSrc} $out/bin/hive-sidecar
       ''
     else
       builtins.abort ''
-        hive-sidecar binary not found at '${resolvedSidecarPath}'.
+        hive-sidecar binary not found.
         Compile it first:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/linux-amd64/hive-sidecar ./cmd/hive-sidecar
-        Or set HIVE_SIDECAR_BIN to point to an existing binary.
+        Then stage it: git add -f bin/linux-amd64/hive-sidecar
       '';
 in
 {
@@ -75,19 +61,20 @@ in
   # Boot
   # ---------------------------------------------------------------------------
   boot = {
-    # Use our custom minimal kernel (see kernel.nix).
-    kernelPackages = pkgs.linuxPackagesFor customKernel;
+    # Stock NixOS kernel — includes virtio, vsock, ext4, networking.
+    # Firecracker only needs vmlinux for direct boot.
 
     # Firecracker does direct kernel boot -- no bootloader needed.
     loader.grub.enable = false;
 
     # Kernel parameters matching what the Firecracker hypervisor passes.
+    # Note: init= is set by Firecracker's boot_args, not here, to avoid
+    # a circular dependency (kernelParams → toplevel → kernelParams).
     kernelParams = [
       "console=ttyS0"
       "reboot=k"
       "panic=1"
       "pci=off"
-      "init=${config.system.build.toplevel}/init"
     ];
 
     # Keep initrd small; only the modules Firecracker actually exposes.
@@ -494,6 +481,7 @@ in
   # filesystem image suitable for Firecracker's block device.
   system.build.rootfsImage = import "${pkgs.path}/nixos/lib/make-ext4-fs.nix" {
     inherit pkgs lib;
+    inherit (pkgs) e2fsprogs zstd libfaketime perl fakeroot;
     storePaths = [ config.system.build.toplevel ];
     volumeLabel = "hive-rootfs";
     # Target < 500 MB; the image will be sparse so the file on disk is smaller

@@ -80,6 +80,7 @@ func main() {
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.AddCommand(logsCmd())
 	rootCmd.AddCommand(execCmd())
+	rootCmd.AddCommand(evalCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

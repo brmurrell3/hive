@@ -452,83 +452,20 @@ Three roles:
 
 ---
 
-## Dashboard and Web UI
+## Dashboard, Metrics, and API
 
-hived serves a REST API and WebSocket endpoint for real-time monitoring.
-
-### REST API
-
-```bash
-# Cluster overview
-curl http://localhost:8080/api/cluster
-
-# List agents
-curl http://localhost:8080/api/agents
-
-# Agent detail
-curl http://localhost:8080/api/agents/my-agent
-
-# List nodes
-curl http://localhost:8080/api/nodes
-
-# Registered capabilities
-curl http://localhost:8080/api/capabilities
-
-# Chat with an agent
-curl -X POST http://localhost:8080/api/agents/my-agent/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"Hello"}'
-
-# Agent logs
-curl http://localhost:8080/api/logs/my-agent?limit=50
-
-# Health check
-curl http://localhost:8080/healthz
-```
-
-### WebSocket
-
-Connect to `ws://localhost:8080/ws` for live events:
-
-```bash
-websocat ws://localhost:8080/ws
-```
-
-Event types:
-- `agent_state_change` -- state transitions
-- `heartbeat` -- agent health updates
-- `log_entry` -- log messages
-
----
-
-## Prometheus Metrics
-
-Exposed at `/metrics` on the dashboard port (default `:8080`).
-
-```bash
-curl http://localhost:8080/metrics
-```
-
-Add to `prometheus.yml`:
+Enable the dashboard in `cluster.yaml`:
 
 ```yaml
-scrape_configs:
-  - job_name: 'hive'
-    static_configs:
-      - targets: ['localhost:8080']
-    scrape_interval: 15s
+spec:
+  dashboard:
+    enabled: true
+    addr: ":8080"
+  metrics:
+    enabled: true
 ```
 
-Key metrics:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `hive_agents_total{status}` | gauge | Agent count by state |
-| `hive_heartbeat_healthy{agent_id}` | gauge | 1=healthy, 0=unhealthy |
-| `hive_capability_invocation_duration_ms` | summary | Capability latency |
-| `hive_nats_messages_total{subject}` | counter | NATS message throughput |
-| `hive_node_memory_usage_percent{node_id}` | gauge | Node memory usage |
-| `hive_node_cpu_usage_percent{node_id}` | gauge | Node CPU usage |
+The dashboard serves REST endpoints, WebSocket events, and Prometheus metrics on the configured port. See [API & Schema Reference](api-reference.md#dashboard-rest-api) for full endpoint documentation.
 
 ---
 
@@ -593,20 +530,7 @@ spec:
 
 ### NATS subjects
 
-All agent communication flows through the embedded NATS server. Subject hierarchy:
-
-| Subject | Direction | Description |
-|---------|-----------|-------------|
-| `hive.health.<agent_id>` | Agent -> hived | Heartbeats |
-| `hive.control.<agent_id>` | hived -> Agent | Control commands |
-| `hive.agent.<agent_id>.inbox` | Any -> Agent | Message inbox |
-| `hive.capabilities.<agent>.<cap>.request` | Any -> Agent | Capability invocation |
-| `hive.capabilities.<agent>.<cap>.response` | Agent -> Requester | Capability response |
-| `hive.team.<team_id>.broadcast` | Lead -> Team | Team broadcast |
-| `hive.logs.<agent_id>` | Agent -> hived | Log entries |
-| `hive.join.request` | Agent -> hived | Tier 2 join |
-
-See [Communication](communication.md) for the full subject hierarchy and envelope format.
+All agent communication flows through the embedded NATS server using `hive.` prefixed subjects. See [API & Schema Reference](api-reference.md#nats-subject-hierarchy) for the full subject hierarchy and envelope format.
 
 ---
 

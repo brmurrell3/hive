@@ -211,19 +211,32 @@
     const wsMaxReconnectDelay = 30000;
     let logFollowCancel = null;
 
+    // --- Auth ---
+    let authToken = localStorage.getItem("hive_token") || "";
+    if (!authToken) {
+        authToken = prompt("Dashboard auth token:") || "";
+        if (authToken) localStorage.setItem("hive_token", authToken);
+    }
+
     // --- API ---
     const api = {
         async get(path) {
-            const r = await fetch("/api" + path);
+            const r = await fetch("/api" + path, {
+                headers: authToken ? {"Authorization": "Bearer " + authToken} : {}
+            });
+            if (r.status === 401) { localStorage.removeItem("hive_token"); location.reload(); }
             if (!r.ok) throw new Error(await r.text());
             return r.json();
         },
         async post(path, body) {
+            const h = {"Content-Type": "application/json"};
+            if (authToken) h["Authorization"] = "Bearer " + authToken;
             const r = await fetch("/api" + path, {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
+                headers: h,
                 body: JSON.stringify(body)
             });
+            if (r.status === 401) { localStorage.removeItem("hive_token"); location.reload(); }
             if (!r.ok) throw new Error(await r.text());
             return r.json();
         }
@@ -250,7 +263,9 @@
     // --- WebSocket ---
     function connectWS() {
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        ws = new WebSocket(proto + "//" + location.host + "/ws");
+        ws = authToken
+            ? new WebSocket(proto + "//" + location.host + "/ws", [authToken])
+            : new WebSocket(proto + "//" + location.host + "/ws");
 
         ws.onopen = () => {
             state.wsConnected = true;

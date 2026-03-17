@@ -146,19 +146,19 @@ jobs:
           go-version: '1.25.8'
 
       - name: Fuzz ParseMemory
-        run: go test -tags unit -run=^$ -fuzz=^FuzzParseMemory$ -fuzztime=10s ./internal/config/
+        run: go test -tags unit -run=^$ -fuzz=^FuzzParseMemory$ -fuzztime=10s -timeout=60s ./internal/config/
 
       - name: Fuzz ParseDiskSize
-        run: go test -tags unit -run=^$ -fuzz=^FuzzParseDiskSize$ -fuzztime=10s ./internal/config/
+        run: go test -tags unit -run=^$ -fuzz=^FuzzParseDiskSize$ -fuzztime=10s -timeout=60s ./internal/config/
 
       - name: Fuzz ValidateSubjectComponent
-        run: go test -tags unit -run=^$ -fuzz=^FuzzValidateSubjectComponent$ -fuzztime=10s ./internal/types/
+        run: go test -tags unit -run=^$ -fuzz=^FuzzValidateSubjectComponent$ -fuzztime=10s -timeout=60s ./internal/types/
 
       - name: Fuzz EnvelopeValidate
-        run: go test -tags unit -run=^$ -fuzz=^FuzzEnvelopeValidate$ -fuzztime=10s ./internal/types/
+        run: go test -tags unit -run=^$ -fuzz=^FuzzEnvelopeValidate$ -fuzztime=10s -timeout=60s ./internal/types/
 
       - name: Fuzz Authenticate
-        run: go test -tags unit -run=^$ -fuzz=^FuzzAuthenticate$ -fuzztime=10s ./internal/auth/
+        run: go test -tags unit -run=^$ -fuzz=^FuzzAuthenticate$ -fuzztime=10s -timeout=60s ./internal/auth/
 
   race-stress:
     name: Race Stress
