@@ -8,24 +8,28 @@ A hands-on guide from zero to running AI agent teams. Four parts, each building 
 
 Works on macOS and Linux. Uses the process backend -- no KVM or Firecracker needed.
 
-### Prerequisites
+### Step 1: Install
 
-- [Go 1.25+](https://go.dev/dl/) installed
-- A terminal with `git` and `make`
-
-### Step 1: Build
+Pick whichever method works for you:
 
 ```bash
+# macOS
+brew install brmurrell3/tap/hive
+
+# Linux (Ubuntu/Debian)
+curl -fsSL https://raw.githubusercontent.com/brmurrell3/hive/main/scripts/install.sh | sudo bash
+
+# From source (any OS with Go 1.25+)
 git clone https://github.com/brmurrell3/hive && cd hive
 make build
 ```
 
-This produces three binaries in `./bin/`: `hived` (control plane), `hivectl` (CLI), and `hive-agent` (Tier 2 agent host).
+See [install.md](install.md) for all options. If you built from source, use `./bin/hivectl` instead of `hivectl` in the examples below.
 
 ### Step 2: Scaffold a cluster
 
 ```bash
-./bin/hivectl init my-cluster
+hivectl init my-cluster
 ```
 
 This creates:
@@ -43,14 +47,14 @@ my-cluster/
 ### Step 3: Validate
 
 ```bash
-./bin/hivectl validate --cluster-root my-cluster
+hivectl validate --cluster-root my-cluster
 # Validation passed.
 ```
 
 ### Step 4: Start the control plane
 
 ```bash
-./bin/hived --cluster-root my-cluster
+hived --cluster-root my-cluster
 ```
 
 hived runs in the foreground with an embedded NATS server. Leave it running and open a second terminal.
@@ -59,19 +63,19 @@ hived runs in the foreground with an embedded NATS server. Leave it running and 
 
 ```bash
 # List agents
-./bin/hivectl agents list --cluster-root my-cluster
+hivectl agents list --cluster-root my-cluster
 
 # Start an agent
-./bin/hivectl agents start example-agent --cluster-root my-cluster
+hivectl agents start example-agent --cluster-root my-cluster
 
 # Check status
-./bin/hivectl agents status example-agent --cluster-root my-cluster
+hivectl agents status example-agent --cluster-root my-cluster
 
 # Stop
-./bin/hivectl agents stop example-agent --cluster-root my-cluster
+hivectl agents stop example-agent --cluster-root my-cluster
 
 # Destroy (removes from state)
-./bin/hivectl agents destroy example-agent --cluster-root my-cluster
+hivectl agents destroy example-agent --cluster-root my-cluster
 ```
 
 ### Using a template
@@ -80,16 +84,16 @@ Templates scaffold complete multi-agent teams with working pipelines:
 
 ```bash
 # List available templates
-./bin/hivectl init --list-templates
+hivectl init --list-templates
 
 # Scaffold a CI pipeline team
-./bin/hivectl init --template ci-pipeline my-pipeline
+hivectl init --template ci-pipeline my-pipeline
 
 # Start the dev environment (builds + starts hived + starts all agents)
-./bin/hivectl dev --cluster-root my-pipeline
+hivectl dev --cluster-root my-pipeline
 
 # In a second terminal, trigger the pipeline
-./bin/hivectl trigger --cluster-root my-pipeline --team ci-pipeline \
+hivectl trigger --cluster-root my-pipeline --team ci-pipeline \
   --payload '{"file_path": "main.go", "test_command": "go test ./..."}'
 ```
 
@@ -303,7 +307,7 @@ Output files:
 
 ```bash
 # Create a cluster with VM configuration
-./bin/hivectl init my-cluster
+hivectl init my-cluster
 
 # Edit cluster.yaml to point to the kernel and rootfs
 ```
@@ -320,20 +324,20 @@ spec:
 Start the control plane (without `HIVE_TEST_FIRECRACKER`):
 
 ```bash
-sudo ./bin/hived --cluster-root my-cluster
+sudo hived --cluster-root my-cluster
 ```
 
 Start an agent -- this boots a real Firecracker microVM:
 
 ```bash
-./bin/hivectl agents start example-agent --cluster-root my-cluster
+hivectl agents start example-agent --cluster-root my-cluster
 ```
 
 ### Verify isolation
 
 ```bash
 # Check agent status (should show RUNNING with a real VM PID)
-./bin/hivectl agents status example-agent --cluster-root my-cluster
+hivectl agents status example-agent --cluster-root my-cluster
 
 # View serial console output
 cat my-cluster/.state/agents/example-agent/console.log
@@ -419,13 +423,13 @@ Query logs via CLI:
 
 ```bash
 # Recent logs
-./bin/hivectl agents logs my-agent --cluster-root my-cluster
+hivectl agents logs my-agent --cluster-root my-cluster
 
 # Tail with follow
-./bin/hivectl agents logs my-agent --follow --cluster-root my-cluster
+hivectl agents logs my-agent --follow --cluster-root my-cluster
 
 # Last 100 lines
-./bin/hivectl agents logs my-agent --tail 100 --cluster-root my-cluster
+hivectl agents logs my-agent --tail 100 --cluster-root my-cluster
 ```
 
 Or via the dashboard REST API:

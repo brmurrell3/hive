@@ -86,7 +86,7 @@ echo "vhost_vsock" | sudo tee /etc/modules-load.d/vhost_vsock.conf
 which nft ip
 
 # If running hived without root, grant capabilities to the binary:
-sudo setcap 'cap_net_admin,cap_sys_admin+ep' ./bin/hived
+sudo setcap 'cap_net_admin,cap_sys_admin+ep' hived
 ```
 
 ### Installing Firecracker (Linux only)
@@ -131,46 +131,7 @@ ls -la /dev/vhost-vsock
 
 ## Installation
 
-### From source
-
-```bash
-git clone https://github.com/brmurrell3/hive && cd hive
-make build
-```
-
-Produces binaries in `./bin/`:
-- `hived` -- control plane daemon
-- `hivectl` -- management CLI
-- `hive-agent` -- Tier 2 agent host binary
-
-### Cross-compilation
-
-```bash
-# Linux x86_64 (servers, VMs)
-make build-linux-amd64
-
-# Linux arm64 (Raspberry Pi)
-make build-linux-arm64
-
-# macOS Intel
-make build-darwin-amd64
-
-# All targets
-make build-all
-```
-
-### VM images (Linux only)
-
-```bash
-# Download Firecracker-compatible kernel
-make download-kernel
-
-# Build Alpine rootfs (requires Docker)
-make rootfs
-
-# Build NixOS rootfs (requires Nix with flakes)
-cd rootfs/nixos && nix build .#rootfs && nix build .#kernel
-```
+See [docs/install.md](install.md) for all installation methods (Homebrew, install script, NixOS, manual download, from source, air-gapped).
 
 ---
 
@@ -307,22 +268,22 @@ FAILED  --> CREATING  (restart)
 
 ```bash
 # Start (PENDING -> CREATING -> STARTING -> RUNNING)
-./bin/hivectl agents start my-agent --cluster-root my-cluster
+hivectl agents start my-agent --cluster-root my-cluster
 
 # Stop (RUNNING -> STOPPING -> STOPPED)
-./bin/hivectl agents stop my-agent --cluster-root my-cluster
+hivectl agents stop my-agent --cluster-root my-cluster
 
 # Restart (stop + start, resets restart counter)
-./bin/hivectl agents restart my-agent --cluster-root my-cluster
+hivectl agents restart my-agent --cluster-root my-cluster
 
 # Destroy (force kill, delete rootfs copy, remove from state)
-./bin/hivectl agents destroy my-agent --cluster-root my-cluster
+hivectl agents destroy my-agent --cluster-root my-cluster
 
 # List all agents
-./bin/hivectl agents list --cluster-root my-cluster
+hivectl agents list --cluster-root my-cluster
 
 # Detailed status (JSON)
-./bin/hivectl agents status my-agent --cluster-root my-cluster
+hivectl agents status my-agent --cluster-root my-cluster
 ```
 
 ### State persistence
@@ -337,16 +298,16 @@ Tokens authenticate Tier 2 nodes joining the cluster. The raw token is shown onc
 
 ```bash
 # Create a token (no expiry)
-./bin/hivectl tokens create --cluster-root my-cluster
+hivectl tokens create --cluster-root my-cluster
 
 # Create a token with TTL
-./bin/hivectl tokens create --ttl 24h --cluster-root my-cluster
+hivectl tokens create --ttl 24h --cluster-root my-cluster
 
 # List tokens (shows prefix, creation time, status)
-./bin/hivectl tokens list --cluster-root my-cluster
+hivectl tokens list --cluster-root my-cluster
 
 # Revoke by prefix
-./bin/hivectl tokens revoke a1b2c3d4 --cluster-root my-cluster
+hivectl tokens revoke a1b2c3d4 --cluster-root my-cluster
 ```
 
 ---
@@ -360,25 +321,25 @@ Nodes self-register when agents join via `hive-agent join`. Tier classification 
 
 ```bash
 # List all nodes
-./bin/hivectl nodes list --cluster-root my-cluster
+hivectl nodes list --cluster-root my-cluster
 
 # Detailed status
-./bin/hivectl nodes status pi4-aarch64 --cluster-root my-cluster
+hivectl nodes status pi4-aarch64 --cluster-root my-cluster
 
 # Cordon (prevent new scheduling, existing agents stay)
-./bin/hivectl nodes cordon pi4-aarch64 --cluster-root my-cluster
+hivectl nodes cordon pi4-aarch64 --cluster-root my-cluster
 
 # Drain (prevent scheduling, signal migration)
-./bin/hivectl nodes drain pi4-aarch64 --cluster-root my-cluster
+hivectl nodes drain pi4-aarch64 --cluster-root my-cluster
 
 # Uncordon (return to online)
-./bin/hivectl nodes uncordon pi4-aarch64 --cluster-root my-cluster
+hivectl nodes uncordon pi4-aarch64 --cluster-root my-cluster
 
 # Add labels
-./bin/hivectl nodes label pi4-aarch64 env=prod gpu=none --cluster-root my-cluster
+hivectl nodes label pi4-aarch64 env=prod gpu=none --cluster-root my-cluster
 
 # Remove labels
-./bin/hivectl nodes unlabel pi4-aarch64 gpu --cluster-root my-cluster
+hivectl nodes unlabel pi4-aarch64 gpu --cluster-root my-cluster
 ```
 
 ---
@@ -390,7 +351,7 @@ Tier 2 agents run natively on hardware (no VM). They use `hive-agent join` to co
 **On the control plane host:**
 
 ```bash
-./bin/hivectl tokens create --cluster-root my-cluster
+hivectl tokens create --cluster-root my-cluster
 # Save the token output
 ```
 
@@ -414,8 +375,8 @@ The agent will connect to NATS, send a join request with hardware inventory, sta
 **Verify:**
 
 ```bash
-./bin/hivectl nodes list --cluster-root my-cluster
-./bin/hivectl agents list --cluster-root my-cluster
+hivectl nodes list --cluster-root my-cluster
+hivectl agents list --cluster-root my-cluster
 ```
 
 ---
@@ -432,22 +393,22 @@ Three roles:
 
 ```bash
 # Create an admin
-./bin/hivectl users create alice --role admin --cluster-root my-cluster
+hivectl users create alice --role admin --cluster-root my-cluster
 
 # Create an operator scoped to a team
-./bin/hivectl users create bob --role operator --teams default --cluster-root my-cluster
+hivectl users create bob --role operator --teams default --cluster-root my-cluster
 
 # Create a viewer scoped to specific agents
-./bin/hivectl users create carol --role viewer --agents my-agent,other-agent --cluster-root my-cluster
+hivectl users create carol --role viewer --agents my-agent,other-agent --cluster-root my-cluster
 
 # List users
-./bin/hivectl users list --cluster-root my-cluster
+hivectl users list --cluster-root my-cluster
 
 # Update role or scope
-./bin/hivectl users update bob --role admin --cluster-root my-cluster
+hivectl users update bob --role admin --cluster-root my-cluster
 
 # Revoke
-./bin/hivectl users revoke carol --cluster-root my-cluster
+hivectl users revoke carol --cluster-root my-cluster
 ```
 
 ---
@@ -492,10 +453,10 @@ Agent logs are streamed via NATS and persisted to JSONL files.
 ### CLI access
 
 ```bash
-./bin/hivectl agents logs my-agent --cluster-root my-cluster
-./bin/hivectl agents logs my-agent --follow --cluster-root my-cluster
-./bin/hivectl agents logs my-agent --tail 100 --cluster-root my-cluster
-./bin/hivectl agents logs my-agent --since 1h --cluster-root my-cluster
+hivectl agents logs my-agent --cluster-root my-cluster
+hivectl agents logs my-agent --follow --cluster-root my-cluster
+hivectl agents logs my-agent --tail 100 --cluster-root my-cluster
+hivectl agents logs my-agent --since 1h --cluster-root my-cluster
 ```
 
 ---
@@ -669,8 +630,8 @@ sudo chmod 666 /dev/kvm
 
 ```bash
 # Force destroy, then restart
-./bin/hivectl agents destroy stuck-agent --cluster-root my-cluster
-./bin/hivectl agents start stuck-agent --cluster-root my-cluster
+hivectl agents destroy stuck-agent --cluster-root my-cluster
+hivectl agents start stuck-agent --cluster-root my-cluster
 ```
 
 **NATS connection refused**
@@ -712,19 +673,19 @@ go test -tags integration -race -count=1 -v -timeout 10m ./internal/...
 
 ```bash
 # Validate all manifests
-./bin/hivectl validate --cluster-root my-cluster
+hivectl validate --cluster-root my-cluster
 
 # Check cluster status
-./bin/hivectl status --cluster-root my-cluster
+hivectl status --cluster-root my-cluster
 
 # List everything
-./bin/hivectl agents list --cluster-root my-cluster
-./bin/hivectl nodes list --cluster-root my-cluster
-./bin/hivectl tokens list --cluster-root my-cluster
-./bin/hivectl capabilities list --cluster-root my-cluster
+hivectl agents list --cluster-root my-cluster
+hivectl nodes list --cluster-root my-cluster
+hivectl tokens list --cluster-root my-cluster
+hivectl capabilities list --cluster-root my-cluster
 
 # Verbose hived logs
-./bin/hived --cluster-root my-cluster --log-level debug
+hived --cluster-root my-cluster --log-level debug
 
 # NATS diagnostics (requires nats CLI)
 nats server info

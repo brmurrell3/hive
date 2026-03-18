@@ -8,19 +8,46 @@
 Define agents in YAML, connect them over an embedded NATS message bus, and deploy anywhere -- from a laptop to an air-gapped data center.
 One Go binary, no Docker, no Python dependencies.
 
-## Quickstart (any OS)
+## Install
+
+### macOS (Homebrew)
+
+```bash
+brew install brmurrell3/tap/hive
+```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brmurrell3/hive/main/scripts/install.sh | sudo bash
+```
+
+### GitHub Releases (any platform)
+
+Download pre-built binaries from the [latest release](https://github.com/brmurrell3/hive/releases/latest).
+
+### From Source
 
 ```bash
 git clone https://github.com/brmurrell3/hive && cd hive
 make build
-./bin/hivectl init --template ci-pipeline my-pipeline
-./bin/hivectl dev --cluster-root my-pipeline
+```
+
+Requires [Go 1.25+](https://go.dev/dl/). See [all installation methods](docs/install.md) for NixOS, cross-compilation, and air-gapped setups.
+
+## Quickstart
+
+```bash
+hivectl init --template ci-pipeline my-pipeline
+hivectl dev --cluster-root my-pipeline
 # In a second terminal:
-./bin/hivectl trigger --cluster-root my-pipeline --team ci-pipeline \
+hivectl trigger --cluster-root my-pipeline --team ci-pipeline \
   --payload '{"file_path": "main.go", "test_command": "go test ./..."}'
 ```
 
-Requires [Go 1.25+](https://go.dev/dl/). This uses the **process backend** -- no KVM or Linux required. Three AI agents start, collaborate on a CI pipeline, and print a JSON report. No API key needed (mock responses by default). Set `ANTHROPIC_API_KEY` for real LLM-powered code review and security scanning.
+This uses the **process backend** -- no KVM or Linux required. Three AI agents start, collaborate on a CI pipeline, and print a JSON report. No API key needed (mock responses by default). Set `ANTHROPIC_API_KEY` for real LLM-powered code review and security scanning.
+
+If you built from source, use `./bin/hivectl` instead of `hivectl`.
 
 Clean up when done:
 
@@ -71,38 +98,6 @@ All communication goes through an embedded NATS message bus. Each agent has a si
 | Linux | arm64 + KVM | Firecracker microVMs | Full | Per-agent kernel, memory, network isolation |
 
 On macOS and Linux without KVM, Hive uses the **process backend**: agents run as OS processes with sidecar messaging, giving you the full orchestration experience without VM isolation. On Linux with KVM, Hive uses **Firecracker microVMs** for production-grade per-agent isolation.
-
-## Real Hardware (Linux + KVM + Firecracker)
-
-For full VM isolation on Linux with KVM:
-
-```bash
-# 1. Verify KVM is available
-ls /dev/kvm
-
-# 2. Build all binaries including the sidecar
-make build-linux-amd64
-
-# 3. Download a Firecracker-compatible kernel
-make download-kernel
-
-# 4. Build the rootfs image
-make rootfs
-
-# 5. Create a cluster configured for real VMs
-./bin/hivectl init my-cluster
-# Edit my-cluster/cluster.yaml to set:
-#   spec.vm.kernelPath: rootfs/vmlinux
-#   spec.vm.rootfsPath: rootfs/rootfs.ext4
-
-# 6. Start the control plane (no HIVE_TEST_FIRECRACKER env var)
-sudo ./bin/hived --cluster-root my-cluster
-
-# 7. Start agents (each boots a Firecracker microVM)
-./bin/hivectl agents start my-agent --cluster-root my-cluster
-```
-
-See the [Operations Guide](docs/operations.md) for full prerequisites, configuration, and troubleshooting.
 
 ## Why Hive?
 
@@ -250,89 +245,14 @@ my-cluster/
     +-- ci-pipeline.yaml   # Team lead, communication settings
 ```
 
-## Requirements
-
-- [Go 1.25](https://go.dev/dl/) or later
-- macOS or Linux for building and local development
-- Linux with KVM for Firecracker VM isolation (production)
-
-## Templates
-
-```bash
-# List available templates
-./bin/hivectl init --list-templates
-
-# Scaffold a CI pipeline team
-./bin/hivectl init --template ci-pipeline my-pipeline
-
-# Start local dev environment
-./bin/hivectl dev --cluster-root my-pipeline
-```
-
-## NixOS Deployment
-
-```nix
-# /etc/nixos/flake.nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    hive.url = "github:brmurrell3/hive";
-  };
-
-  outputs = { nixpkgs, hive, ... }: {
-    nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        ./configuration.nix
-        hive.nixosModules.default
-        {
-          services.hived = {
-            enable = true;
-            clusterRoot = "/home/deploy/hive-cluster";
-            user = "deploy";
-            group = "users";
-            openFirewall = true;
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-## Project Layout
-
-```
-cmd/
-  hived/           Control plane daemon (embedded NATS, state, reconciler)
-  hivectl/         CLI tool (validate, init, dev, trigger, agents, tokens)
-  hive-agent/      Tier 2 native agent join binary
-  hive-sidecar/    Sidecar runtime for agent VMs
-internal/
-  config/          YAML parsing + validation
-  sidecar/         Agent runtime, HTTP API, heartbeats, capability routing
-  capability/      NATS capability routing with cross-team support
-  nats/            Embedded NATS server wrapper
-  vm/              Firecracker VM lifecycle + nftables networking
-  state/           SQLite state persistence
-  health/          Heartbeat monitor + auto-restart
-  reconciler/      Desired-state reconciliation loop
-  scheduler/       Bin-packing node scheduler
-  auth/            RBAC (admin, operator, viewer)
-  templates/       Embedded agent team templates
-sdk/
-  python/          Python SDK (zero dependencies)
-  go/              Go SDK
-  typescript/      TypeScript SDK (zero dependencies)
-```
-
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
+| [Install](docs/install.md) | All installation methods |
 | [Getting Started](docs/getting-started.md) | From zero to running agents |
-| [Operations](docs/operations.md) | Installation, configuration, troubleshooting |
-| [Architecture](docs/architecture.md) | Design, agent identity, capability routing, vol research deployment |
+| [Operations](docs/operations.md) | Configuration, networking, backup, troubleshooting |
+| [Architecture](docs/architecture.md) | Design, agent identity, capability routing |
 | [API & Schema Reference](docs/api-reference.md) | HTTP APIs, NATS subjects, YAML manifests, SDKs |
 | [CLI Reference](docs/cli-reference.md) | All hivectl commands |
 

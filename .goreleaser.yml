@@ -95,5 +95,26 @@ release:
   draft: true
   replace_existing_draft: true
 
+brews:
+  - ids:
+      - hived
+      - hivectl
+      - hive-agent
+      - hive-sidecar
+    repository:
+      owner: brmurrell3
+      name: homebrew-tap
+    directory: Formula
+    homepage: https://github.com/brmurrell3/hive
+    description: Declarative orchestration framework for AI agent teams
+    license: Apache-2.0
+    install: |
+      bin.install "hived"
+      bin.install "hivectl"
+      bin.install "hive-agent"
+      bin.install "hive-sidecar"
+    test: |
+      system "#{bin}/hivectl", "version"
+
 changelog:
   use: github-native
