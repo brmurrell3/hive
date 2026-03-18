@@ -385,6 +385,13 @@ func (c *Cluster) Subscribe(subject string, handler func(data []byte)) (*nats.Su
 		return nil, fmt.Errorf("subscribing to %s: %w", subject, err)
 	}
 
+	// Flush so the SUB protocol message reaches the server before we return.
+	// Without this, a publisher on another connection could send a message
+	// before the server has processed the subscription.
+	if err := c.nc.Flush(); err != nil {
+		return nil, fmt.Errorf("flushing subscription for %s: %w", subject, err)
+	}
+
 	// Track the subscription for cleanup on Stop.
 	c.subs = append(c.subs, sub)
 

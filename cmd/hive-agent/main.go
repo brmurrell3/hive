@@ -60,16 +60,17 @@ func versionCmd() *cobra.Command {
 
 func joinCmd() *cobra.Command {
 	var (
-		token        string
-		controlPlane string
-		agentID      string
-		runtimeCmd   string
-		runtimeArgs  string
-		workDir      string
-		httpAddr     string
-		natsToken    string
-		manifestPath string
-		logLevel     string
+		token           string
+		controlPlane    string
+		agentID         string
+		runtimeCmd      string
+		runtimeArgs     string
+		workDir         string
+		httpAddr        string
+		natsToken       string
+		manifestPath    string
+		logLevel        string
+		protocolDocDirs []string
 	)
 
 	cmd := &cobra.Command{
@@ -117,15 +118,16 @@ func joinCmd() *cobra.Command {
 			}
 
 			return runJoin(logger, JoinConfig{
-				Token:        token,
-				ControlPlane: controlPlane,
-				AgentID:      agentID,
-				RuntimeCmd:   runtimeCmd,
-				RuntimeArgs:  runtimeArgs,
-				WorkDir:      workDir,
-				HTTPAddr:     httpAddr,
-				NATSToken:    natsToken,
-				ManifestPath: manifestPath,
+				Token:           token,
+				ControlPlane:    controlPlane,
+				AgentID:         agentID,
+				RuntimeCmd:      runtimeCmd,
+				RuntimeArgs:     runtimeArgs,
+				WorkDir:         workDir,
+				HTTPAddr:        httpAddr,
+				NATSToken:       natsToken,
+				ManifestPath:    manifestPath,
+				ProtocolDocDirs: protocolDocDirs,
 			})
 		},
 	}
@@ -140,21 +142,23 @@ func joinCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsToken, "nats-token", "", "NATS authentication token")
 	cmd.Flags().StringVar(&manifestPath, "manifest", "", "Path to agent manifest YAML (provides capabilities and team)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
+	cmd.Flags().StringSliceVar(&protocolDocDirs, "protocol-doc-dir", nil, "Additional directories to write HIVE.md protocol reference (can be repeated)")
 
 	return cmd
 }
 
 // JoinConfig holds the configuration for joining a Hive cluster.
 type JoinConfig struct {
-	Token        string
-	ControlPlane string
-	AgentID      string
-	RuntimeCmd   string
-	RuntimeArgs  string
-	WorkDir      string
-	HTTPAddr     string
-	NATSToken    string
-	ManifestPath string
+	Token           string
+	ControlPlane    string
+	AgentID         string
+	RuntimeCmd      string
+	RuntimeArgs     string
+	WorkDir         string
+	HTTPAddr        string
+	NATSToken       string
+	ManifestPath    string
+	ProtocolDocDirs []string
 }
 
 func runJoin(logger *slog.Logger, cfg JoinConfig) error {
@@ -257,18 +261,19 @@ func runJoin(logger *slog.Logger, cfg JoinConfig) error {
 	}
 
 	sidecarCfg := sidecar.Config{
-		AgentID:        cfg.AgentID,
-		TeamID:         teamID,
-		NATSUrl:        natsURL,
-		NATSToken:      cfg.NATSToken,
-		HTTPAddr:       cfg.HTTPAddr,
-		Capabilities:   capabilities,
-		RuntimeCmd:     cfg.RuntimeCmd,
-		RuntimeArgs:    rtArgs,
-		WorkspacePath:  cfg.WorkDir,
-		HealthInterval: 30 * time.Second,
-		Tier:           "native",
-		Mode:           sidecar.ModeLibrary,
+		AgentID:          cfg.AgentID,
+		TeamID:           teamID,
+		NATSUrl:          natsURL,
+		NATSToken:        cfg.NATSToken,
+		HTTPAddr:         cfg.HTTPAddr,
+		Capabilities:     capabilities,
+		RuntimeCmd:       cfg.RuntimeCmd,
+		RuntimeArgs:      rtArgs,
+		WorkspacePath:    cfg.WorkDir,
+		HealthInterval:   30 * time.Second,
+		Tier:             "native",
+		Mode:             sidecar.ModeLibrary,
+		ProtocolDocPaths: cfg.ProtocolDocDirs,
 	}
 
 	s := sidecar.New(sidecarCfg, logger)

@@ -138,6 +138,13 @@ type Config struct {
 	// /health. If empty, no authentication is enforced.
 	HTTPToken string
 
+	// ProtocolDocPaths is an optional list of additional directories where
+	// HIVE.md should be written. This is useful when the runtime manages its
+	// own workspace separate from WorkspacePath (e.g., openclaw creates
+	// $HOME/.openclaw/workspace/). HIVE.md is always written to
+	// WorkspacePath (if set); these paths receive additional copies.
+	ProtocolDocPaths []string
+
 	// CallbackURL is the base URL of the agent process's HTTP server for
 	// receiving capability invocations. When set, the sidecar forwards
 	// capability requests via HTTP POST to {CallbackURL}/handle/{capability}
@@ -411,6 +418,18 @@ func (s *Sidecar) startRuntime(_ context.Context) error {
 	// runtime process can use them as system prompt and context without
 	// needing to read the filesystem.
 	envs = append(envs, s.loadAgentFiles()...)
+
+	// Write HIVE.md protocol reference to workspace before starting the
+	// runtime so the agent process can read it on startup.
+	if err := s.writeProtocolDoc(); err != nil {
+		s.logger.Warn("failed to write HIVE.md protocol doc", "error", err)
+	} else if protocolContent, renderErr := s.renderProtocolDoc(); renderErr == nil && protocolContent != "" {
+		const maxProtocolEnv = 64 * 1024
+		if len(protocolContent) <= maxProtocolEnv {
+			envs = append(envs, "HIVE_PROTOCOL="+protocolContent)
+		}
+	}
+
 	s.runtime.EnvVars = envs
 	if err := s.runtime.Start(); err != nil {
 		return fmt.Errorf("starting runtime: %w", err)
@@ -645,6 +664,8 @@ func (s *Sidecar) Stop() error {
 	if s.vsockProxy != nil {
 		s.vsockProxy.Stop()
 	}
+
+	s.cleanupProtocolDoc()
 
 	s.mu.Lock()
 	s.healthy = false

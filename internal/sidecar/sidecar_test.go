@@ -849,6 +849,152 @@ func TestInvokeRemote_UnknownCapability_NoRouter(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// HIVE.md protocol doc rendering and writing
+// ---------------------------------------------------------------------------
+
+func TestRenderProtocolDoc_ContainsAgentIdentity(t *testing.T) {
+	caps := []Capability{
+		{
+			Name:        "analyze",
+			Description: "Analyzes data",
+			Inputs: []CapabilityParam{
+				{Name: "data", Type: "string", Required: true},
+			},
+			Outputs: []CapabilityParam{
+				{Name: "result", Type: "string"},
+			},
+		},
+	}
+	cfg := Config{
+		AgentID:      "my-agent",
+		TeamID:       "my-team",
+		HTTPAddr:     ":9100",
+		Tier:         "native",
+		Capabilities: caps,
+	}
+	s := New(cfg, testLogger())
+
+	content, err := s.renderProtocolDoc()
+	if err != nil {
+		t.Fatalf("renderProtocolDoc: %v", err)
+	}
+
+	for _, want := range []string{
+		"my-agent",
+		"my-team",
+		"native",
+		"localhost:9100",
+		"analyze",
+		"Analyzes data",
+		"`data`",
+		"invoke-remote",
+		"GET /team/capabilities",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("rendered doc missing %q", want)
+		}
+	}
+}
+
+func TestRenderProtocolDoc_NoTeam(t *testing.T) {
+	cfg := Config{
+		AgentID:  "solo-agent",
+		HTTPAddr: ":9100",
+		Tier:     "vm",
+	}
+	s := New(cfg, testLogger())
+
+	content, err := s.renderProtocolDoc()
+	if err != nil {
+		t.Fatalf("renderProtocolDoc: %v", err)
+	}
+
+	if !strings.Contains(content, "solo-agent") {
+		t.Error("missing agent ID")
+	}
+	// Should not contain "on team **" when no team
+	if strings.Contains(content, "on team **") {
+		t.Error("should not mention team when TeamID is empty")
+	}
+}
+
+func TestWriteProtocolDoc_WritesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		AgentID:       "write-agent",
+		TeamID:        "write-team",
+		HTTPAddr:      ":9100",
+		Tier:          "native",
+		WorkspacePath: tmpDir,
+	}
+	s := New(cfg, testLogger())
+
+	if err := s.writeProtocolDoc(); err != nil {
+		t.Fatalf("writeProtocolDoc: %v", err)
+	}
+
+	data, err := os.ReadFile(tmpDir + "/HIVE.md")
+	if err != nil {
+		t.Fatalf("reading HIVE.md: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "write-agent") {
+		t.Error("HIVE.md missing agent ID")
+	}
+	if !strings.Contains(content, "write-team") {
+		t.Error("HIVE.md missing team ID")
+	}
+}
+
+func TestWriteProtocolDoc_NoWorkspace(t *testing.T) {
+	cfg := Config{
+		AgentID: "no-ws-agent",
+	}
+	s := New(cfg, testLogger())
+
+	if err := s.writeProtocolDoc(); err != nil {
+		t.Fatalf("writeProtocolDoc with no workspace should return nil, got: %v", err)
+	}
+}
+
+func TestRenderProtocolDoc_NoCaps(t *testing.T) {
+	cfg := Config{
+		AgentID:  "empty-agent",
+		HTTPAddr: ":9100",
+	}
+	s := New(cfg, testLogger())
+
+	content, err := s.renderProtocolDoc()
+	if err != nil {
+		t.Fatalf("renderProtocolDoc: %v", err)
+	}
+
+	if !strings.Contains(content, "No capabilities registered") {
+		t.Error("should indicate no capabilities")
+	}
+}
+
+func TestRenderProtocolDoc_TLSScheme(t *testing.T) {
+	cfg := Config{
+		AgentID:     "tls-agent",
+		HTTPAddr:    ":9443",
+		TLSCertFile: "/path/to/cert.pem",
+		TLSKeyFile:  "/path/to/key.pem",
+	}
+	s := New(cfg, testLogger())
+
+	content, err := s.renderProtocolDoc()
+	if err != nil {
+		t.Fatalf("renderProtocolDoc: %v", err)
+	}
+
+	if !strings.Contains(content, "https://localhost:9443") {
+		t.Errorf("expected https scheme, got content without it")
+	}
+}
+
 func TestInvokeRemote_Success(t *testing.T) {
 	srv := testutil.NATSServer(t)
 	ncA := testutil.NATSConnect(t, srv)

@@ -240,14 +240,25 @@ in
             chmod 600 "${agentHome}/${agentCfg.runtimeConfigDest}"
           ''}
 
-          # Ensure work directory exists.
+          # Ensure work directory exists and is owned by the service user.
           mkdir -p "${workDir}"
+          chown ${cfg.user}:${cfg.group} "${workDir}"
 
-          # Sync agent files from cluster root to workspace.
+          ${lib.optionalString isOpenClaw ''
+            # Pre-create openclaw workspace so the sidecar can write HIVE.md
+            # before openclaw starts.
+            mkdir -p "${agentHome}/.openclaw/workspace"
+            chown -R ${cfg.user}:${cfg.group} "${agentHome}/.openclaw"
+          ''}
+
+          # Sync agent files from cluster root to workspace(s).
           for f in AGENTS.md SKILL.md MEMORY.md IDENTITY.md USER.md SOUL.md; do
             src="${cfg.clusterRoot}/agents/${name}/$f"
             if [ -f "$src" ]; then
               cp "$src" "${workDir}/$f"
+              ${lib.optionalString isOpenClaw ''
+              cp "$src" "${agentHome}/.openclaw/workspace/$f"
+              ''}
             fi
           done
 
@@ -280,6 +291,7 @@ in
             ${lib.optionalString (runtimeArgsStr != "") "--runtime-args ${runtimeArgsStr}"} \
             --work-dir ${workDir} \
             --http-addr ${agentCfg.httpAddr} \
+            ${lib.optionalString isOpenClaw "--protocol-doc-dir ${agentHome}/.openclaw/workspace"} \
             ''${JOIN_TOKEN:+--token "$JOIN_TOKEN"} \
             ''${NATS_TOKEN:+--nats-token "$NATS_TOKEN"}
         '';
