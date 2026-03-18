@@ -63,7 +63,7 @@ gh attestation verify <artifact-file> --repo brmurrell3/hive
 CycloneDX Software Bills of Materials are attached to each release as `*.sbom.json` files. These can be used with vulnerability scanners like [Grype](https://github.com/anchore/grype):
 
 ```bash
-grype sbom:./hive-1.0.0-linux-amd64.sbom.json
+grype sbom:./hive-0.9.0-linux-amd64.sbom.json
 ```
 
 ## Security Considerations
