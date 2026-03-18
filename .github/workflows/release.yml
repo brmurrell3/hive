@@ -268,7 +268,7 @@ jobs:
 
           echo "Extracting..."
           mkdir -p extracted
-          tar -xzf "$TARBALL" -C extracted --strip-components=1
+          tar -xzf "$TARBALL" -C extracted
 
           echo "Checking binaries exist..."
           for bin in hived hivectl hive-agent hive-sidecar; do
